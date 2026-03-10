@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "githubclaw"
+version = "0.1.0"
+description = "Near-autonomous AI agents that manage open-source projects end-to-end using GitHub as the single source of truth."
+readme = "docs/ARCHITECTURE.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    { name = "Jeffrey", email = "jeffrey@githubclaw.dev" },
+]
+keywords = ["github", "ai", "agents", "automation", "webhook"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "typer>=0.15.0",
+    "pyyaml>=6.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.0",
+    "anthropic>=0.40.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.15.0",
+    "deptry>=0.22",
+]
+
+[project.scripts]
+githubclaw = "githubclaw.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/githubclaw/githubclaw"
+Documentation = "https://github.com/githubclaw/githubclaw/tree/main/docs"
+Repository = "https://github.com/githubclaw/githubclaw"
+Issues = "https://github.com/githubclaw/githubclaw/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/githubclaw"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["githubclaw"]
+
+[tool.ty.environment]
+python-version = "3.11"
+
+
+[tool.deptry]
+pep621_dev_dependency_groups = ["dev"]
+
+[tool.deptry.package_module_name_map]
+pyyaml = "yaml"
+
+[tool.deptry.per_rule_ignores]
+DEP002 = ["uvicorn", "httpx"]

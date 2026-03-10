@@ -1,0 +1,18 @@
+# GithubClaw — .githubclaw/.gitignore
+# Controls which GithubClaw configuration files are tracked in version control.
+
+# Always ignore — these contain sensitive or ephemeral data
+secrets/
+queue/
+logs/
+memory.md
+
+# User's choice — uncomment to ignore if you prefer not to version control these:
+# orchestrator.md
+# global-prompt.md
+# VALUE.md
+# agents/
+# ai_instructions/
+# spawn_claude.sh
+# spawn_codex.sh
+# config.yaml
