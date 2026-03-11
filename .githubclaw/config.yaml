@@ -1,0 +1,26 @@
+# GithubClaw per-repo configuration.
+# Values here override the global ~/.githubclaw/config.yaml where applicable.
+
+# Additional filesystem paths the orchestrator may read (beyond the repo itself).
+allowed_read_paths: []
+
+# Paths the orchestrator is forbidden from reading.
+excluded_read_paths:
+  - "~/.githubclaw/secrets/"
+  - "~/.ssh/"
+  - "~/.aws/"
+
+# GitHub event types this repo subscribes to.
+event_subscription:
+  - issues
+  - issue_comment
+  - pull_request
+  - pull_request_review
+  - pull_request_review_comment
+  - discussion
+  - discussion_comment
+  - label
+  - milestone
+  - projects_v2_item
+  - check_suite
+  - check_run

@@ -1,0 +1,15 @@
+# GithubClaw - always ignore
+secrets/
+queue/
+logs/
+memory.md
+
+# User's choice - uncomment to track in version control
+# orchestrator.md
+# global-prompt.md
+# VALUE.md
+# agents/
+# ai_instructions/
+# spawn_claude.sh
+# spawn_codex.sh
+# config.yaml

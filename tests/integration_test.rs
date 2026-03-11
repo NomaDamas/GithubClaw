@@ -48,6 +48,7 @@ async fn test_webhook_to_queue_roundtrip() {
         scheduler: Mutex::new(ScheduledEventManager::new(tmp.path().join("scheduled.json"))),
         rate_limiter: Arc::new(RateLimiter::default()),
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        orchestrators: Mutex::new(HashMap::new()),
     });
 
     let app = create_router(state.clone());

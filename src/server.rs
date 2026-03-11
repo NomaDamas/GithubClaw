@@ -23,7 +23,7 @@ use crate::agents::parser::load_agent_definition;
 use crate::agents::prompt_assembler::PromptAssembler;
 use crate::agents::spawner::AgentSpawner;
 use crate::orchestrator::schema::Action;
-use crate::orchestrator::session::{send_event_to_orchestrator, OrchestratorSession};
+use crate::orchestrator::session::OrchestratorSession;
 use crate::process_manager::{check_fork_pr_gate, ProcessManager};
 use crate::queue::DiskPersistedQueue;
 use crate::scheduler::ScheduledEventManager;
@@ -43,6 +43,8 @@ pub struct ServerState {
     pub scheduler: Mutex<ScheduledEventManager>,
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-repo orchestrator sessions (created on demand in the drain loop).
+    pub orchestrators: Mutex<HashMap<String, OrchestratorSession>>,
 }
 
 /// A single entry in `registry.json`.
@@ -627,7 +629,7 @@ pub async fn start_event_processing(state: Arc<ServerState>) {
 
 /// Per-repo drain loop: peek the queue, send to orchestrator, execute actions.
 async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &RegistryEntry) {
-    let repo_slug = repo_name.replace('/', "-");
+    let _repo_slug = repo_name.replace('/', "-");
     info!(repo = %repo_name, "Starting event drain loop");
 
     loop {
@@ -678,33 +680,36 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             continue;
         }
 
-        // 3. Send event to orchestrator via Unix socket.
+        // 3. Send event to orchestrator (in-process).
         let event_json = serde_json::to_string(&event.payload).unwrap_or_default();
-        let response = send_event_to_orchestrator(
-            &repo_slug,
-            &event_json,
-            crate::constants::DEFAULT_ORCHESTRATOR_EVENT_TIMEOUT_SECONDS,
-        )
-        .await;
 
-        let response_text = match response {
-            Ok(text) => text,
-            Err(e) => {
-                warn!(
-                    repo = %repo_name,
-                    seq = event.sequence,
-                    "Failed to send event to orchestrator: {}. Will nack and retry.",
-                    e,
-                );
-                state.rate_limiter.report_orchestrator_rate_limit();
-                // Nack (retry) the event.
-                nack_head_event(state, repo_name, &event.filename).await;
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                continue;
+        // Get or create the orchestrator session for this repo.
+        let response_text = {
+            let mut orchestrators = state.orchestrators.lock().await;
+            let session = orchestrators.entry(repo_name.to_string()).or_insert_with(|| {
+                let entry = state.registry.get(repo_name).unwrap();
+                OrchestratorSession::new(repo_name, &entry.local_path, None, None)
+            });
+            match session.process_event(&event_json).await {
+                Ok(text) => text,
+                Err(e) => {
+                    warn!(
+                        repo = %repo_name,
+                        seq = event.sequence,
+                        "Orchestrator failed to process event: {}. Will nack and retry.",
+                        e,
+                    );
+                    state.rate_limiter.report_orchestrator_rate_limit();
+                    // Drop the lock before sleeping.
+                    drop(orchestrators);
+                    nack_head_event(state, repo_name, &event.filename).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    continue;
+                }
             }
         };
 
-        // 3. Parse the ActionList response.
+        // 4. Parse the ActionList response.
         let action_list = OrchestratorSession::extract_action_list(&response_text);
         if let Err(e) = action_list.validate() {
             warn!(
@@ -910,6 +915,7 @@ mod tests {
             scheduler: Mutex::new(ScheduledEventManager::new(scheduler_path)),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            orchestrators: Mutex::new(HashMap::new()),
         })
     }
 

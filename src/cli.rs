@@ -748,6 +748,7 @@ fn cmd_serve(host: &str, port: u16) {
             scheduler: Mutex::new(scheduler),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            orchestrators: Mutex::new(HashMap::new()),
         });
 
         // Bootstrap repos: scan existing open issues/PRs for each repo
@@ -804,11 +805,8 @@ fn cmd_serve(host: &str, port: u16) {
             });
         }
 
-        // Start the event drain loop in background
-        let drain_state = Arc::clone(&state);
-        let drain_handle = tokio::spawn(async move {
-            event_drain_loop(drain_state).await;
-        });
+        // Start per-repo event drain loops + rate limiter recovery probe
+        crate::server::start_event_processing(Arc::clone(&state)).await;
 
         // Build router
         let app = create_router(Arc::clone(&state));
@@ -848,89 +846,8 @@ fn cmd_serve(host: &str, port: u16) {
                 std::process::exit(1);
             });
 
-        drain_handle.abort();
         tracing::info!("Server shut down.");
     });
-}
-
-/// Background loop that drains per-repo queues and dispatches events to
-/// orchestrator sessions.
-async fn event_drain_loop(state: Arc<crate::server::ServerState>) {
-    use crate::orchestrator::session::send_event_to_orchestrator;
-    use crate::constants::DEFAULT_ORCHESTRATOR_EVENT_TIMEOUT_SECONDS;
-
-    loop {
-        if state.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!("Shutdown signal received, stopping drain loop");
-            break;
-        }
-        // Collect repo names that have queued events
-        let repo_names: Vec<String> = {
-            let queues = state.queues.lock().await;
-            queues
-                .iter()
-                .filter(|(_, q)| !q.is_empty())
-                .map(|(name, _)| name.clone())
-                .collect()
-        };
-
-        for repo_name in &repo_names {
-            let event_opt = {
-                let mut queues = state.queues.lock().await;
-                if let Some(queue) = queues.get_mut(repo_name) {
-                    match queue.dequeue() {
-                        Ok(ev) => ev,
-                        Err(e) => {
-                            tracing::error!("Dequeue error for {}: {}", repo_name, e);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            };
-
-            if let Some(event) = event_opt {
-                let event_json = serde_json::to_string(&event.payload).unwrap_or_default();
-                let repo_slug = repo_name.replace('/', "-");
-
-                match send_event_to_orchestrator(
-                    &repo_slug,
-                    &event_json,
-                    DEFAULT_ORCHESTRATOR_EVENT_TIMEOUT_SECONDS,
-                )
-                .await
-                {
-                    Ok(response) => {
-                        tracing::info!(
-                            "Orchestrator response for {} (seq {}): {}",
-                            repo_name,
-                            event.sequence,
-                            &response[..response.len().min(200)]
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to send event to orchestrator for {}: {}",
-                            repo_name,
-                            e
-                        );
-                        // Nack the event for retry
-                        let mut queues = state.queues.lock().await;
-                        if let Some(queue) = queues.get_mut(repo_name) {
-                            let mut event = event;
-                            if let Err(nack_err) = queue.nack(&mut event, "drain_retry") {
-                                tracing::error!("Nack error for {}: {}", repo_name, nack_err);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sleep between drain cycles
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    }
 }
 
 // ===========================================================================
