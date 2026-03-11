@@ -1,6 +1,6 @@
 # Webhook Server
 
-The webhook server is the central nervous system of GithubClaw — a persistent Python FastAPI process that receives GitHub events, routes them to per-repo orchestrators, manages all child processes, and executes dispatch instructions.
+The webhook server is the central nervous system of GithubClaw — a persistent Rust axum process that receives GitHub events, routes them to per-repo orchestrators, manages all child processes, and executes dispatch instructions.
 
 ## Responsibilities
 
@@ -32,7 +32,7 @@ POST /webhook
   - Persists to disk-backed serial queue
 ```
 
-No internal HTTP endpoints needed — scheduled events use asyncio timers in-process.
+No internal HTTP endpoints needed — scheduled events use tokio timers in-process.
 
 ## Event Queue
 
@@ -74,7 +74,7 @@ Temp file cleaned up after agent exits.
 
 ## Frontmatter Parsing
 
-Agent definition files have YAML frontmatter parsed mechanically by Python:
+Agent definition files have YAML frontmatter parsed mechanically by Rust (serde_yaml):
 
 ```yaml
 ---
@@ -134,27 +134,32 @@ All child processes (orchestrators + workers) managed uniformly:
 
 Enforced mechanically from webhook payload fields before any dispatch execution:
 
-```python
-def check_fork_pr_gate(event_payload, dispatch):
-    pr = event_payload.get("pull_request", {})
-    head_repo = pr.get("head", {}).get("repo", {})
+```rust
+fn check_fork_pr_gate(event_payload: &WebhookPayload, agent_type: &str) -> bool {
+    let Some(pr) = &event_payload.pull_request else { return true };
+    let Some(head_repo) = &pr.head.repo else { return true };
 
-    if not head_repo.get("fork", False):
-        return True  # Not a fork PR, allow
+    if !head_repo.fork {
+        return true; // Not a fork PR, allow
+    }
 
-    labels = [l["name"] for l in pr.get("labels", [])]
-    if "githubclaw-approved" in labels:
-        return True  # Approved, allow
+    let has_approval = pr.labels.iter()
+        .any(|l| l.name == "githubclaw-approved");
+    if has_approval {
+        return true; // Approved, allow
+    }
 
-    if dispatch.agent_type == "security_reviewer":
-        return True  # Security reviewer is always allowed (read-only)
+    if agent_type == "security_reviewer" {
+        return true; // Security reviewer is always allowed (read-only)
+    }
 
-    return False  # Block, inject corrective feedback to orchestrator
+    false // Block, inject corrective feedback to orchestrator
+}
 ```
 
 ## Rate Limit Handling
 
-Three-tier response, all handled in Python (no LLM calls):
+Three-tier response, all handled in Rust (no LLM calls):
 
 | Tier | Trigger | Response |
 |------|---------|----------|
@@ -162,20 +167,25 @@ Three-tier response, all handled in Python (no LLM calls):
 | Orchestrator limit | Orchestrator session fails to respond | Full hibernate — stop feeding events, queue to disk |
 | Both exhausted | All API calls failing | Full hibernate + alert, webhook server stays alive for event reception |
 
-Recovery: asyncio timer periodically attempts lightweight API probe. On success, resume normal operation and drain queued events.
+Recovery: tokio timer periodically attempts lightweight API probe. On success, resume normal operation and drain queued events.
 
 ## Scheduled Events
 
-```python
-async def scheduled_event_loop():
-    while True:
-        await asyncio.sleep(60)
-        now = datetime.utcnow()
-        for event in load_scheduled_events():
-            if event.trigger_at <= now:
-                inject_into_queue(event.repo, event.payload)
-                if event.is_one_shot:
-                    remove_scheduled_event(event.event_id)
+```rust
+async fn scheduled_event_loop(state: Arc<ServerState>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let now = Utc::now();
+        let mut scheduler = state.scheduler.lock().await;
+        for event in scheduler.due_events(now) {
+            state.inject_into_queue(&event.repo, &event.payload).await;
+            if event.one_shot {
+                scheduler.remove(&event.event_id);
+            }
+        }
+        scheduler.save().unwrap();
+    }
+}
 ```
 
 - Persisted to `~/.githubclaw/scheduled.json`

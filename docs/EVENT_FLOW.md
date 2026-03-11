@@ -147,7 +147,7 @@ GitHub Event
 ### Proactive Visionary (Cron)
 
 ```
-1. asyncio timer fires daily at configured time
+1. tokio timer fires daily at configured time
    Synthetic event injected into queue
 
 2. Orchestrator → dispatch Visionary
@@ -206,7 +206,7 @@ Events generated internally (not from GitHub webhooks):
 | Type | Source | Purpose |
 |------|--------|---------|
 | `virtual_bootstrap` | Bootstrap scan | Process existing issues/PRs on first start |
-| `scheduled_fired` | asyncio timer | Cron events (Visionary daily, orchestrator follow-ups) |
+| `scheduled_fired` | tokio timer | Cron events (Visionary daily, orchestrator follow-ups) |
 | `error_feedback` | Webhook server | Invalid agent_type correction, fork PR gate rejection |
 | `failure_injection` | Process monitor | Agent crash/timeout notification |
 | `rate_limit_recovery` | Recovery probe | "Are we back?" test event |

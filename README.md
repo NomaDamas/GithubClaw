@@ -7,7 +7,7 @@ GithubClaw treats GitHub as the single source of truth. A webhook server receive
 ## Quick Start
 
 ```bash
-pip install githubclaw            # or: uv add githubclaw
+cargo install githubclaw          # single ~6MB binary
 
 cd /path/to/your-repo
 githubclaw init                   # scaffold .githubclaw/ directory
@@ -32,7 +32,7 @@ githubclaw start
                          v
             +------------------------+
             |    Webhook Server      |
-            |    FastAPI + Python    |
+            |    axum + tokio        |
             |                        |
             | - Signature verify     |
             | - Event routing        |
@@ -125,7 +125,7 @@ For detailed specs, see:
 
 ## Requirements
 
-- Python 3.11+
+- Rust 1.75+ (or install the pre-built binary via `cargo install githubclaw`)
 - `gh` CLI (authenticated)
 - Claude Code or Codex CLI
 - A tunnel service (Cloudflare Tunnel, ngrok, etc.)

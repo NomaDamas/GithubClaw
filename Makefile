@@ -1,39 +1,64 @@
-.PHONY: install lint format typecheck deps test check all clean
+.PHONY: build release test lint format check clean install all
 
-# Install dependencies with uv
-install:
-	uv sync --dev
+# Build debug binary
+build:
+	cargo build
 
-# Lint with ruff
-lint:
-	ruff check src/
+# Build release binary
+release:
+	cargo build --release
 
-# Format with ruff
-format:
-	ruff format src/
-	ruff check --fix src/
-
-# Type check with ty
-typecheck:
-	ty check src/
-
-# Check dependency issues with deptry
-deps:
-	deptry src/
-
-# Run tests
+# Run all tests
 test:
-	uv run pytest tests/ -v
+	cargo test
 
-# Run all checks (lint + typecheck + deps)
-check: lint typecheck deps
+# Run tests with output
+test-verbose:
+	cargo test -- --nocapture
+
+# Lint with clippy
+lint:
+	cargo clippy -- -D warnings
+
+# Format code
+format:
+	cargo fmt
+
+# Check formatting without changing
+format-check:
+	cargo fmt -- --check
+
+# Run all checks (format + lint + test)
+check: format-check lint test
 	@echo "All checks passed."
 
-# Run everything (format + check + test)
-all: format check test
+# Run everything (format + check)
+all: format check
+
+# Install the binary
+install:
+	cargo install --path .
 
 # Clean build artifacts
 clean:
-	rm -rf dist/ build/ .ruff_cache/ .pytest_cache/
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	find . -type f -name "*.pyc" -delete 2>/dev/null || true
+	cargo clean
+
+# Show binary size
+size: release
+	@ls -lh target/release/githubclaw
+
+# Initialize a repo for GithubClaw
+init:
+	cargo run -- init
+
+# Start the webhook server
+start:
+	cargo run -- start
+
+# Stop the webhook server
+stop:
+	cargo run -- stop
+
+# Show status
+status:
+	cargo run -- status

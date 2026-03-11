@@ -2,7 +2,7 @@
 
 ## Overview
 
-GithubClaw is a system of near-autonomous AI agents that manage open-source projects end-to-end using **GitHub as the single source of truth**. A Python webhook server receives GitHub events and routes them to a stateful orchestrator, which classifies each event and dispatches specialized worker agents (Claude Code / Codex CLI processes) to handle tasks autonomously.
+GithubClaw is a system of near-autonomous AI agents that manage open-source projects end-to-end using **GitHub as the single source of truth**. A Rust webhook server receives GitHub events and routes them to a stateful orchestrator, which classifies each event and dispatches specialized worker agents (Claude Code / Codex CLI processes) to handle tasks autonomously.
 
 ## Core Philosophy
 
@@ -22,7 +22,7 @@ GithubClaw is a system of near-autonomous AI agents that manage open-source proj
                            v
               +------------------------+
               |    Webhook Server      |  (Global, one per user)
-              |    FastAPI + Python    |  (~/.githubclaw/)
+              |    axum + Rust         |  (~/.githubclaw/)
               |                        |
               | - Signature verify     |
               | - Registry routing     |
@@ -65,9 +65,9 @@ GithubClaw is a system of near-autonomous AI agents that manage open-source proj
 Flat process tree — webhook server manages all child processes as siblings:
 
 ```
-webhook server (FastAPI, persistent)
-├── orchestrator-repoA     (Agent SDK, Unix socket IPC)
-├── orchestrator-repoB     (Agent SDK, Unix socket IPC)
+webhook server (axum, persistent)
+├── orchestrator-repoA     (Anthropic API client, Unix socket IPC)
+├── orchestrator-repoB     (Anthropic API client, Unix socket IPC)
 ├── coder-repoA-issue42    (Claude Code / Codex CLI)
 ├── qa-repoA-pr88          (Claude Code / Codex CLI)
 ├── bugtracker-repoB-#12   (Claude Code / Codex CLI)
@@ -108,24 +108,26 @@ feature/#42 ─── PR ──→ dev ─── PR ──→ main
 
 | Component | Technology |
 |-----------|-----------|
-| Webhook server | Python, FastAPI, asyncio |
-| CLI | Python, Typer |
-| Orchestrator | Claude Agent SDK (abstraction layer for future OpenAI support) |
+| Webhook server | Rust, axum, tokio |
+| CLI | Rust, clap |
+| Orchestrator | Direct Anthropic API client (Rust, reqwest) with agentic tool loop |
 | Worker agents | Claude Code CLI / Codex CLI |
-| IPC | Unix sockets |
-| Scheduling | asyncio timers + `~/.githubclaw/scheduled.json` |
+| IPC | Unix sockets (tokio) |
+| Scheduling | tokio timers + `~/.githubclaw/scheduled.json` |
 | Daemonization | launchd (macOS) / systemd (Linux) |
 | Browser testing | Playwright + VLM (Vision Language Model) |
 | GitHub API | `gh` CLI with PAT |
 | Webhook delivery | GitHub App (webhook only, not for API auth) |
 | Tunneling | User's choice (Cloudflare Tunnel, ngrok, etc.) |
+| Serialization | serde + serde_yaml + serde_json |
+| Config | config (YAML) via serde_yaml |
 
 ## Key Decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Agent execution | Claude Code / Codex CLI | Instruction-following + full tool access, easy to implement |
-| Orchestrator SDK | Claude Agent SDK (v1) | Session persistence, context compaction, tool use |
+| Orchestrator runtime | Direct Anthropic API + agentic tool loop (Rust) | Minimal dependency, full control over tool execution |
 | Inter-agent comms | Async, stateless, GitHub trail | Simplicity — stateful coordination too complex |
 | Task lifecycle | No explicit tracking | LLM judgment from accumulated context + GitHub state |
 | Behavioral enforcement | Instruction prompts (except security gates) | Complexity/autonomy tradeoff — trust the model |

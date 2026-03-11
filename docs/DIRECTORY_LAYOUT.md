@@ -2,7 +2,7 @@
 
 ## Global Configuration (`~/.githubclaw/`)
 
-Per-user, shared across all repos. Created during initial `pip install githubclaw` setup.
+Per-user, shared across all repos. Created during initial `cargo install githubclaw` setup (or via pre-built binary).
 
 ```
 ~/.githubclaw/
@@ -12,6 +12,9 @@ Per-user, shared across all repos. Created during initial `pip install githubcla
 ├── secrets/
 │   ├── webhook_secret          # GitHub App HMAC secret
 │   └── twitter_credentials     # Platform API keys (extensible)
+├── sessions/                    # Persisted orchestrator sessions
+│   └── {repo-name}/
+│       └── session_state.json   # Message history + state for resume
 └── logs/
     └── webhook_server.log      # Server-level logs
 ```
@@ -167,7 +170,7 @@ memory.md
 | `queue/*` | Webhook server | Webhook server |
 | `~/.githubclaw/config.yaml` | Webhook server | User / setup agent |
 | `~/.githubclaw/registry.json` | Webhook server | Setup agent |
-| `~/.githubclaw/scheduled.json` | Webhook server (asyncio timer) | Webhook server |
+| `~/.githubclaw/scheduled.json` | Webhook server (tokio timer) | Webhook server |
 | `~/.githubclaw/secrets/*` | Webhook server (env var injection) | User / setup agent |
 
 ## Runtime Files
@@ -183,19 +186,21 @@ memory.md
 ## CLI Commands
 
 ```bash
-pip install githubclaw              # Install global package
+cargo install githubclaw            # Install from crates.io (or download pre-built binary)
 
 githubclaw init                     # Scaffold .githubclaw/ in current repo
 githubclaw start                    # Start webhook server (daemonize)
 githubclaw stop                     # Graceful drain shutdown
 githubclaw stop --force             # Immediate kill
-githubclaw status                   # Show running processes (future)
+githubclaw status                   # Show running processes, registered repos, queue sizes
+githubclaw logs                     # View webhook server logs
+githubclaw logs --follow            # Tail webhook server logs
 ```
 
 ## Setup Flow
 
 ```
-1. pip install githubclaw
+1. cargo install githubclaw
 2. cd /path/to/your/repo
 3. githubclaw init                  # Scaffolds .githubclaw/
 4. [Coding agent assists with:]

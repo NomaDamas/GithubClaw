@@ -1,0 +1,364 @@
+//! Agent CLI spawner.
+//!
+//! Builds the environment variables and command-line arguments needed to launch
+//! an agent subprocess (e.g. `claude-code` or `codex`) with the correct
+//! prompt, tool permissions, and git identity.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use crate::agents::parser::AgentDefinition;
+
+/// Spawns agent subprocesses with the correct environment and CLI flags.
+pub struct AgentSpawner {
+    repo_root: PathBuf,
+    max_turns: u32,
+}
+
+impl AgentSpawner {
+    /// Create a new spawner rooted at `repo_root` with the given turn limit.
+    pub fn new(repo_root: impl AsRef<Path>, max_turns: u32) -> Self {
+        Self {
+            repo_root: repo_root.as_ref().to_path_buf(),
+            max_turns,
+        }
+    }
+
+    /// Locate an optional spawn script for the given backend.
+    ///
+    /// Looks for `.githubclaw/spawn_claude.sh` or `.githubclaw/spawn_codex.sh`
+    /// under the repo root, matching the spec and the Python implementation.
+    /// Returns `None` if the script does not exist.
+    fn get_spawn_script(&self, backend: &str) -> Option<PathBuf> {
+        let script_name = match backend {
+            "claude-code" => "spawn_claude.sh",
+            "codex" => "spawn_codex.sh",
+            _ => return None,
+        };
+        let script = self.repo_root.join(".githubclaw").join(script_name);
+        if script.exists() {
+            Some(script)
+        } else {
+            None
+        }
+    }
+
+    /// Build the full set of environment variables for an agent subprocess.
+    ///
+    /// Sets git identity, tool permissions, prompt/task info, and GithubClaw
+    /// metadata. Optionally merges caller-supplied `extra_env`.
+    pub fn build_env(
+        &self,
+        agent_def: &AgentDefinition,
+        prompt_file: &Path,
+        task_prompt: &str,
+        extra_env: Option<&HashMap<String, String>>,
+    ) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+
+        // Git identity
+        env.insert(
+            "GIT_AUTHOR_NAME".into(),
+            agent_def.git_author_name.clone(),
+        );
+        env.insert(
+            "GIT_AUTHOR_EMAIL".into(),
+            agent_def.git_author_email.clone(),
+        );
+        env.insert(
+            "GIT_COMMITTER_NAME".into(),
+            agent_def.git_author_name.clone(),
+        );
+        env.insert(
+            "GIT_COMMITTER_EMAIL".into(),
+            agent_def.git_author_email.clone(),
+        );
+
+        // Tool permissions
+        let tools = agent_def.active_tools();
+        env.insert("ALLOWED_TOOLS".into(), tools.allowed.join(","));
+        env.insert("DISALLOWED_TOOLS".into(), tools.disallowed.join(","));
+
+        // Prompt and task
+        env.insert(
+            "PROMPT_FILE".into(),
+            prompt_file.to_string_lossy().into_owned(),
+        );
+        env.insert("TASK_PROMPT".into(), task_prompt.to_string());
+        env.insert("MAX_TURNS".into(), self.max_turns.to_string());
+
+        // GithubClaw metadata
+        env.insert("GITHUBCLAW_AGENT_TYPE".into(), agent_def.name.clone());
+        env.insert("GITHUBCLAW_BACKEND".into(), agent_def.backend.clone());
+        env.insert(
+            "GITHUBCLAW_REPO_ROOT".into(),
+            self.repo_root.to_string_lossy().into_owned(),
+        );
+
+        // Merge extra env (caller overrides take precedence)
+        if let Some(extra) = extra_env {
+            for (k, v) in extra {
+                env.insert(k.clone(), v.clone());
+            }
+        }
+
+        env
+    }
+
+    /// Build the command-line arguments for launching the agent.
+    ///
+    /// Returns a `Vec<String>` where the first element is the program and the
+    /// rest are arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend is not recognized.
+    pub fn build_command(
+        &self,
+        agent_def: &AgentDefinition,
+        prompt_file: &Path,
+        task_prompt: &str,
+    ) -> Result<Vec<String>, String> {
+        // If a spawn script override exists, use it. All config is passed via
+        // environment variables (build_env), so no extra CLI args are needed.
+        if let Some(script_path) = self.get_spawn_script(&agent_def.backend) {
+            return Ok(vec![
+                "bash".to_string(),
+                script_path.to_string_lossy().into_owned(),
+            ]);
+        }
+
+        let prompt_path = prompt_file.to_string_lossy().into_owned();
+
+        match agent_def.backend.as_str() {
+            "claude-code" => {
+                let mut cmd = vec![
+                    "claude".to_string(),
+                    "--print".to_string(),
+                    "--prompt-file".to_string(),
+                    prompt_path,
+                    "--max-turns".to_string(),
+                    self.max_turns.to_string(),
+                ];
+                if !task_prompt.is_empty() {
+                    cmd.push("--task".to_string());
+                    cmd.push(task_prompt.to_string());
+                }
+                Ok(cmd)
+            }
+            "codex" => {
+                let mut cmd = vec![
+                    "codex".to_string(),
+                    "--prompt-file".to_string(),
+                    prompt_path,
+                ];
+                if !task_prompt.is_empty() {
+                    cmd.push("--task".to_string());
+                    cmd.push(task_prompt.to_string());
+                }
+                Ok(cmd)
+            }
+            other => Err(format!("unknown backend: {}", other)),
+        }
+    }
+
+    // spawn() will be async in the real implementation.
+    // For now we only expose build_env and build_command for testing.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::parser::{AgentDefinition, ToolPermissions};
+    use crate::constants::DEFAULT_AGENT_MAX_TURNS;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    /// Helper: build a minimal agent definition with sensible defaults.
+    fn make_agent_def(backend: &str) -> AgentDefinition {
+        let mut tools = HashMap::new();
+        tools.insert(
+            backend.to_string(),
+            ToolPermissions {
+                allowed: vec!["Read".into(), "Write".into()],
+                disallowed: vec!["Shell".into()],
+            },
+        );
+        AgentDefinition {
+            name: "coder".into(),
+            backend: backend.into(),
+            git_author_name: "Test Bot".into(),
+            git_author_email: "bot@test.local".into(),
+            timeout: None,
+            tools,
+            instruction_body: "Do the work.".into(),
+        }
+    }
+
+    // 1. build_env sets git author fields
+    #[test]
+    fn build_env_sets_git_author_fields() {
+        let tmp = TempDir::new().unwrap();
+        let spawner = AgentSpawner::new(tmp.path(), DEFAULT_AGENT_MAX_TURNS);
+        let def = make_agent_def("claude-code");
+        let prompt = tmp.path().join("prompt.md");
+
+        let env = spawner.build_env(&def, &prompt, "fix bug", None);
+
+        assert_eq!(env["GIT_AUTHOR_NAME"], "Test Bot");
+        assert_eq!(env["GIT_AUTHOR_EMAIL"], "bot@test.local");
+        assert_eq!(env["GIT_COMMITTER_NAME"], "Test Bot");
+        assert_eq!(env["GIT_COMMITTER_EMAIL"], "bot@test.local");
+    }
+
+    // 2. build_env sets tool permissions
+    #[test]
+    fn build_env_sets_tool_permissions() {
+        let tmp = TempDir::new().unwrap();
+        let spawner = AgentSpawner::new(tmp.path(), 100);
+        let def = make_agent_def("claude-code");
+        let prompt = tmp.path().join("prompt.md");
+
+        let env = spawner.build_env(&def, &prompt, "task", None);
+
+        assert_eq!(env["ALLOWED_TOOLS"], "Read,Write");
+        assert_eq!(env["DISALLOWED_TOOLS"], "Shell");
+    }
+
+    // 3. build_env sets prompt and task info
+    #[test]
+    fn build_env_sets_prompt_and_task_info() {
+        let tmp = TempDir::new().unwrap();
+        let spawner = AgentSpawner::new(tmp.path(), 50);
+        let def = make_agent_def("codex");
+        let prompt = tmp.path().join("prompt.md");
+
+        let env = spawner.build_env(&def, &prompt, "implement caching", None);
+
+        assert_eq!(env["PROMPT_FILE"], prompt.to_string_lossy().as_ref());
+        assert_eq!(env["TASK_PROMPT"], "implement caching");
+        assert_eq!(env["MAX_TURNS"], "50");
+        assert_eq!(env["GITHUBCLAW_AGENT_TYPE"], "coder");
+        assert_eq!(env["GITHUBCLAW_BACKEND"], "codex");
+        assert_eq!(
+            env["GITHUBCLAW_REPO_ROOT"],
+            tmp.path().to_string_lossy().as_ref()
+        );
+    }
+
+    // 4. build_env merges extra_env
+    #[test]
+    fn build_env_merges_extra_env() {
+        let tmp = TempDir::new().unwrap();
+        let spawner = AgentSpawner::new(tmp.path(), 100);
+        let def = make_agent_def("claude-code");
+        let prompt = tmp.path().join("prompt.md");
+
+        let mut extra = HashMap::new();
+        extra.insert("CUSTOM_VAR".into(), "custom_value".into());
+        extra.insert("GIT_AUTHOR_NAME".into(), "Override Bot".into());
+
+        let env = spawner.build_env(&def, &prompt, "task", Some(&extra));
+
+        assert_eq!(env["CUSTOM_VAR"], "custom_value");
+        // Extra env overrides built-in values
+        assert_eq!(env["GIT_AUTHOR_NAME"], "Override Bot");
+    }
+
+    // 5. build_command for claude-code backend
+    #[test]
+    fn build_command_claude_code() {
+        let tmp = TempDir::new().unwrap();
+        let spawner = AgentSpawner::new(tmp.path(), 200);
+        let def = make_agent_def("claude-code");
+        let prompt = tmp.path().join("prompt.md");
+
+        let cmd = spawner.build_command(&def, &prompt, "fix the bug").unwrap();
+
+        assert_eq!(cmd[0], "claude");
+        assert!(cmd.contains(&"--print".to_string()));
+        assert!(cmd.contains(&"--prompt-file".to_string()));
+        assert!(cmd.contains(&"--max-turns".to_string()));
+        assert!(cmd.contains(&"200".to_string()));
+        assert!(cmd.contains(&"--task".to_string()));
+        assert!(cmd.contains(&"fix the bug".to_string()));
+    }
+
+    // 6. build_command for codex backend
+    #[test]
+    fn build_command_codex() {
+        let tmp = TempDir::new().unwrap();
+        let spawner = AgentSpawner::new(tmp.path(), 100);
+        let def = make_agent_def("codex");
+        let prompt = tmp.path().join("prompt.md");
+
+        let cmd = spawner.build_command(&def, &prompt, "implement feature").unwrap();
+
+        assert_eq!(cmd[0], "codex");
+        assert!(cmd.contains(&"--prompt-file".to_string()));
+        assert!(cmd.contains(&"--task".to_string()));
+        assert!(cmd.contains(&"implement feature".to_string()));
+        // codex should NOT have --print or --max-turns
+        assert!(!cmd.contains(&"--print".to_string()));
+        assert!(!cmd.contains(&"--max-turns".to_string()));
+    }
+
+    // 7. build_command for unknown backend returns error
+    #[test]
+    fn build_command_unknown_backend_errors() {
+        let tmp = TempDir::new().unwrap();
+        let spawner = AgentSpawner::new(tmp.path(), 100);
+        let def = make_agent_def("unknown-backend");
+        let prompt = tmp.path().join("prompt.md");
+
+        let result = spawner.build_command(&def, &prompt, "task");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown backend"));
+    }
+
+    // 8. get_spawn_script returns None when no script exists
+    #[test]
+    fn get_spawn_script_returns_none_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        let spawner = AgentSpawner::new(tmp.path(), 100);
+
+        assert!(spawner.get_spawn_script("claude-code").is_none());
+        assert!(spawner.get_spawn_script("codex").is_none());
+    }
+
+    // 9. get_spawn_script returns path when script exists
+    #[test]
+    fn get_spawn_script_returns_path_when_exists() {
+        let tmp = TempDir::new().unwrap();
+        let claw_dir = tmp.path().join(".githubclaw");
+        std::fs::create_dir_all(&claw_dir).unwrap();
+
+        let script_path = claw_dir.join("spawn_claude.sh");
+        std::fs::write(&script_path, "#!/bin/bash\necho hello").unwrap();
+
+        let spawner = AgentSpawner::new(tmp.path(), 100);
+        let result = spawner.get_spawn_script("claude-code");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), script_path);
+    }
+
+    // 10. build_command uses spawn script override when present
+    #[test]
+    fn build_command_uses_spawn_script_override() {
+        let tmp = TempDir::new().unwrap();
+        let claw_dir = tmp.path().join(".githubclaw");
+        std::fs::create_dir_all(&claw_dir).unwrap();
+
+        let script_path = claw_dir.join("spawn_claude.sh");
+        std::fs::write(&script_path, "#!/bin/bash\nexec claude").unwrap();
+
+        let spawner = AgentSpawner::new(tmp.path(), 200);
+        let def = make_agent_def("claude-code");
+        let prompt = tmp.path().join("prompt.md");
+
+        let cmd = spawner.build_command(&def, &prompt, "fix the bug").unwrap();
+        assert_eq!(cmd[0], "bash");
+        assert_eq!(cmd[1], script_path.to_string_lossy().as_ref());
+        assert_eq!(cmd.len(), 2);
+    }
+}

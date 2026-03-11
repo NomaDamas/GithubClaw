@@ -1,10 +1,10 @@
 # Orchestrator
 
-The orchestrator is a per-repo Claude Agent SDK session running as a child process of the webhook server. It is the **pure decision-maker** — it classifies events, gathers context, and produces structured dispatch output. It never executes dispatches, spawns agents, or performs destructive actions.
+The orchestrator is a per-repo Rust process that calls the Anthropic API directly with an agentic tool loop, running as a child process of the webhook server. It is the **pure decision-maker** — it classifies events, gathers context, and produces structured dispatch output. It never executes dispatches, spawns agents, or performs destructive actions.
 
 ## Architecture
 
-- **Runtime**: Claude Agent SDK (Python), with abstraction layer for future OpenAI Agents SDK support
+- **Runtime**: Direct Anthropic API client (Rust, reqwest) with agentic tool loop — call model, execute tools, repeat until final structured output
 - **Process**: Separate child process per repo, managed by webhook server
 - **IPC**: Unix socket at `/tmp/githubclaw-{repo_name}.sock`
 - **Lifecycle**: Hybrid — start on first event, stay alive while processing, idle timeout shutdown, session persistence for resume
@@ -45,7 +45,7 @@ The orchestrator has **no raw shell access**. Only these registered custom funct
 | `write_memory(section, content)` | Write memory section | `.githubclaw/memory.md` only |
 | `web_search(query)` | Search the web | Read-only |
 
-All GitHub query tools are implemented as Python functions calling `gh` CLI internally. `read_file` enforced via whitelist — repo directory + `.githubclaw/` only, excludes `~/.githubclaw/secrets/`, `~/.ssh/`, etc. User can expand allowed paths in `.githubclaw/config.yaml` (orchestrator cannot modify this config).
+All GitHub query tools are implemented as Rust functions calling `gh` CLI internally via `tokio::process::Command`. `read_file` enforced via whitelist — repo directory + `.githubclaw/` only, excludes `~/.githubclaw/secrets/`, `~/.ssh/`, etc. User can expand allowed paths in `.githubclaw/config.yaml` (orchestrator cannot modify this config).
 
 ## Structured Output Schema
 
@@ -99,7 +99,7 @@ Lives in `.githubclaw/orchestrator.md` — user-editable. Contains:
 - **Workflow templates**: General progression patterns (bug lifecycle, feature lifecycle)
 - **Rules**: "Always verify current state before acting", "Respect direct human requests with high priority"
 
-Baked into the Agent SDK session at creation. On session resume after idle timeout, recency bias from dynamic file re-reads overrides any stale system prompt content.
+Baked into the Anthropic API system prompt at session creation. On session resume after idle timeout, recency bias from dynamic file re-reads overrides any stale system prompt content.
 
 ## Dynamic Re-reads
 
@@ -164,7 +164,7 @@ Task context in dispatch output is **minimal** — just a pointer and brief summ
 
 | Aspect | Orchestrator | Worker Agents |
 |--------|-------------|---------------|
-| Runtime | Agent SDK session | Claude Code / Codex CLI |
+| Runtime | Anthropic API + agentic tool loop (Rust) | Claude Code / Codex CLI |
 | Lifecycle | Long-running, stateful | Stateless, per-task |
 | Shell access | None (scoped custom tools) | Full (YOLO mode) |
 | Output | Structured JSON actions | GitHub comments, PRs, commits |

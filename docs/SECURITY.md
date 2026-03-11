@@ -33,15 +33,23 @@ Layer 7: Agent Instructions
 
 Every incoming POST to the webhook endpoint is verified:
 
-```python
-import hmac
-import hashlib
+```rust
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
-def verify_signature(payload_body: bytes, signature_header: str, secret: str) -> bool:
-    expected = "sha256=" + hmac.new(
-        secret.encode(), payload_body, hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature_header)
+fn verify_signature(payload_body: &[u8], signature_header: &str, secret: &str) -> bool {
+    let Some(hex_sig) = signature_header.strip_prefix("sha256=") else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(payload_body);
+    let Ok(sig_bytes) = hex::decode(hex_sig) else {
+        return false;
+    };
+    mac.verify_slice(&sig_bytes).is_ok()
+}
 ```
 
 - Webhook secret stored in `~/.githubclaw/secrets/webhook_secret`
@@ -53,11 +61,11 @@ def verify_signature(payload_body: bytes, signature_header: str, secret: str) ->
 **Mechanical enforcement** — not dependent on LLM judgment:
 
 ### Detection (from webhook payload)
-```python
-head_repo = payload["pull_request"]["head"]["repo"]
-is_fork = head_repo.get("fork", False)
-labels = [l["name"] for l in payload["pull_request"].get("labels", [])]
-is_approved = "githubclaw-approved" in labels
+```rust
+let head_repo = &payload.pull_request.as_ref().unwrap().head.repo;
+let is_fork = head_repo.as_ref().map_or(false, |r| r.fork);
+let is_approved = payload.pull_request.as_ref().unwrap()
+    .labels.iter().any(|l| l.name == "githubclaw-approved");
 ```
 
 ### Enforcement
@@ -164,7 +172,7 @@ dev branch:
 | Webhook authenticity | Mechanical | HMAC signature verification |
 | Fork PR execution | Mechanical | Payload field check + label gate |
 | Orchestrator shell | Mechanical | Custom tools only, no Bash |
-| Orchestrator file read | Mechanical | Path whitelist in Python |
+| Orchestrator file read | Mechanical | Path whitelist in Rust |
 | Orchestrator file write | Mechanical | Only memory.md via dedicated tool |
 | Agent tool permissions | Mechanical | CLI flags from parsed frontmatter |
 | Agent behavioral scope | Instruction | Prompt-based constraints |
