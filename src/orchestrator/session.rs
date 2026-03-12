@@ -62,8 +62,7 @@ impl OrchestratorSession {
         let socket_path = format!("/tmp/githubclaw-{}.sock", repo_name);
         let persistence_dir = home_dir().join(".githubclaw/sessions").join(&repo_name);
 
-        let conversation_history =
-            Self::load_persisted_state(&persistence_dir).unwrap_or_default();
+        let conversation_history = Self::load_persisted_state(&persistence_dir).unwrap_or_default();
 
         Self {
             repo: repo.to_string(),
@@ -314,6 +313,7 @@ impl OrchestratorSession {
     }
 
     /// Check if a CLI binary is available on PATH.
+    #[cfg(test)]
     fn has_cli(name: &str) -> bool {
         which::which(name).is_ok()
     }
@@ -326,14 +326,20 @@ impl OrchestratorSession {
 
         let output = Command::new("claude")
             .args([
-                "-p",                        // print mode (non-interactive)
-                "--output-format", "text",   // plain text output
-                "--max-turns", "15",         // allow multi-step investigation
-                "--model", &self.model,
+                "-p", // print mode (non-interactive)
+                "--output-format",
+                "text", // plain text output
+                "--max-turns",
+                "15", // allow multi-step investigation
+                "--model",
+                &self.model,
             ])
             .arg(prompt)
             .current_dir(&self.repo_dir)
-            .env("ANTHROPIC_API_KEY", std::env::var("ANTHROPIC_API_KEY").unwrap_or_default())
+            .env(
+                "ANTHROPIC_API_KEY",
+                std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+            )
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -365,20 +371,19 @@ impl OrchestratorSession {
         info!(repo = %self.repo, "Spawning Codex as orchestrator");
 
         // Write the ActionList JSON schema to a temp file for --output-schema
-        let schema_path = std::env::temp_dir().join(format!(
-            "githubclaw_schema_{}.json",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::write(&schema_path, include_str!("../../defaults/action_list_schema.json"))
-            .map_err(|e| format!("Failed to write schema file: {}", e))?;
+        let schema_path =
+            std::env::temp_dir().join(format!("githubclaw_schema_{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &schema_path,
+            include_str!("../../defaults/action_list_schema.json"),
+        )
+        .map_err(|e| format!("Failed to write schema file: {}", e))?;
 
         // Write output to a temp file via -o
-        let output_path = std::env::temp_dir().join(format!(
-            "githubclaw_output_{}.txt",
-            uuid::Uuid::new_v4()
-        ));
+        let output_path =
+            std::env::temp_dir().join(format!("githubclaw_output_{}.txt", uuid::Uuid::new_v4()));
 
-        let mut child = Command::new("codex")
+        let child = Command::new("codex")
             .arg("exec")
             .arg("--full-auto")
             .arg("--output-schema")
@@ -392,7 +397,8 @@ impl OrchestratorSession {
             .spawn()
             .map_err(|e| format!("Failed to spawn codex CLI: {}", e))?;
 
-        let result = child.wait_with_output()
+        let result = child
+            .wait_with_output()
             .await
             .map_err(|e| format!("Codex process failed: {}", e))?;
 
@@ -478,9 +484,7 @@ fn extract_json_fence(text: &str) -> Option<String> {
 
 /// Get the user's home directory from the `HOME` environment variable.
 fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
+    std::env::var("HOME").map(PathBuf::from).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -661,7 +665,13 @@ That's my decision."#;
         fs::create_dir_all(&gc_dir).unwrap();
         fs::write(gc_dir.join("orchestrator.md"), "Custom system prompt.").unwrap();
 
-        let session = OrchestratorSession::new("owner/repo", repo_dir, OrchestratorBackend::Codex, None, None);
+        let session = OrchestratorSession::new(
+            "owner/repo",
+            repo_dir,
+            OrchestratorBackend::Codex,
+            None,
+            None,
+        );
         let prompt = session.load_system_prompt();
         assert_eq!(prompt, "Custom system prompt.");
     }
@@ -672,7 +682,13 @@ That's my decision."#;
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().to_str().unwrap();
 
-        let session = OrchestratorSession::new("owner/repo", repo_dir, OrchestratorBackend::Codex, None, None);
+        let session = OrchestratorSession::new(
+            "owner/repo",
+            repo_dir,
+            OrchestratorBackend::Codex,
+            None,
+            None,
+        );
         let prompt = session.load_system_prompt();
         assert!(prompt.contains("owner/repo"));
         assert!(prompt.contains("orchestrator"));
@@ -689,10 +705,7 @@ That's my decision."#;
             None,
         );
         let home = std::env::var("HOME").unwrap();
-        let expected = PathBuf::from(format!(
-            "{}/.githubclaw/sessions/acme-widgets",
-            home
-        ));
+        let expected = PathBuf::from(format!("{}/.githubclaw/sessions/acme-widgets", home));
         assert_eq!(session.persistence_dir, expected);
     }
 
@@ -704,7 +717,13 @@ That's my decision."#;
         let socket_path = tmp.path().join("test-serve.sock");
         let socket_path_str = socket_path.to_str().unwrap().to_string();
 
-        let mut session = OrchestratorSession::new("test/serve-repo", repo_dir, OrchestratorBackend::Codex, None, Some(2));
+        let mut session = OrchestratorSession::new(
+            "test/serve-repo",
+            repo_dir,
+            OrchestratorBackend::Codex,
+            None,
+            Some(2),
+        );
         session.socket_path = socket_path_str.clone();
 
         // Spawn serve in background -- it will time out after 2 seconds
@@ -768,7 +787,13 @@ That's my decision."#;
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().to_str().unwrap();
 
-        let mut session = OrchestratorSession::new("test/persist", repo_dir, OrchestratorBackend::Codex, None, None);
+        let mut session = OrchestratorSession::new(
+            "test/persist",
+            repo_dir,
+            OrchestratorBackend::Codex,
+            None,
+            None,
+        );
         // Override persistence_dir to use temp
         session.persistence_dir = tmp.path().join("sessions").join("test-persist");
 
@@ -784,8 +809,7 @@ That's my decision."#;
         session.persist().await.unwrap();
 
         // Load in a fresh context
-        let loaded =
-            OrchestratorSession::load_persisted_state(&session.persistence_dir).unwrap();
+        let loaded = OrchestratorSession::load_persisted_state(&session.persistence_dir).unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0]["role"], "user");
         assert_eq!(loaded[1]["role"], "assistant");
@@ -794,8 +818,7 @@ That's my decision."#;
     // 12. load_persisted_state returns None for missing file
     #[test]
     fn load_persisted_state_returns_none_for_missing() {
-        let result =
-            OrchestratorSession::load_persisted_state(Path::new("/nonexistent/path"));
+        let result = OrchestratorSession::load_persisted_state(Path::new("/nonexistent/path"));
         assert!(result.is_none());
     }
 
@@ -807,6 +830,8 @@ That's my decision."#;
         let _has_claude = OrchestratorSession::has_cli("claude");
         let _has_codex = OrchestratorSession::has_cli("codex");
         // A definitely missing binary should return false
-        assert!(!OrchestratorSession::has_cli("definitely_not_a_real_binary_xyz"));
+        assert!(!OrchestratorSession::has_cli(
+            "definitely_not_a_real_binary_xyz"
+        ));
     }
 }

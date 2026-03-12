@@ -19,6 +19,8 @@ The webhook server is the central nervous system of GithubClaw — a persistent 
 13. **Concurrency throttle**: `max_concurrent_agents` limit — queue dispatches when full
 14. **Bootstrap**: Inject virtual events for existing issues/PRs on first start
 
+The server keeps one serial drain loop and one orchestrator session per repo. That preserves queue order and conversation continuity inside a repo while letting unrelated repos classify in parallel.
+
 ## HTTP Endpoints
 
 ### External (public via tunnel, port configurable)
@@ -51,6 +53,7 @@ Dead-letter:     .githubclaw/queue/dead/
 ```
 
 - Events processed FIFO, one at a time per repo
+- Different repos drain independently, so orchestrator classification can overlap across repos
 - Disk persistence survives crash/restart
 - `max_retry` configurable — exceeded events move to dead-letter
 - Bootstrap virtual events block normal operation until drained

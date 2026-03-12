@@ -211,7 +211,7 @@ Events generated internally (not from GitHub webhooks):
 | `failure_injection` | Process monitor | Agent crash/timeout notification |
 | `rate_limit_recovery` | Recovery probe | "Are we back?" test event |
 
-All synthetic events enter the same serial queue as real webhook events. The orchestrator processes them identically — classification from scratch, no special handling.
+All synthetic events enter the same per-repo serial queue as real webhook events. The orchestrator processes them identically — classification from scratch, no special handling. Different repos still drain independently, so this serialization does not block cross-repo classification.
 
 ## Event Subscription (Default)
 

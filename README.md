@@ -117,7 +117,7 @@ To test the webhook delivery, open an issue on your repo. You should see it appe
                             GitHub
 ```
 
-Events flow in a loop: GitHub fires a webhook, the server routes it to a per-repo orchestrator, the orchestrator dispatches a worker agent, the agent acts on GitHub, and the resulting event re-enters the loop.
+Events flow in a loop: GitHub fires a webhook, the server routes it to a per-repo orchestrator, the orchestrator dispatches a worker agent, the agent acts on GitHub, and the resulting event re-enters the loop. Each repo keeps its own serial orchestrator lane, while different repos can classify in parallel.
 
 ## Agent Team
 

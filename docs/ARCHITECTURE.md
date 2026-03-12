@@ -26,7 +26,7 @@ GithubClaw is a system of near-autonomous AI agents that manage open-source proj
               |                        |
               | - Signature verify     |
               | - Registry routing     |
-              | - Serial event queues  |
+              | - Per-repo serial queues |
               | - Process management   |
               | - Prompt assembly      |
               | - Scheduled events     |
@@ -75,7 +75,7 @@ webhook server (axum, persistent)
 ```
 
 - **Webhook server**: Always-on, daemonized via launchd (macOS) / systemd (Linux)
-- **Orchestrators**: Hybrid lifecycle — start on first event, stay alive while processing, idle timeout shutdown, session persistence for resume
+- **Orchestrators**: One serial loop per repo. Sessions start on first event, stay alive while processing, idle-timeout shut down, and persist state for resume. Different repos can classify in parallel.
 - **Worker agents**: Stateless, fresh CLI spawn per task, exit after completion
 
 ## Event Flow (Happy Path)
