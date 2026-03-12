@@ -183,6 +183,7 @@ For detailed specs, see:
 - `docs/ARCHITECTURE.md` -- System components, event flow, technology stack
 - `docs/AGENTS.md` -- Full agent roster with triggers, scopes, and interaction patterns
 - `docs/DIRECTORY_LAYOUT.md` -- Complete file listing and ownership matrix
+- `docs/HOSTED_PROXY.md` -- Hosted proxy MVP trust model and `POST /register` contract
 
 ## Requirements
 
