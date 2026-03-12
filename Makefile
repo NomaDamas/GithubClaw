@@ -1,64 +1,65 @@
-.PHONY: build release test lint format check clean install all
+.PHONY: build release test test-verbose lint format format-check check ci install clean size init start stop status serve logs help
 
-# Build debug binary
-build:
+# ─── Build ────────────────────────────────────────────────────────────
+build:            ## Build debug binary
 	cargo build
 
-# Build release binary
-release:
+release:          ## Build release binary
 	cargo build --release
 
-# Run all tests
-test:
-	cargo test
+# ─── Test ─────────────────────────────────────────────────────────────
+test:             ## Run all tests
+	cargo test --all-targets
 
-# Run tests with output
-test-verbose:
-	cargo test -- --nocapture
+test-verbose:     ## Run tests with output
+	cargo test --all-targets -- --nocapture
 
-# Lint with clippy
-lint:
-	cargo clippy -- -D warnings
+# ─── Lint & Format ────────────────────────────────────────────────────
+lint:             ## Run clippy (warnings = errors)
+	cargo clippy --all-targets -- -D warnings
 
-# Format code
-format:
+format:           ## Format code
 	cargo fmt
 
-# Check formatting without changing
-format-check:
+format-check:     ## Check formatting without changes
 	cargo fmt -- --check
 
-# Run all checks (format + lint + test)
-check: format-check lint test
-	@echo "All checks passed."
+# ─── Combined ─────────────────────────────────────────────────────────
+check: format-check lint test  ## Run format check + lint + test
+	@echo "✓ All checks passed."
 
-# Run everything (format + check)
-all: format check
+ci: check release  ## Run full CI pipeline locally (same as GitHub Actions)
+	@echo "✓ CI passed. Release binary ready."
 
-# Install the binary
-install:
+# ─── Install ──────────────────────────────────────────────────────────
+install:          ## Install githubclaw binary
 	cargo install --path .
 
-# Clean build artifacts
-clean:
+clean:            ## Remove build artifacts
 	cargo clean
 
-# Show binary size
-size: release
+size: release     ## Show release binary size
 	@ls -lh target/release/githubclaw
 
-# Initialize a repo for GithubClaw
-init:
+# ─── Run ──────────────────────────────────────────────────────────────
+init:             ## Scaffold .githubclaw/ in current repo
 	cargo run -- init
 
-# Start the webhook server
-start:
+start:            ## Start webhook server (daemonized)
 	cargo run -- start
 
-# Stop the webhook server
-stop:
+stop:             ## Stop webhook server (graceful)
 	cargo run -- stop
 
-# Show status
-status:
+status:           ## Show server status + registered repos
 	cargo run -- status
+
+serve:            ## Run webhook server inline (foreground, for dev)
+	cargo run -- serve
+
+logs:             ## Tail webhook server logs
+	cargo run -- logs --follow
+
+# ─── Help ─────────────────────────────────────────────────────────────
+help:             ## Show this help
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
