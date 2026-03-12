@@ -255,11 +255,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = setup_repo(&tmp);
 
-        fs::write(
-            root.join(".githubclaw").join("global-prompt.md"),
-            "Global.",
-        )
-        .unwrap();
+        fs::write(root.join(".githubclaw").join("global-prompt.md"), "Global.").unwrap();
 
         let agent_def = make_agent_def("Agent body.");
         let mut assembler = PromptAssembler::new(&root);
