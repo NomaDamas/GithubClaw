@@ -1,5 +1,13 @@
 # Hosted Proxy MVP
 
+## Status
+
+This is a documentation-first MVP spec for `POST /register`.
+
+- It defines the trust model and wire contract the project intends to implement.
+- It does not claim the endpoint is already live.
+- If server work is needed, that should land in a separate PR targeting `dev`.
+
 ## Purpose
 
 The hosted proxy lets one shared GithubClaw service receive GitHub App webhooks and forward each installation's traffic to that user's public tunnel URL.
@@ -48,6 +56,19 @@ After a successful first claim, the proxy returns a long random `update_secret`.
 
 This keeps the core small: no accounts, no OAuth dance on every update, no dashboard state.
 
+## Security Assumptions
+
+The MVP assumes:
+
+- the install/setup callback that mints `claim_proof` is already trusted
+- clients talk to the hosted proxy over HTTPS
+- `installation_id` is public metadata, not a secret
+- `claim_proof` is opaque, signed by the hosted service, short-lived, and single-use
+- `update_secret` is a bearer secret scoped to one `installation_id`
+- compromise of the current `update_secret` is equivalent to authority to perform the next update until rotation
+
+The MVP intentionally does not add heavier mechanisms such as user accounts, mutual TLS, or public-key client signatures.
+
 ## Endpoint
 
 ### `POST /register`
@@ -76,6 +97,8 @@ Rules:
 - `tunnel_url` is required.
 - `claim_proof` and `update_secret` are mutually exclusive.
 - Requests with both or neither must be rejected.
+- `claim_proof`, when present, must decode to a proof bound to the same `installation_id`.
+- `update_secret`, when present, must match the current secret for the same `installation_id`.
 
 ### Tunnel URL Rules
 
@@ -124,6 +147,7 @@ Success response:
 Status:
 
 - `201 Created` for the first successful claim
+- The returned `update_secret` is the only secret valid for the next update
 
 ## Update Flow
 
@@ -160,6 +184,7 @@ Success response:
 Status:
 
 - `200 OK` for a successful update
+- Each successful update rotates the secret immediately and returns the replacement
 
 ## Error Contract
 
@@ -196,6 +221,7 @@ Status and codes:
 - `update_secret` remains valid until the next successful update.
 - Once a new `update_secret` is issued, the previous secret must fail immediately.
 - Retrying the same update request after a successful rotation must fail with `invalid_update_secret` unless the caller uses the newly returned secret.
+- Concurrent attempts to spend the same `claim_proof` or `update_secret` are replay attempts; at most one may succeed.
 
 ## Ownership Mismatch Handling
 
