@@ -233,9 +233,7 @@ pub fn build_tool_specs() -> Vec<ToolSpec> {
 // ---------------------------------------------------------------------------
 
 fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
+    std::env::var("HOME").map(PathBuf::from).unwrap_or_default()
 }
 
 /// Resolve and check a file path against allowed/denied lists.
@@ -272,10 +270,7 @@ pub fn resolve_and_check_path(
 
     // 3. Check allowed prefixes
     let githubclaw_dir = home.join(".githubclaw");
-    let mut allowed: Vec<PathBuf> = vec![
-        normalize_path(repo_dir),
-        githubclaw_dir,
-    ];
+    let mut allowed: Vec<PathBuf> = vec![normalize_path(repo_dir), githubclaw_dir];
     for extra in extra_allowed {
         allowed.push(normalize_path(Path::new(extra)));
     }
@@ -398,8 +393,13 @@ pub async fn execute_tool(
                 .as_i64()
                 .ok_or("missing or invalid 'number'")?;
             run_gh(
-                &["issue", "view", &number.to_string(), "--json",
-                  "number,title,state,body,labels,assignees,comments,author,createdAt,updatedAt"],
+                &[
+                    "issue",
+                    "view",
+                    &number.to_string(),
+                    "--json",
+                    "number,title,state,body,labels,assignees,comments,author,createdAt,updatedAt",
+                ],
                 repo,
             )
             .await
@@ -415,9 +415,14 @@ pub async fn execute_tool(
             // Build the search filter up front so it lives long enough.
             let search_filter = format!("updated:>={}", since);
             let mut gh_args = vec![
-                "issue", "list", "--state", state,
-                "--limit", &limit_str,
-                "--json", "number,title,state,labels,assignees,createdAt",
+                "issue",
+                "list",
+                "--state",
+                state,
+                "--limit",
+                &limit_str,
+                "--json",
+                "number,title,state,labels,assignees,createdAt",
             ];
             if !labels.is_empty() {
                 gh_args.extend(["--label", labels]);
@@ -443,9 +448,16 @@ pub async fn execute_tool(
             let state = args["state"].as_str().unwrap_or("open");
             let limit = args["limit"].as_u64().unwrap_or(PRS_LIST_LIMIT as u64);
             run_gh(
-                &["pr", "list", "--state", state,
-                  "--limit", &limit.to_string(),
-                  "--json", "number,title,state,labels,assignees,createdAt"],
+                &[
+                    "pr",
+                    "list",
+                    "--state",
+                    state,
+                    "--limit",
+                    &limit.to_string(),
+                    "--json",
+                    "number,title,state,labels,assignees,createdAt",
+                ],
                 repo,
             )
             .await
@@ -464,7 +476,7 @@ pub async fn execute_tool(
             let api_path = format!("repos/{}/discussions/{}", repo, number);
             run_gh(
                 &["api", &api_path, "--jq", "."],
-                "",  // repo already embedded in the API path
+                "", // repo already embedded in the API path
             )
             .await
         }
@@ -472,15 +484,26 @@ pub async fn execute_tool(
             // Accept either run_id (specific run) or ref_name (branch filter)
             if let Some(run_id) = args.get("run_id").and_then(|v| v.as_i64()) {
                 run_gh(
-                    &["run", "view", &run_id.to_string(), "--json",
-                      "status,conclusion,name,workflowName,jobs,createdAt,updatedAt"],
+                    &[
+                        "run",
+                        "view",
+                        &run_id.to_string(),
+                        "--json",
+                        "status,conclusion,name,workflowName,jobs,createdAt,updatedAt",
+                    ],
                     repo,
                 )
                 .await
             } else {
                 let ref_name = args["ref_name"].as_str().unwrap_or("");
-                let mut gh_args = vec!["run", "list", "--limit", "5", "--json",
-                                       "databaseId,status,conclusion,name,headBranch,createdAt"];
+                let mut gh_args = vec![
+                    "run",
+                    "list",
+                    "--limit",
+                    "5",
+                    "--json",
+                    "databaseId,status,conclusion,name,headBranch,createdAt",
+                ];
                 if !ref_name.is_empty() {
                     gh_args.extend(["--branch", ref_name]);
                 }
@@ -488,9 +511,7 @@ pub async fn execute_tool(
             }
         }
         "search_issues" => {
-            let query = args["query"]
-                .as_str()
-                .ok_or("missing 'query'")?;
+            let query = args["query"].as_str().ok_or("missing 'query'")?;
             if query.len() > SEARCH_QUERY_MAX_LENGTH {
                 return Err(format!(
                     "Search query too long ({} > {} chars)",
@@ -502,17 +523,24 @@ pub async fn execute_tool(
                 .as_u64()
                 .unwrap_or(SEARCH_RESULTS_LIMIT as u64);
             run_gh(
-                &["search", "issues", "--match", "title,body",
-                  "--limit", &limit.to_string(), "--json",
-                  "number,title,repository,state,type", "--", query],
+                &[
+                    "search",
+                    "issues",
+                    "--match",
+                    "title,body",
+                    "--limit",
+                    &limit.to_string(),
+                    "--json",
+                    "number,title,repository,state,type",
+                    "--",
+                    query,
+                ],
                 repo,
             )
             .await
         }
         "read_file" => {
-            let path = args["path"]
-                .as_str()
-                .ok_or("missing 'path'")?;
+            let path = args["path"].as_str().ok_or("missing 'path'")?;
             let resolved = resolve_and_check_path(path, repo_dir, extra_allowed)?;
             tokio::fs::read_to_string(&resolved)
                 .await
@@ -524,19 +552,13 @@ pub async fn execute_tool(
                 .unwrap_or_default();
             let sections = parse_memory_sections(&content);
             match args.get("section").and_then(|v| v.as_str()) {
-                Some(section) => {
-                    Ok(sections.get(section).cloned().unwrap_or_default())
-                }
+                Some(section) => Ok(sections.get(section).cloned().unwrap_or_default()),
                 None => Ok(content),
             }
         }
         "write_memory" => {
-            let section = args["section"]
-                .as_str()
-                .ok_or("missing 'section'")?;
-            let new_content = args["content"]
-                .as_str()
-                .ok_or("missing 'content'")?;
+            let section = args["section"].as_str().ok_or("missing 'section'")?;
+            let new_content = args["content"].as_str().ok_or("missing 'content'")?;
 
             let existing = tokio::fs::read_to_string(memory_file)
                 .await
@@ -575,8 +597,7 @@ async fn run_gh(args: &[&str], repo: &str) -> Result<String, String> {
     // Prevent the child from inheriting stdin (avoids blocking on prompts).
     cmd.stdin(std::process::Stdio::null());
 
-    let timeout_duration =
-        std::time::Duration::from_secs_f64(GH_CLI_TIMEOUT_SECONDS);
+    let timeout_duration = std::time::Duration::from_secs_f64(GH_CLI_TIMEOUT_SECONDS);
 
     let child = cmd.output();
 
@@ -601,8 +622,7 @@ async fn run_gh(args: &[&str], repo: &str) -> Result<String, String> {
     };
 
     if output.status.success() {
-        String::from_utf8(output.stdout)
-            .map_err(|e| format!("gh output was not UTF-8: {}", e))
+        String::from_utf8(output.stdout).map_err(|e| format!("gh output was not UTF-8: {}", e))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("gh failed ({}): {}", output.status, stderr.trim()))
@@ -651,10 +671,7 @@ mod tests {
     fn resolve_absolute_path_under_repo() {
         let repo = PathBuf::from("/tmp/test-repo");
         let result = resolve_and_check_path("/tmp/test-repo/Cargo.toml", &repo, &[]);
-        assert_eq!(
-            result.unwrap(),
-            PathBuf::from("/tmp/test-repo/Cargo.toml")
-        );
+        assert_eq!(result.unwrap(), PathBuf::from("/tmp/test-repo/Cargo.toml"));
     }
 
     // 4. resolve_and_check_path: path under ~/.githubclaw/ allowed
@@ -798,15 +815,7 @@ Content of first section.
         let args = json!({ "path": file_path.to_str().unwrap() });
         let memory = dir.path().join("memory.md");
 
-        let result = execute_tool(
-            "read_file",
-            &args,
-            "owner/repo",
-            dir.path(),
-            &memory,
-            &[],
-        )
-        .await;
+        let result = execute_tool("read_file", &args, "owner/repo", dir.path(), &memory, &[]).await;
 
         assert!(result.is_ok(), "Expected Ok, got {:?}", result);
         assert_eq!(result.unwrap(), "hello world");
@@ -819,15 +828,7 @@ Content of first section.
         let memory = dir.path().join("memory.md");
         let args = json!({ "path": "/etc/passwd" });
 
-        let result = execute_tool(
-            "read_file",
-            &args,
-            "owner/repo",
-            dir.path(),
-            &memory,
-            &[],
-        )
-        .await;
+        let result = execute_tool("read_file", &args, "owner/repo", dir.path(), &memory, &[]).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Access denied"));
@@ -845,15 +846,8 @@ Content of first section.
         .expect("write memory");
 
         let args = json!({ "section": "Architecture" });
-        let result = execute_tool(
-            "read_memory",
-            &args,
-            "owner/repo",
-            dir.path(),
-            &memory,
-            &[],
-        )
-        .await;
+        let result =
+            execute_tool("read_memory", &args, "owner/repo", dir.path(), &memory, &[]).await;
 
         assert!(result.is_ok(), "Expected Ok, got {:?}", result);
         assert_eq!(result.unwrap(), "Three modules.");
@@ -867,15 +861,8 @@ Content of first section.
         std::fs::write(&memory, "## Overview\n\nHello.\n").expect("write memory");
 
         let args = json!({ "section": "NonExistent" });
-        let result = execute_tool(
-            "read_memory",
-            &args,
-            "owner/repo",
-            dir.path(),
-            &memory,
-            &[],
-        )
-        .await;
+        let result =
+            execute_tool("read_memory", &args, "owner/repo", dir.path(), &memory, &[]).await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "");
@@ -946,15 +933,8 @@ Content of first section.
         let memory = dir.path().join("memory.md");
         let args = json!({ "query": "rust async" });
 
-        let result = execute_tool(
-            "web_search",
-            &args,
-            "owner/repo",
-            dir.path(),
-            &memory,
-            &[],
-        )
-        .await;
+        let result =
+            execute_tool("web_search", &args, "owner/repo", dir.path(), &memory, &[]).await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "Web search is not configured.");

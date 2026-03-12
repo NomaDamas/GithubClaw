@@ -30,6 +30,18 @@ POST /webhook
   - Discards events from repos not in registry.json
   - Checks fork PR gate before queuing
   - Persists to disk-backed serial queue
+
+GET /setup/callback
+  - Trusted hosted setup callback after GitHub identifies one installation
+  - Mints a 10-minute single-use `claim_proof` bound to `installation_id`
+  - Returns the handoff payload shape for `POST /register`
+
+POST /register
+  - Claims or updates one installation's hosted-proxy tunnel URL
+  - Uses one-time `claim_proof` for the first claim
+  - Uses rotating `update_secret` for later updates
+  - Rotates `update_secret` on every successful update
+  - See `docs/HOSTED_PROXY.md` for the full contract
 ```
 
 No internal HTTP endpoints needed — scheduled events use tokio timers in-process.

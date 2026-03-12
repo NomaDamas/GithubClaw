@@ -56,6 +56,20 @@ fn verify_signature(payload_body: &[u8], signature_header: &str, secret: &str) -
 - Set during GitHub App creation
 - Requests without valid `X-Hub-Signature-256` are rejected (403)
 
+## Hosted Proxy Registration Boundary
+
+The hosted-proxy setup and registration flow has its own narrow ownership boundary:
+
+- the trusted setup callback mints a short-lived single-use `claim_proof`
+- each proof is bound to exactly one `installation_id`
+- the proof expires 10 minutes after issuance
+- the first successful `POST /register` consumes the proof and returns an installation-scoped `update_secret`
+- later updates require the latest `update_secret`
+- every successful update rotates the secret immediately
+- replayed, expired, or mismatched proofs must fail
+
+This boundary only bootstraps hosted proxy registration. It does not replace webhook HMAC verification, fork PR gating, orchestrator isolation, or branch protection.
+
 ## Fork PR Gate
 
 **Mechanical enforcement** — not dependent on LLM judgment:
