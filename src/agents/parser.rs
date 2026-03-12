@@ -41,10 +41,7 @@ pub struct AgentDefinition {
 impl AgentDefinition {
     /// Return the tool permissions for the configured backend.
     pub fn active_tools(&self) -> ToolPermissions {
-        self.tools
-            .get(&self.backend)
-            .cloned()
-            .unwrap_or_default()
+        self.tools.get(&self.backend).cloned().unwrap_or_default()
     }
 }
 
@@ -113,13 +110,8 @@ pub fn parse_agent_file(path: &Path) -> Result<AgentDefinition, String> {
             let body_start = caps.get(0).unwrap().end();
             let body = text[body_start..].trim().to_string();
 
-            let fm: RawFrontmatter = serde_yaml::from_str(frontmatter_raw).map_err(|e| {
-                format!(
-                    "Malformed YAML frontmatter in {}: {}",
-                    path.display(),
-                    e
-                )
-            })?;
+            let fm: RawFrontmatter = serde_yaml::from_str(frontmatter_raw)
+                .map_err(|e| format!("Malformed YAML frontmatter in {}: {}", path.display(), e))?;
             (fm, body)
         }
         None => {
@@ -166,7 +158,9 @@ pub fn parse_agent_file(path: &Path) -> Result<AgentDefinition, String> {
 }
 
 /// Parse the tools section from frontmatter YAML.
-fn parse_tools(raw: Option<HashMap<String, RawToolPermissions>>) -> HashMap<String, ToolPermissions> {
+fn parse_tools(
+    raw: Option<HashMap<String, RawToolPermissions>>,
+) -> HashMap<String, ToolPermissions> {
     let Some(raw_map) = raw else {
         return HashMap::new();
     };
@@ -220,7 +214,10 @@ pub fn list_agent_types(repo_root: &Path) -> Vec<String> {
 /// # Errors
 ///
 /// Returns an error if neither repo-local nor default definition exists.
-pub fn load_agent_definition(repo_root: &Path, agent_type: &str) -> Result<AgentDefinition, String> {
+pub fn load_agent_definition(
+    repo_root: &Path,
+    agent_type: &str,
+) -> Result<AgentDefinition, String> {
     // Try repo-local first.
     let repo_path = repo_root
         .join(".githubclaw")

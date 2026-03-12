@@ -190,10 +190,7 @@ impl DiskPersistedQueue {
         let files = self.sorted_event_files();
         match files.last() {
             Some(path) => {
-                let stem = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("0");
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("0");
                 let seq_str = stem.split('_').next().unwrap_or("0");
                 seq_str.parse::<u64>().unwrap_or(0) + 1
             }
@@ -265,9 +262,7 @@ impl DiskPersistedQueue {
 /// [`QUEUE_FILENAME_LABEL_MAX_LENGTH`].
 fn safe_label(event_type: &str) -> String {
     event_type
-        .replace('.', "_")
-        .replace('/', "_")
-        .replace(' ', "_")
+        .replace(['.', '/', ' '], "_")
         .chars()
         .take(QUEUE_FILENAME_LABEL_MAX_LENGTH)
         .collect()
@@ -329,10 +324,15 @@ mod tests {
     fn test_enqueue_creates_numbered_json_file() {
         let (_tmp, q) = make_queue(DEFAULT_QUEUE_MAX_RETRY);
 
-        let path = q.enqueue(json!({"action": "opened"}), "issues_opened").unwrap();
+        let path = q
+            .enqueue(json!({"action": "opened"}), "issues_opened")
+            .unwrap();
 
         assert!(path.exists());
-        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "000001_issues_opened.json");
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            "000001_issues_opened.json"
+        );
 
         let content: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -350,9 +350,18 @@ mod tests {
         let p2 = q.enqueue(json!({"n": 2}), "event").unwrap();
         let p3 = q.enqueue(json!({"n": 3}), "event").unwrap();
 
-        assert_eq!(p1.file_name().unwrap().to_str().unwrap(), "000001_event.json");
-        assert_eq!(p2.file_name().unwrap().to_str().unwrap(), "000002_event.json");
-        assert_eq!(p3.file_name().unwrap().to_str().unwrap(), "000003_event.json");
+        assert_eq!(
+            p1.file_name().unwrap().to_str().unwrap(),
+            "000001_event.json"
+        );
+        assert_eq!(
+            p2.file_name().unwrap().to_str().unwrap(),
+            "000002_event.json"
+        );
+        assert_eq!(
+            p3.file_name().unwrap().to_str().unwrap(),
+            "000003_event.json"
+        );
     }
 
     // 4. peek returns first event without removing
@@ -380,14 +389,20 @@ mod tests {
         q.enqueue(json!({"n": 1}), "event").unwrap();
         q.enqueue(json!({"n": 2}), "event").unwrap();
 
-        let event = q.dequeue().unwrap().expect("dequeue should return an event");
+        let event = q
+            .dequeue()
+            .unwrap()
+            .expect("dequeue should return an event");
         assert_eq!(event.sequence, 1);
         assert_eq!(event.payload, json!({"n": 1}));
 
         // Only one event should remain.
         assert_eq!(q.size(), 1);
 
-        let second = q.dequeue().unwrap().expect("dequeue should return second event");
+        let second = q
+            .dequeue()
+            .unwrap()
+            .expect("dequeue should return second event");
         assert_eq!(second.sequence, 2);
         assert_eq!(q.size(), 0);
     }
@@ -503,7 +518,10 @@ mod tests {
     // 11b. safe_label with combined special characters
     #[test]
     fn test_safe_label_combined() {
-        assert_eq!(safe_label("github.event/issue comment"), "github_event_issue_comment");
+        assert_eq!(
+            safe_label("github.event/issue comment"),
+            "github_event_issue_comment"
+        );
     }
 
     // Extra: peek on empty returns None
