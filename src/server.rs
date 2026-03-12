@@ -777,7 +777,7 @@ fn is_actionable_event(event: &serde_json::Value) -> bool {
         event
             .pointer("/check_run/conclusion")
             .and_then(|v| v.as_str())
-            .map_or(false, |c| c == "failure")
+            == Some("failure")
     } else {
         true
     }
@@ -850,11 +850,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 
         // 2. Filter: only actionable events reach the orchestrator
         if !is_actionable_event(&event.payload)
-            && event
-                .payload
-                .get("type")
-                .and_then(|v| v.as_str())
-                != Some("virtual_bootstrap")
+            && event.payload.get("type").and_then(|v| v.as_str()) != Some("virtual_bootstrap")
         {
             // Silently dequeue and skip
             let mut queues = state.queues.lock().await;
@@ -941,9 +937,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                         issue_ref: issue_ref.clone(),
                         task_context: task_context.clone(),
                     };
-                    match execute_dispatch(state, &dispatch, &event.payload, repo_name)
-                        .await
-                    {
+                    match execute_dispatch(state, &dispatch, &event.payload, repo_name).await {
                         Ok(()) => {
                             // Record in dispatch_log for orchestrator context
                             let timestamp = chrono::Utc::now().format("%H:%M").to_string();
