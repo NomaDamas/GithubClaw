@@ -24,6 +24,16 @@ The webhook server is the central nervous system of GithubClaw — a persistent 
 ### External (public via tunnel, port configurable)
 
 ```
+GET /setup/github/callback?installation_id=123456
+  - Hosted setup callback for initial tunnel claim
+  - Mints or returns the current unconsumed claim proof for one installation
+  - Rejects already-claimed installations
+
+POST /register
+  - Claims the first tunnel URL with a one-time claim proof
+  - Rotates tunnel URL later with the current installation update secret
+  - Persists proof replay state and current update credential per installation
+
 POST /webhook
   - Receives GitHub App webhook payloads
   - Validates X-Hub-Signature-256
