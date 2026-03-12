@@ -1,4 +1,4 @@
-.PHONY: build release test test-verbose lint format format-check check ci install clean size init start stop status serve logs help
+.PHONY: build release test test-verbose lint format format-check check ci install reinstall restart clean size init start stop status serve logs help
 
 # ─── Build ────────────────────────────────────────────────────────────
 build:            ## Build debug binary
@@ -32,8 +32,19 @@ ci: check release  ## Run full CI pipeline locally (same as GitHub Actions)
 	@echo "✓ CI passed. Release binary ready."
 
 # ─── Install ──────────────────────────────────────────────────────────
-install:          ## Install githubclaw binary
+install:          ## Install githubclaw binary to ~/.cargo/bin
 	cargo install --path .
+
+reinstall: install  ## Rebuild, install, and restart the server
+	@if githubclaw status 2>/dev/null | grep -q "is running"; then \
+		githubclaw stop && sleep 2 && githubclaw start; \
+		echo "✓ Server restarted with latest build."; \
+	else \
+		echo "✓ Installed. Server not running (use 'make start' to start)."; \
+	fi
+
+restart:          ## Restart the server (no rebuild)
+	githubclaw stop && sleep 2 && githubclaw start
 
 clean:            ## Remove build artifacts
 	cargo clean
