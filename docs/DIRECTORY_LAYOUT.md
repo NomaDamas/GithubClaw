@@ -7,6 +7,7 @@ Per-user, shared across all repos. Created during initial `cargo install githubc
 ```
 ~/.githubclaw/
 ├── config.yaml                 # Webhook server settings
+├── hosted_proxy_state.json     # Hosted proxy tunnel registration + claim replay state
 ├── registry.json               # Repo → local path mapping
 ├── scheduled.json              # All scheduled events across repos
 ├── secrets/
@@ -65,6 +66,25 @@ event_subscription:
     "owner/another-repo": {
       "local_path": "/Users/jeffrey/Projects/another-repo",
       "socket_path": "/tmp/githubclaw-another-repo.sock"
+    }
+  }
+}
+```
+
+### hosted_proxy_state.json
+
+```json
+{
+  "version": 1,
+  "installations": {
+    "123456": {
+      "tunnel_url": "https://abc123.trycloudflare.com",
+      "update_secret_verifier": "sha256:...",
+      "created_at": "2026-03-12T00:00:00Z",
+      "updated_at": "2026-03-12T01:00:00Z",
+      "consumed_claim_proofs": {
+        "sha256:...": "2026-03-12T00:00:05Z"
+      }
     }
   }
 }
@@ -169,6 +189,7 @@ memory.md
 | `logs/*.jsonl` | Visionary, user, Claude Code (on request) | Orchestrator (via webhook server logging) |
 | `queue/*` | Webhook server | Webhook server |
 | `~/.githubclaw/config.yaml` | Webhook server | User / setup agent |
+| `~/.githubclaw/hosted_proxy_state.json` | Hosted proxy registration handler | Hosted proxy registration handler |
 | `~/.githubclaw/registry.json` | Webhook server | Setup agent |
 | `~/.githubclaw/scheduled.json` | Webhook server (tokio timer) | Webhook server |
 | `~/.githubclaw/secrets/*` | Webhook server (env var injection) | User / setup agent |
