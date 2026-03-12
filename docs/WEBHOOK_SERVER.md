@@ -30,9 +30,19 @@ POST /webhook
   - Discards events from repos not in registry.json
   - Checks fork PR gate before queuing
   - Persists to disk-backed serial queue
+
+GET /setup
+  - Accepts GitHub App install/setup callback query parameters
+  - Issues a short-lived single-use claim proof bound to one installation_id
+  - Returns the minimal handoff payload for the registration consumer
+
+POST /register
+  - Claims or updates one installation's hosted-proxy tunnel URL
+  - Uses one-time claim proofs for first claim and rotating update secrets later
+  - Persists enough state to reject expired or replayed credentials
 ```
 
-No internal HTTP endpoints needed — scheduled events use tokio timers in-process.
+See `docs/HOSTED_PROXY.md` for the setup-to-register handoff contract.
 
 ## Event Queue
 

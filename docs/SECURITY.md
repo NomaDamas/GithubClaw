@@ -150,6 +150,19 @@ Worker agents run in **full YOLO mode** with unrestricted shell access. This is 
 - Orchestrator `read_file` whitelist explicitly excludes `~/.githubclaw/secrets/`
 - Platform credentials injected as environment variables at agent spawn time by webhook server
 
+## Hosted Proxy Registration Boundary
+
+The hosted proxy `GET /setup` and `POST /register` endpoints form a separate narrow trust boundary:
+
+- GitHub identifies the installation during the setup callback
+- the setup step mints a short-lived single-use `claim_proof` bound to exactly one `installation_id`
+- the first successful `POST /register` consumes that proof and returns an installation-scoped `update_secret`
+- later updates require the current `update_secret`, which rotates after every successful write
+
+This boundary is intentionally minimal. It bootstraps installation registration only; it does not replace webhook HMAC verification, fork gating, orchestrator isolation, or branch protection.
+
+See `docs/HOSTED_PROXY.md` for the exact setup and registration contract.
+
 ## Branch Protection
 
 ```
