@@ -7,20 +7,81 @@ GithubClaw treats GitHub as the single source of truth. A webhook server receive
 ## Quick Start
 
 ```bash
-cargo install githubclaw          # single ~6MB binary
+cargo install --path .            # install from the current checkout
+# or, after crates.io release:
+# cargo install githubclaw
 
 cd /path/to/your-repo
 githubclaw init                   # scaffold .githubclaw/ directory
 ```
 
-1. Edit `.githubclaw/VALUE.md` with your project's mission statement.
-2. Create a GitHub App configured for webhook delivery only (see GitHub docs on creating a GitHub App). Store the webhook secret in `~/.githubclaw/secrets/webhook_secret`.
-3. Set up a tunnel (Cloudflare Tunnel, ngrok, or similar) pointing to `localhost:8000`.
-4. Start the server:
+Then follow the setup steps below.
+
+### 1. Edit your project mission
+
+Open `.githubclaw/VALUE.md` and describe what the project is about. Every agent reads this to align decisions with your goals.
+
+### 2. Set up a public tunnel
+
+GithubClaw needs a public URL so GitHub can deliver webhooks to your local machine. Pick any tunnel service:
+
+```bash
+# Option A: Cloudflare Tunnel (recommended, free)
+cloudflared tunnel --url http://localhost:8000
+
+# Option B: ngrok
+ngrok http 8000
+```
+
+Note the public URL (e.g. `https://your-tunnel.trycloudflare.com`).
+
+### 3. Create a GitHub App
+
+1. Go to **GitHub Settings > Developer settings > GitHub Apps > New GitHub App**.
+2. Fill in:
+   - **GitHub App name**: `GithubClaw` (or any name you like)
+   - **Homepage URL**: your repo URL
+   - **Webhook URL**: your tunnel URL + `/webhook` (e.g. `https://your-tunnel.trycloudflare.com/webhook`)
+   - **Webhook secret**: copy the value from `~/.githubclaw/secrets/webhook_secret` (generated during `githubclaw init`)
+3. Under **Permissions**, grant:
+   - **Repository permissions**:
+     - Issues: Read & Write
+     - Pull requests: Read & Write
+     - Contents: Read & Write
+     - Discussions: Read & Write
+     - Projects: Read & Write
+     - Checks: Read-only
+     - Metadata: Read-only
+   - **Organization permissions**: None needed
+4. Under **Subscribe to events**, check:
+   - Issues, Issue comment
+   - Pull request, Pull request review, Pull request review comment
+   - Discussion, Discussion comment
+   - Check suite, Check run
+   - Label, Milestone, Projects v2 item
+5. Set **Where can this GitHub App be installed?** to "Only on this account".
+6. Click **Create GitHub App**.
+
+### 4. Install the GitHub App
+
+1. After creation, click **Install App** in the sidebar.
+2. Choose **Only select repositories** and pick the repo(s) you want GithubClaw to manage.
+3. Click **Install**.
+
+### 5. Start the server
 
 ```bash
 githubclaw start
 ```
+
+Verify it's running:
+
+```bash
+githubclaw status          # show server status + registered repos
+curl http://localhost:8000/health   # should return {"status":"ok"}
+```
+
+To test the webhook delivery, open an issue on your repo. You should see it appear in the queue and get processed by the orchestrator.
 
 ## How It Works
 
@@ -46,8 +107,8 @@ githubclaw start
         +-------------+  +-------------+
         | Orchestrator |  |   Worker    |
         | (per-repo)   |  |   Agents    |
-        | Claude Agent |  | Claude Code |
-        | SDK          |  |   / Codex   |
+        | Codex /      |  | Codex /     |
+        | Claude Code  |  | Claude Code |
         +-------------+  +-------------+
                                |
                          (gh CLI / git)
@@ -125,7 +186,7 @@ For detailed specs, see:
 
 ## Requirements
 
-- Rust 1.75+ (or install the pre-built binary via `cargo install githubclaw`)
+- Rust 1.75+ (`cargo install --path .` from this repo, or `cargo install githubclaw` after crates.io release)
 - `gh` CLI (authenticated)
 - Claude Code or Codex CLI
 - A tunnel service (Cloudflare Tunnel, ngrok, etc.)
