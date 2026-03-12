@@ -4,5 +4,4 @@
 set -euo pipefail
 
 cat "${PROMPT_FILE}" | codex exec - \
-  --approval-mode full-auto \
-  --sandbox off
+  --dangerously-bypass-approvals-and-sandbox

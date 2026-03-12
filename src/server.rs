@@ -711,6 +711,10 @@ async fn execute_dispatch(
                 );
             }
         }
+        // Clean up the temp prompt file now that the agent has exited.
+        if let Err(e) = std::fs::remove_file(&prompt_file_for_cleanup) {
+            debug!("Failed to clean up prompt file {:?}: {}", prompt_file_for_cleanup, e);
+        }
     });
 
     Ok(())
