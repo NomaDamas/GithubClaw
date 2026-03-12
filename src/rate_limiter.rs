@@ -6,7 +6,7 @@
 //! - Recovery: tokio timer periodically attempts lightweight API probe. On success, resume.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::time::{Duration, interval};
+use tokio::time::{interval, Duration};
 
 use crate::constants::DEFAULT_RECOVERY_PROBE_INTERVAL_SECONDS;
 

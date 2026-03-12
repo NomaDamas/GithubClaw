@@ -9,6 +9,8 @@ Per-user, shared across all repos. Created during initial `cargo install githubc
 ├── config.yaml                 # Webhook server settings
 ├── registry.json               # Repo → local path mapping
 ├── scheduled.json              # All scheduled events across repos
+├── hosted_proxy/
+│   └── installations.json      # Hosted-proxy installation mapping snapshot
 ├── secrets/
 │   ├── webhook_secret          # GitHub App HMAC secret
 │   └── twitter_credentials     # Platform API keys (extensible)
@@ -95,6 +97,28 @@ event_subscription:
 }
 ```
 
+### hosted_proxy/installations.json
+
+```json
+{
+  "installations": {
+    "123456": {
+      "tunnel_url": "https://abc123.trycloudflare.com",
+      "update_secret_hash": "baf1f6...sha256...",
+      "created_at": "2026-03-12T09:00:00Z",
+      "updated_at": "2026-03-12T09:10:00Z",
+      "used_claim_proof_hashes": [
+        "47d0d3...sha256..."
+      ]
+    }
+  }
+}
+```
+
+- `update_secret_hash` stores a verifier, not the raw `update_secret`
+- `used_claim_proof_hashes` preserves successful-claim replay rejection across restarts
+- The webhook server writes this file atomically via temp file + rename
+
 ## Per-Repo Configuration (`.githubclaw/`)
 
 Created by `githubclaw init`, lives inside the target repo. User controls what gets committed via `.gitignore`.
@@ -171,6 +195,7 @@ memory.md
 | `~/.githubclaw/config.yaml` | Webhook server | User / setup agent |
 | `~/.githubclaw/registry.json` | Webhook server | Setup agent |
 | `~/.githubclaw/scheduled.json` | Webhook server (tokio timer) | Webhook server |
+| `~/.githubclaw/hosted_proxy/installations.json` | Webhook server (`POST /register`) | Webhook server |
 | `~/.githubclaw/secrets/*` | Webhook server (env var injection) | User / setup agent |
 
 ## Runtime Files

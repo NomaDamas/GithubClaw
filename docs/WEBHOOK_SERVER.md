@@ -30,6 +30,13 @@ POST /webhook
   - Discards events from repos not in registry.json
   - Checks fork PR gate before queuing
   - Persists to disk-backed serial queue
+
+POST /register
+  - Claims or updates one installation's hosted-proxy tunnel URL
+  - Uses one-time `claim_proof` for the first claim
+  - Uses rotating `update_secret` for later updates
+  - Persists replay-protection state to `~/.githubclaw/hosted_proxy/installations.json`
+  - See `docs/HOSTED_PROXY.md` for the full contract
 ```
 
 No internal HTTP endpoints needed — scheduled events use tokio timers in-process.

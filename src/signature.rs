@@ -19,11 +19,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// # Returns
 ///
 /// `true` if the signature is valid, `false` otherwise.
-pub fn verify_webhook_signature(
-    payload_body: &[u8],
-    signature_header: &str,
-    secret: &str,
-) -> bool {
+pub fn verify_webhook_signature(payload_body: &[u8], signature_header: &str, secret: &str) -> bool {
     if signature_header.is_empty() {
         return false;
     }
