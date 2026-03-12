@@ -30,9 +30,42 @@ POST /webhook
   - Discards events from repos not in registry.json
   - Checks fork PR gate before queuing
   - Persists to disk-backed serial queue
+
+POST /register
+  - Claims or updates the tunnel URL for one GitHub App installation
+  - Requires a short-lived registration token scoped to exactly one installation_id
+  - Rejects non-HTTPS, non-origin, localhost, loopback, and private-network tunnel URLs
+  - Persists installation_id -> tunnel URL mapping on disk so it survives restart
 ```
 
 No internal HTTP endpoints needed — scheduled events use tokio timers in-process.
+
+### Registration Flow
+
+The hosted proxy MVP uses a minimal signed-token contract instead of embedding GitHub OAuth or installation-owner checks directly in the proxy:
+
+1. A separate trusted step verifies the installer with GitHub and mints a short-lived `registration_token`.
+2. The token contains `installation_id`, `issued_at`, and `expires_at`, then is HMAC-signed with the proxy's registration secret.
+3. The client calls `POST /register` with:
+
+```json
+{
+  "installation_id": 123456,
+  "tunnel_url": "https://abc123.trycloudflare.com",
+  "registration_token": "<opaque signed token>"
+}
+```
+
+4. The proxy verifies the token, confirms the body `installation_id` matches the signed claim, normalizes the tunnel origin, and writes the mapping to disk.
+5. A later call with a fresh token for the same `installation_id` rotates the tunnel URL in place.
+
+Response semantics:
+
+- `201 Created`: first successful claim for that installation
+- `200 OK`: tunnel URL updated for the same installation
+- `400 Bad Request`: malformed or unsafe tunnel URL / invalid installation input
+- `403 Forbidden`: invalid, expired, or mismatched registration token
+- `500 Internal Server Error`: persistence failure
 
 ## Event Queue
 
