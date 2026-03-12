@@ -35,6 +35,7 @@ POST /register
   - Claims or updates one installation's hosted-proxy tunnel URL
   - Uses one-time `claim_proof` for the first claim
   - Uses rotating `update_secret` for later updates
+  - Rotates `update_secret` on every successful update
   - Rejects unsafe or malformed tunnel URLs
   - See `docs/HOSTED_PROXY.md` for the full contract
 ```
