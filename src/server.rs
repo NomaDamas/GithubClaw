@@ -8,10 +8,11 @@
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::Json,
+    response::IntoResponse,
     routing::{get, post},
-    Router,
+    Json, Router,
 };
+use chrono::Utc;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ use tracing::{debug, error, info, warn};
 use crate::agents::parser::load_agent_definition;
 use crate::agents::prompt_assembler::PromptAssembler;
 use crate::agents::spawner::AgentSpawner;
+use crate::hosted_proxy::{error_code, error_message, HostedProxyService, RegisterError};
 use crate::orchestrator::schema::Action;
 use crate::orchestrator::session::OrchestratorSession;
 use crate::process_manager::{check_fork_pr_gate, ProcessManager};
@@ -36,6 +38,7 @@ use crate::signature::verify_webhook_signature;
 /// All shared state for the running webhook server.
 pub struct ServerState {
     pub webhook_secret: String,
+    pub hosted_proxy: Arc<HostedProxyService>,
     pub registry: RwLock<HashMap<String, RegistryEntry>>,
     pub started_repos: RwLock<HashSet<String>>,
     pub queues: Mutex<HashMap<String, DiskPersistedQueue>>,
@@ -73,7 +76,13 @@ pub struct RegistryFile {
 pub fn load_webhook_secret(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path)
         .map(|s| s.trim().to_string())
-        .map_err(|e| format!("Failed to read webhook secret from {}: {}", path.display(), e))
+        .map_err(|e| {
+            format!(
+                "Failed to read webhook secret from {}: {}",
+                path.display(),
+                e
+            )
+        })
 }
 
 /// Load the repo registry mapping `full_name -> RegistryEntry`.
@@ -83,7 +92,10 @@ pub fn load_webhook_secret(path: &Path) -> Result<String, String> {
 /// - Flat: `{ "owner/repo": { "local_path": "..." } }`
 pub fn load_registry(path: &Path) -> HashMap<String, RegistryEntry> {
     if !path.exists() {
-        warn!("Registry file not found at {} -- no repos registered", path.display());
+        warn!(
+            "Registry file not found at {} -- no repos registered",
+            path.display()
+        );
         return HashMap::new();
     }
 
@@ -140,10 +152,7 @@ fn annotate_fork_status(mut payload: Value) -> Value {
 
     if !has_approved_label {
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert(
-                "_githubclaw_fork_unapproved".to_string(),
-                Value::Bool(true),
-            );
+            obj.insert("_githubclaw_fork_unapproved".to_string(), Value::Bool(true));
         }
         let pr_number = payload
             .pointer("/pull_request/number")
@@ -189,10 +198,7 @@ fn get_or_create_queue<'a>(
             fallback_queue_dir(githubclaw_home, repo_full_name)
         };
 
-        let q = DiskPersistedQueue::new(
-            &queue_dir,
-            crate::constants::DEFAULT_QUEUE_MAX_RETRY,
-        )?;
+        let q = DiskPersistedQueue::new(&queue_dir, crate::constants::DEFAULT_QUEUE_MAX_RETRY)?;
         queues.insert(repo_full_name.to_string(), q);
     }
     Ok(queues.get_mut(repo_full_name).unwrap())
@@ -212,7 +218,11 @@ async fn registry_snapshot(state: &Arc<ServerState>) -> HashMap<String, Registry
     state.registry.read().await.clone()
 }
 
-pub async fn start_repo_processing(state: Arc<ServerState>, repo_name: &str, entry: &RegistryEntry) {
+pub async fn start_repo_processing(
+    state: Arc<ServerState>,
+    repo_name: &str,
+    entry: &RegistryEntry,
+) {
     {
         let mut started = state.started_repos.write().await;
         if !started.insert(repo_name.to_string()) {
@@ -228,7 +238,10 @@ pub async fn start_repo_processing(state: Arc<ServerState>, repo_name: &str, ent
     });
 }
 
-async fn ensure_repo_registered(state: &Arc<ServerState>, repo_full_name: &str) -> Option<RegistryEntry> {
+async fn ensure_repo_registered(
+    state: &Arc<ServerState>,
+    repo_full_name: &str,
+) -> Option<RegistryEntry> {
     if let Some(entry) = state.registry.read().await.get(repo_full_name).cloned() {
         return Some(entry);
     }
@@ -243,10 +256,16 @@ async fn ensure_repo_registered(state: &Arc<ServerState>, repo_full_name: &str) 
     }
 
     if let Err(e) = bootstrap_repo(state, repo_full_name, &entry, false).await {
-        warn!("Bootstrap failed for {} after registry refresh: {}", repo_full_name, e);
+        warn!(
+            "Bootstrap failed for {} after registry refresh: {}",
+            repo_full_name, e
+        );
     }
     start_repo_processing(Arc::clone(state), repo_full_name, &entry).await;
-    info!("Hot-registered repo {} from refreshed registry", repo_full_name);
+    info!(
+        "Hot-registered repo {} from refreshed registry",
+        repo_full_name
+    );
 
     Some(entry)
 }
@@ -305,25 +324,19 @@ async fn webhook_handler(
         .to_string();
 
     if repo_full_name.is_empty() {
-        debug!(
-            "Discarding event for unregistered repo: {}",
-            repo_full_name
-        );
-        return Ok((
-            StatusCode::OK,
-            "Ignored: repo not registered".to_string(),
-        ));
+        debug!("Discarding event for unregistered repo: {}", repo_full_name);
+        return Ok((StatusCode::OK, "Ignored: repo not registered".to_string()));
     }
 
-    if ensure_repo_registered(&state, &repo_full_name).await.is_none() {
+    if ensure_repo_registered(&state, &repo_full_name)
+        .await
+        .is_none()
+    {
         debug!(
             "Discarding event for unregistered repo after refresh: {}",
             repo_full_name
         );
-        return Ok((
-            StatusCode::OK,
-            "Ignored: repo not registered".to_string(),
-        ));
+        return Ok((StatusCode::OK, "Ignored: repo not registered".to_string()));
     }
 
     // 4. Fork PR annotation
@@ -335,10 +348,7 @@ async fn webhook_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
 
-    let action = payload
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let action = payload.get("action").and_then(Value::as_str).unwrap_or("");
 
     let event_label = if action.is_empty() {
         event_type.to_string()
@@ -385,6 +395,124 @@ async fn health_handler(State(state): State<Arc<ServerState>>) -> Json<Value> {
     }))
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct SetupInstallCallbackQuery {
+    installation_id: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RegisterRequest {
+    installation_id: u64,
+    tunnel_url: String,
+    #[serde(default)]
+    claim_proof: Option<String>,
+    #[serde(default)]
+    update_secret: Option<String>,
+}
+
+async fn setup_install_callback_handler(
+    State(state): State<Arc<ServerState>>,
+    axum::extract::Query(query): axum::extract::Query<SetupInstallCallbackQuery>,
+) -> impl IntoResponse {
+    match state
+        .hosted_proxy
+        .mint_claim_proof_at(query.installation_id, Utc::now())
+    {
+        Ok(issued) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "installation_id": issued.installation_id,
+                "claim_proof": issued.claim_proof,
+                "expires_at": issued.expires_at,
+            })),
+        )
+            .into_response(),
+        Err(error) => hosted_proxy_error_response(error),
+    }
+}
+
+async fn register_handler(
+    State(state): State<Arc<ServerState>>,
+    Json(request): Json<RegisterRequest>,
+) -> impl IntoResponse {
+    match (&request.claim_proof, &request.update_secret) {
+        (Some(_), Some(_)) | (None, None) => {
+            return hosted_proxy_error_response(RegisterError::InvalidRequest);
+        }
+        _ => {}
+    }
+
+    if let Some(claim_proof) = &request.claim_proof {
+        match state.hosted_proxy.register_with_claim_proof_at(
+            request.installation_id,
+            &request.tunnel_url,
+            claim_proof,
+            Utc::now(),
+        ) {
+            Ok(result) => (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "status": "claimed",
+                    "installation_id": result.installation_id,
+                    "tunnel_url": result.tunnel_url,
+                    "update_secret": result.update_secret,
+                    "rotated": false,
+                })),
+            )
+                .into_response(),
+            Err(error) => hosted_proxy_error_response(error),
+        }
+    } else {
+        match state.hosted_proxy.update_registration_at(
+            request.installation_id,
+            &request.tunnel_url,
+            request.update_secret.as_deref().unwrap_or_default(),
+            Utc::now(),
+        ) {
+            Ok(result) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "updated",
+                    "installation_id": result.installation_id,
+                    "tunnel_url": result.tunnel_url,
+                    "update_secret": result.update_secret,
+                    "rotated": true,
+                })),
+            )
+                .into_response(),
+            Err(error) => hosted_proxy_error_response(error),
+        }
+    }
+}
+
+fn hosted_proxy_error_response(error: RegisterError) -> axum::response::Response {
+    let status = match error {
+        RegisterError::InvalidRequest
+        | RegisterError::InvalidTunnelUrl
+        | RegisterError::UnsafeTunnelUrl => StatusCode::BAD_REQUEST,
+        RegisterError::AlreadyClaimed => StatusCode::CONFLICT,
+        RegisterError::PersistenceFailure | RegisterError::SecretRotationFailure => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        RegisterError::InvalidClaimProof
+        | RegisterError::ExpiredClaimProof
+        | RegisterError::ClaimProofAlreadyUsed
+        | RegisterError::InvalidUpdateSecret
+        | RegisterError::OwnershipMismatch => StatusCode::FORBIDDEN,
+    };
+
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "code": error_code(&error),
+                "message": error_message(&error),
+            }
+        })),
+    )
+        .into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
@@ -402,13 +530,8 @@ pub async fn bootstrap_repo(
     if !force {
         let mut queues = state.queues.lock().await;
         let registry = registry_snapshot(state).await;
-        let queue = get_or_create_queue(
-            &mut queues,
-            &registry,
-            &state.githubclaw_home,
-            repo_name,
-        )
-        .map_err(|e| format!("Queue creation error: {}", e))?;
+        let queue = get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+            .map_err(|e| format!("Queue creation error: {}", e))?;
 
         if queue.size() > 0 {
             info!(
@@ -444,13 +567,9 @@ pub async fn bootstrap_repo(
         if !issues.is_empty() {
             let mut queues = state.queues.lock().await;
             let registry = registry_snapshot(state).await;
-            let queue = get_or_create_queue(
-                &mut queues,
-                &registry,
-                &state.githubclaw_home,
-                repo_name,
-            )
-            .map_err(|e| format!("Queue creation error: {}", e))?;
+            let queue =
+                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+                    .map_err(|e| format!("Queue creation error: {}", e))?;
 
             for issue in &issues {
                 queue
@@ -503,13 +622,9 @@ pub async fn bootstrap_repo(
         if !prs.is_empty() {
             let mut queues = state.queues.lock().await;
             let registry = registry_snapshot(state).await;
-            let queue = get_or_create_queue(
-                &mut queues,
-                &registry,
-                &state.githubclaw_home,
-                repo_name,
-            )
-            .map_err(|e| format!("Queue creation error: {}", e))?;
+            let queue =
+                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+                    .map_err(|e| format!("Queue creation error: {}", e))?;
 
             for pr in &prs {
                 queue
@@ -544,6 +659,11 @@ pub async fn bootstrap_repo(
 /// Build the axum router with shared state.
 pub fn create_router(state: Arc<ServerState>) -> Router {
     Router::new()
+        .route(
+            "/setup/install/callback",
+            get(setup_install_callback_handler),
+        )
+        .route("/register", post(register_handler))
         .route("/webhook", post(webhook_handler))
         .route("/health", get(health_handler))
         .with_state(state)
@@ -653,13 +773,16 @@ async fn execute_dispatch(
 
     // 8. Register with ProcessManager for monitoring.
     let label = format!("{}/{}", dispatch.agent_type, dispatch.issue_ref);
-    state.process_manager.register(
-        pid,
-        crate::process_manager::ProcessKind::Worker,
-        repo_full_name,
-        &label,
-        crate::constants::DEFAULT_PROCESS_TIMEOUT_SECONDS,
-    ).await;
+    state
+        .process_manager
+        .register(
+            pid,
+            crate::process_manager::ProcessKind::Worker,
+            repo_full_name,
+            &label,
+            crate::constants::DEFAULT_PROCESS_TIMEOUT_SECONDS,
+        )
+        .await;
 
     info!(
         pid,
@@ -713,7 +836,10 @@ async fn execute_dispatch(
         }
         // Clean up the temp prompt file now that the agent has exited.
         if let Err(e) = std::fs::remove_file(&prompt_file_for_cleanup) {
-            debug!("Failed to clean up prompt file {:?}: {}", prompt_file_for_cleanup, e);
+            debug!(
+                "Failed to clean up prompt file {:?}: {}",
+                prompt_file_for_cleanup, e
+            );
         }
     });
 
@@ -749,7 +875,10 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 
     loop {
         if state.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            info!("Shutdown signal received, stopping drain loop for {}", repo_name);
+            info!(
+                "Shutdown signal received, stopping drain loop for {}",
+                repo_name
+            );
             break;
         }
         // 1. Peek the queue for the next event.
@@ -803,16 +932,18 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         let response_text = {
             let mut orchestrators = state.orchestrators.lock().await;
             let registry = state.registry.read().await;
-            let session = orchestrators.entry(repo_name.to_string()).or_insert_with(|| {
-                let entry = registry.get(repo_name).unwrap();
-                OrchestratorSession::new(
-                    repo_name,
-                    &entry.local_path,
-                    state.orchestrator_backend.clone(),
-                    None,
-                    None,
-                )
-            });
+            let session = orchestrators
+                .entry(repo_name.to_string())
+                .or_insert_with(|| {
+                    let entry = registry.get(repo_name).unwrap();
+                    OrchestratorSession::new(
+                        repo_name,
+                        &entry.local_path,
+                        state.orchestrator_backend.clone(),
+                        None,
+                        None,
+                    )
+                });
             match session.process_event(&event_json).await {
                 Ok(text) => text,
                 Err(e) => {
@@ -889,36 +1020,34 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                     repo,
                     payload,
                     context,
-                } => {
-                    match chrono::DateTime::parse_from_rfc3339(trigger_at) {
-                        Ok(dt) => {
-                            let mut scheduler = state.scheduler.lock().await;
-                            let id = scheduler.create_event(
-                                repo,
-                                dt.with_timezone(&chrono::Utc),
-                                payload.clone(),
-                                true,
-                                None,
-                                context,
-                            );
-                            info!(
-                                repo = %repo_name,
-                                event_id = %id,
-                                trigger_at = %trigger_at,
-                                "Scheduled event created",
-                            );
-                        }
-                        Err(e) => {
-                            error!(
-                                repo = %repo_name,
-                                "Invalid trigger_at '{}': {}",
-                                trigger_at,
-                                e,
-                            );
-                            all_ok = false;
-                        }
+                } => match chrono::DateTime::parse_from_rfc3339(trigger_at) {
+                    Ok(dt) => {
+                        let mut scheduler = state.scheduler.lock().await;
+                        let id = scheduler.create_event(
+                            repo,
+                            dt.with_timezone(&chrono::Utc),
+                            payload.clone(),
+                            true,
+                            None,
+                            context,
+                        );
+                        info!(
+                            repo = %repo_name,
+                            event_id = %id,
+                            trigger_at = %trigger_at,
+                            "Scheduled event created",
+                        );
                     }
-                }
+                    Err(e) => {
+                        error!(
+                            repo = %repo_name,
+                            "Invalid trigger_at '{}': {}",
+                            trigger_at,
+                            e,
+                        );
+                        all_ok = false;
+                    }
+                },
                 Action::CancelEvent { event_id } => {
                     let mut scheduler = state.scheduler.lock().await;
                     let cancelled = scheduler.cancel_event(event_id);
@@ -958,12 +1087,9 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         if all_ok {
             let mut queues = state.queues.lock().await;
             let registry = registry_snapshot(state).await;
-            if let Ok(q) = get_or_create_queue(
-                &mut queues,
-                &registry,
-                &state.githubclaw_home,
-                repo_name,
-            ) {
+            if let Ok(q) =
+                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+            {
                 if let Err(e) = q.dequeue() {
                     error!(repo = %repo_name, "Failed to dequeue after success: {}", e);
                 }
@@ -979,12 +1105,8 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 async fn nack_head_event(state: &Arc<ServerState>, repo_name: &str, _filename: &str) {
     let mut queues = state.queues.lock().await;
     let registry = registry_snapshot(state).await;
-    let queue = match get_or_create_queue(
-        &mut queues,
-        &registry,
-        &state.githubclaw_home,
-        repo_name,
-    ) {
+    let queue = match get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+    {
         Ok(q) => q,
         Err(e) => {
             error!(repo = %repo_name, "Failed to get queue for nack: {}", e);
@@ -1049,6 +1171,12 @@ mod tests {
         let scheduler_path = tmp.path().join(".githubclaw").join("scheduled.json");
         Arc::new(ServerState {
             webhook_secret: TEST_SECRET.to_string(),
+            hosted_proxy: Arc::new(
+                crate::hosted_proxy::HostedProxyService::new(
+                    &tmp.path().join("hosted-proxy-state.json"),
+                )
+                .unwrap(),
+            ),
             registry: RwLock::new(registry),
             started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
@@ -1105,6 +1233,30 @@ mod tests {
         let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(body["status"], "ok");
         assert_eq!(body["registered_repos"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_setup_install_callback_mints_claim_proof() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/setup/install/callback?installation_id=42")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["installation_id"], 42);
+        assert!(body["claim_proof"].as_str().unwrap().starts_with("cp_"));
+        assert!(body.get("expires_at").is_some());
     }
 
     // ---------------------------------------------------------------
@@ -1453,8 +1605,7 @@ mod tests {
             "repository": { "full_name": "owner/repo" },
         });
 
-        let result =
-            execute_dispatch(&state, &dispatch, &event_payload, "owner/repo").await;
+        let result = execute_dispatch(&state, &dispatch, &event_payload, "owner/repo").await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1503,8 +1654,7 @@ mod tests {
             }
         });
 
-        let result =
-            execute_dispatch(&state, &dispatch, &event_payload, "owner/repo").await;
+        let result = execute_dispatch(&state, &dispatch, &event_payload, "owner/repo").await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
