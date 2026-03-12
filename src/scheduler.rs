@@ -41,7 +41,7 @@ impl ScheduledEvent {
 
     /// Returns `true` if the event's trigger time is at or before `now`.
     pub fn is_due(&self, now: DateTime<Utc>) -> bool {
-        self.trigger_datetime().map_or(false, |dt| dt <= now)
+        self.trigger_datetime().is_some_and(|dt| dt <= now)
     }
 }
 
@@ -95,8 +95,7 @@ impl ScheduledEventManager {
             std::fs::create_dir_all(parent)?;
         }
 
-        let data = serde_json::to_string_pretty(&self.events)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let data = serde_json::to_string_pretty(&self.events).map_err(std::io::Error::other)?;
 
         let tmp_path = self.json_path.with_extension("tmp");
         std::fs::write(&tmp_path, &data)?;
@@ -189,7 +188,7 @@ impl ScheduledEventManager {
                                 let mut e = event;
                                 if let Some(mut next) = e.trigger_datetime() {
                                     while next <= now {
-                                        next = next + chrono::Duration::seconds(interval as i64);
+                                        next += chrono::Duration::seconds(interval as i64);
                                     }
                                     e.trigger_at = next.to_rfc3339();
                                     e.retry_count = 0;
@@ -280,7 +279,14 @@ mod tests {
     fn create_event_adds_to_list_and_saves() {
         let (mut mgr, _dir) = temp_manager();
         let trigger = Utc::now() + Duration::hours(1);
-        let id = mgr.create_event("owner/repo", trigger, json!({"key": "val"}), true, None, "test event");
+        let id = mgr.create_event(
+            "owner/repo",
+            trigger,
+            json!({"key": "val"}),
+            true,
+            None,
+            "test event",
+        );
 
         assert_eq!(mgr.list_events().len(), 1);
         assert_eq!(mgr.list_events()[0].event_id, id);
@@ -343,7 +349,14 @@ mod tests {
         {
             let mut mgr = ScheduledEventManager::new(&path);
             let trigger = Utc::now() + Duration::hours(1);
-            mgr.create_event("owner/repo", trigger, json!({"action": "test"}), true, None, "roundtrip");
+            mgr.create_event(
+                "owner/repo",
+                trigger,
+                json!({"action": "test"}),
+                true,
+                None,
+                "roundtrip",
+            );
         }
 
         // Load in a new manager
@@ -370,6 +383,13 @@ mod tests {
     fn recurring_event_requires_interval_seconds() {
         let (mut mgr, _dir) = temp_manager();
         let trigger = Utc::now() + Duration::hours(1);
-        mgr.create_event("owner/repo", trigger, json!({}), false, None, "bad recurring");
+        mgr.create_event(
+            "owner/repo",
+            trigger,
+            json!({}),
+            false,
+            None,
+            "bad recurring",
+        );
     }
 }
