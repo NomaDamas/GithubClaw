@@ -15,6 +15,8 @@ Per-user, shared across all repos. Created during initial `cargo install githubc
 ├── sessions/                    # Persisted orchestrator sessions
 │   └── {repo-name}/
 │       └── session_state.json   # Message history + state for resume
+├── hosted_proxy/
+│   └── state.json               # Hosted-proxy installation -> tunnel mapping state
 └── logs/
     └── webhook_server.log      # Server-level logs
 ```
@@ -171,6 +173,7 @@ memory.md
 | `~/.githubclaw/config.yaml` | Webhook server | User / setup agent |
 | `~/.githubclaw/registry.json` | Webhook server | Setup agent |
 | `~/.githubclaw/scheduled.json` | Webhook server (tokio timer) | Webhook server |
+| `~/.githubclaw/hosted_proxy/state.json` | Webhook server (`POST /register`) | Webhook server |
 | `~/.githubclaw/secrets/*` | Webhook server (env var injection) | User / setup agent |
 
 ## Runtime Files
