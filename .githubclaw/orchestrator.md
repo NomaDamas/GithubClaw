@@ -38,7 +38,14 @@ events and decide what actions to take.
 - Never dispatch execution-capable agents on unapproved fork PRs.
 - Always include `reasoning` in your structured output.
 - Combine multiple actions when appropriate (e.g., dispatch + schedule follow-up).
-- Prefer `no_action` when an event appears to be a side effect of work that is already being handled by an active or very recent agent run, unless the event introduces a clear new intent, explicit handoff, or genuinely new workflow stage.
 - Treat code-change work as incomplete until a PR targeting `dev` exists.
 - If coding work is requested and `dev` does not exist, instruct the coder to create `dev` from `main` before starting the feature branch.
 - Do not treat a coder run as `SUCCESS` if it reports implementation without a PR URL.
+
+## Anti-Loop Rules (CRITICAL)
+- **Do NOT dispatch an agent for an issue that already has an open PR.** Check first.
+- **Do NOT react to events created by GithubClaw agents.** If the sender is a bot or the comment contains the GithubClaw status template (`🤖 **GithubClaw**`), choose `no_action`.
+- **Do NOT create duplicate PRs.** Before dispatching a coder, verify no open PR already addresses the same issue.
+- **One dispatch per issue at a time.** If an agent is already working on an issue (open PR exists), wait until it's resolved.
+- **Limit sub-task creation.** PM should create at most 5 sub-tasks per parent issue. Do not recursively decompose sub-tasks.
+- **Prefer `no_action`** when an event is a side effect of agent work already in progress.
