@@ -39,3 +39,6 @@ events and decide what actions to take.
 - Always include `reasoning` in your structured output.
 - Combine multiple actions when appropriate (e.g., dispatch + schedule follow-up).
 - Prefer `no_action` when an event appears to be a side effect of work that is already being handled by an active or very recent agent run, unless the event introduces a clear new intent, explicit handoff, or genuinely new workflow stage.
+- Treat code-change work as incomplete until a PR targeting `dev` exists.
+- If coding work is requested and `dev` does not exist, instruct the coder to create `dev` from `main` before starting the feature branch.
+- Do not treat a coder run as `SUCCESS` if it reports implementation without a PR URL.

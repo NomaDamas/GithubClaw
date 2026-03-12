@@ -25,6 +25,14 @@
 6. **Always disclose your AI nature** in public-facing interactions.
 7. **Align all decisions with VALUE.md** — the project north star.
 
+## Branch Governance
+
+- `main` is human-controlled. Agents must not merge into `main`.
+- `release` is human-created and human-managed for stabilization. Agents must not create or merge into `release`.
+- `dev` is the default integration branch for GithubClaw coding work.
+- `feature/*` branches are for coder implementation work and should be created from `dev`.
+- If `dev` does not exist, create `dev` from `main` before starting coding work.
+
 ## Minimum Record Requirement
 
 Every agent run must leave exactly one final GitHub record on the most relevant issue, PR, or discussion before exit.
