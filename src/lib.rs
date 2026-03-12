@@ -7,6 +7,7 @@ pub mod orchestrator;
 pub mod process_manager;
 pub mod queue;
 pub mod rate_limiter;
+pub mod registration;
 pub mod scheduler;
 pub mod server;
 pub mod signature;

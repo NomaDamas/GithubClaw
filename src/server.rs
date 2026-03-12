@@ -6,6 +6,7 @@
 //! Translated from the Python `server.py`.
 
 use axum::{
+    extract::rejection::JsonRejection,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::Json,
@@ -26,6 +27,9 @@ use crate::orchestrator::schema::Action;
 use crate::orchestrator::session::OrchestratorSession;
 use crate::process_manager::{check_fork_pr_gate, ProcessManager};
 use crate::queue::DiskPersistedQueue;
+use crate::registration::{
+    AuthCredential, RegistrationError, RegistrationOutcome, RegistrationState,
+};
 use crate::scheduler::ScheduledEventManager;
 use crate::signature::verify_webhook_signature;
 
@@ -40,6 +44,7 @@ pub struct ServerState {
     pub started_repos: RwLock<HashSet<String>>,
     pub queues: Mutex<HashMap<String, DiskPersistedQueue>>,
     pub githubclaw_home: PathBuf,
+    pub registration: Arc<RegistrationState>,
     pub process_manager: Arc<ProcessManager>,
     pub scheduler: Mutex<ScheduledEventManager>,
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
@@ -73,7 +78,13 @@ pub struct RegistryFile {
 pub fn load_webhook_secret(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path)
         .map(|s| s.trim().to_string())
-        .map_err(|e| format!("Failed to read webhook secret from {}: {}", path.display(), e))
+        .map_err(|e| {
+            format!(
+                "Failed to read webhook secret from {}: {}",
+                path.display(),
+                e
+            )
+        })
 }
 
 /// Load the repo registry mapping `full_name -> RegistryEntry`.
@@ -83,7 +94,10 @@ pub fn load_webhook_secret(path: &Path) -> Result<String, String> {
 /// - Flat: `{ "owner/repo": { "local_path": "..." } }`
 pub fn load_registry(path: &Path) -> HashMap<String, RegistryEntry> {
     if !path.exists() {
-        warn!("Registry file not found at {} -- no repos registered", path.display());
+        warn!(
+            "Registry file not found at {} -- no repos registered",
+            path.display()
+        );
         return HashMap::new();
     }
 
@@ -140,10 +154,7 @@ fn annotate_fork_status(mut payload: Value) -> Value {
 
     if !has_approved_label {
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert(
-                "_githubclaw_fork_unapproved".to_string(),
-                Value::Bool(true),
-            );
+            obj.insert("_githubclaw_fork_unapproved".to_string(), Value::Bool(true));
         }
         let pr_number = payload
             .pointer("/pull_request/number")
@@ -189,10 +200,7 @@ fn get_or_create_queue<'a>(
             fallback_queue_dir(githubclaw_home, repo_full_name)
         };
 
-        let q = DiskPersistedQueue::new(
-            &queue_dir,
-            crate::constants::DEFAULT_QUEUE_MAX_RETRY,
-        )?;
+        let q = DiskPersistedQueue::new(&queue_dir, crate::constants::DEFAULT_QUEUE_MAX_RETRY)?;
         queues.insert(repo_full_name.to_string(), q);
     }
     Ok(queues.get_mut(repo_full_name).unwrap())
@@ -212,7 +220,11 @@ async fn registry_snapshot(state: &Arc<ServerState>) -> HashMap<String, Registry
     state.registry.read().await.clone()
 }
 
-pub async fn start_repo_processing(state: Arc<ServerState>, repo_name: &str, entry: &RegistryEntry) {
+pub async fn start_repo_processing(
+    state: Arc<ServerState>,
+    repo_name: &str,
+    entry: &RegistryEntry,
+) {
     {
         let mut started = state.started_repos.write().await;
         if !started.insert(repo_name.to_string()) {
@@ -228,7 +240,10 @@ pub async fn start_repo_processing(state: Arc<ServerState>, repo_name: &str, ent
     });
 }
 
-async fn ensure_repo_registered(state: &Arc<ServerState>, repo_full_name: &str) -> Option<RegistryEntry> {
+async fn ensure_repo_registered(
+    state: &Arc<ServerState>,
+    repo_full_name: &str,
+) -> Option<RegistryEntry> {
     if let Some(entry) = state.registry.read().await.get(repo_full_name).cloned() {
         return Some(entry);
     }
@@ -243,10 +258,16 @@ async fn ensure_repo_registered(state: &Arc<ServerState>, repo_full_name: &str) 
     }
 
     if let Err(e) = bootstrap_repo(state, repo_full_name, &entry, false).await {
-        warn!("Bootstrap failed for {} after registry refresh: {}", repo_full_name, e);
+        warn!(
+            "Bootstrap failed for {} after registry refresh: {}",
+            repo_full_name, e
+        );
     }
     start_repo_processing(Arc::clone(state), repo_full_name, &entry).await;
-    info!("Hot-registered repo {} from refreshed registry", repo_full_name);
+    info!(
+        "Hot-registered repo {} from refreshed registry",
+        repo_full_name
+    );
 
     Some(entry)
 }
@@ -305,25 +326,19 @@ async fn webhook_handler(
         .to_string();
 
     if repo_full_name.is_empty() {
-        debug!(
-            "Discarding event for unregistered repo: {}",
-            repo_full_name
-        );
-        return Ok((
-            StatusCode::OK,
-            "Ignored: repo not registered".to_string(),
-        ));
+        debug!("Discarding event for unregistered repo: {}", repo_full_name);
+        return Ok((StatusCode::OK, "Ignored: repo not registered".to_string()));
     }
 
-    if ensure_repo_registered(&state, &repo_full_name).await.is_none() {
+    if ensure_repo_registered(&state, &repo_full_name)
+        .await
+        .is_none()
+    {
         debug!(
             "Discarding event for unregistered repo after refresh: {}",
             repo_full_name
         );
-        return Ok((
-            StatusCode::OK,
-            "Ignored: repo not registered".to_string(),
-        ));
+        return Ok((StatusCode::OK, "Ignored: repo not registered".to_string()));
     }
 
     // 4. Fork PR annotation
@@ -335,10 +350,7 @@ async fn webhook_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
 
-    let action = payload
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let action = payload.get("action").and_then(Value::as_str).unwrap_or("");
 
     let event_label = if action.is_empty() {
         event_type.to_string()
@@ -385,6 +397,134 @@ async fn health_handler(State(state): State<Arc<ServerState>>) -> Json<Value> {
     }))
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct RegisterRequest {
+    installation_id: u64,
+    tunnel_url: String,
+    #[serde(default)]
+    claim_proof: Option<String>,
+    #[serde(default)]
+    update_secret: Option<String>,
+}
+
+async fn register_handler(
+    State(state): State<Arc<ServerState>>,
+    request: Result<axum::Json<RegisterRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let request = match request {
+        Ok(axum::Json(request)) => request,
+        Err(_) => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Request body must be valid JSON matching the register contract.",
+            ))
+        }
+    };
+
+    if request.installation_id == 0 {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "installation_id must be greater than 0.",
+        ));
+    }
+
+    let auth = match (request.claim_proof, request.update_secret) {
+        (Some(_), Some(_)) => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Exactly one of claim_proof or update_secret must be present.",
+            ))
+        }
+        (None, None) => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Exactly one of claim_proof or update_secret must be present.",
+            ))
+        }
+        (Some(claim_proof), None) => AuthCredential::ClaimProof(claim_proof),
+        (None, Some(update_secret)) => AuthCredential::UpdateSecret(update_secret),
+    };
+
+    match state
+        .registration
+        .register(request.installation_id, &request.tunnel_url, auth)
+        .await
+    {
+        Ok(result) => {
+            let status = match result.outcome {
+                RegistrationOutcome::Claimed => StatusCode::CREATED,
+                RegistrationOutcome::Updated => StatusCode::OK,
+            };
+            Ok((
+                status,
+                Json(serde_json::json!({
+                    "status": match result.outcome {
+                        RegistrationOutcome::Claimed => "claimed",
+                        RegistrationOutcome::Updated => "updated",
+                    },
+                    "installation_id": result.installation_id,
+                    "tunnel_url": result.tunnel_url,
+                    "update_secret": result.update_secret,
+                    "rotated": matches!(result.outcome, RegistrationOutcome::Updated),
+                })),
+            ))
+        }
+        Err(error) => Err(error_response(
+            registration_status_code(&error),
+            registration_error_code(&error),
+            &error.to_string(),
+        )),
+    }
+}
+
+fn registration_status_code(error: &RegistrationError) -> StatusCode {
+    match error {
+        RegistrationError::InvalidClaimProof
+        | RegistrationError::ExpiredClaimProof
+        | RegistrationError::ClaimProofAlreadyUsed
+        | RegistrationError::InvalidUpdateSecret
+        | RegistrationError::OwnershipMismatch => StatusCode::FORBIDDEN,
+        RegistrationError::AlreadyClaimed => StatusCode::CONFLICT,
+        RegistrationError::InvalidTunnelUrl | RegistrationError::UnsafeTunnelUrl => {
+            StatusCode::BAD_REQUEST
+        }
+        RegistrationError::Persistence(_) | RegistrationError::SecretRotationFailure => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+fn registration_error_code(error: &RegistrationError) -> &'static str {
+    match error {
+        RegistrationError::InvalidClaimProof => "invalid_claim_proof",
+        RegistrationError::ExpiredClaimProof => "expired_claim_proof",
+        RegistrationError::ClaimProofAlreadyUsed => "claim_proof_already_used",
+        RegistrationError::InvalidUpdateSecret => "invalid_update_secret",
+        RegistrationError::OwnershipMismatch => "ownership_mismatch",
+        RegistrationError::AlreadyClaimed => "already_claimed",
+        RegistrationError::InvalidTunnelUrl => "invalid_tunnel_url",
+        RegistrationError::UnsafeTunnelUrl => "unsafe_tunnel_url",
+        RegistrationError::Persistence(_) => "persistence_failure",
+        RegistrationError::SecretRotationFailure => "secret_rotation_failure",
+    }
+}
+
+fn error_response(status: StatusCode, code: &str, message: &str) -> (StatusCode, Json<Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message,
+            }
+        })),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
@@ -402,13 +542,8 @@ pub async fn bootstrap_repo(
     if !force {
         let mut queues = state.queues.lock().await;
         let registry = registry_snapshot(state).await;
-        let queue = get_or_create_queue(
-            &mut queues,
-            &registry,
-            &state.githubclaw_home,
-            repo_name,
-        )
-        .map_err(|e| format!("Queue creation error: {}", e))?;
+        let queue = get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+            .map_err(|e| format!("Queue creation error: {}", e))?;
 
         if queue.size() > 0 {
             info!(
@@ -444,13 +579,9 @@ pub async fn bootstrap_repo(
         if !issues.is_empty() {
             let mut queues = state.queues.lock().await;
             let registry = registry_snapshot(state).await;
-            let queue = get_or_create_queue(
-                &mut queues,
-                &registry,
-                &state.githubclaw_home,
-                repo_name,
-            )
-            .map_err(|e| format!("Queue creation error: {}", e))?;
+            let queue =
+                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+                    .map_err(|e| format!("Queue creation error: {}", e))?;
 
             for issue in &issues {
                 queue
@@ -503,13 +634,9 @@ pub async fn bootstrap_repo(
         if !prs.is_empty() {
             let mut queues = state.queues.lock().await;
             let registry = registry_snapshot(state).await;
-            let queue = get_or_create_queue(
-                &mut queues,
-                &registry,
-                &state.githubclaw_home,
-                repo_name,
-            )
-            .map_err(|e| format!("Queue creation error: {}", e))?;
+            let queue =
+                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+                    .map_err(|e| format!("Queue creation error: {}", e))?;
 
             for pr in &prs {
                 queue
@@ -544,6 +671,7 @@ pub async fn bootstrap_repo(
 /// Build the axum router with shared state.
 pub fn create_router(state: Arc<ServerState>) -> Router {
     Router::new()
+        .route("/register", post(register_handler))
         .route("/webhook", post(webhook_handler))
         .route("/health", get(health_handler))
         .with_state(state)
@@ -653,13 +781,16 @@ async fn execute_dispatch(
 
     // 8. Register with ProcessManager for monitoring.
     let label = format!("{}/{}", dispatch.agent_type, dispatch.issue_ref);
-    state.process_manager.register(
-        pid,
-        crate::process_manager::ProcessKind::Worker,
-        repo_full_name,
-        &label,
-        crate::constants::DEFAULT_PROCESS_TIMEOUT_SECONDS,
-    ).await;
+    state
+        .process_manager
+        .register(
+            pid,
+            crate::process_manager::ProcessKind::Worker,
+            repo_full_name,
+            &label,
+            crate::constants::DEFAULT_PROCESS_TIMEOUT_SECONDS,
+        )
+        .await;
 
     info!(
         pid,
@@ -713,7 +844,10 @@ async fn execute_dispatch(
         }
         // Clean up the temp prompt file now that the agent has exited.
         if let Err(e) = std::fs::remove_file(&prompt_file_for_cleanup) {
-            debug!("Failed to clean up prompt file {:?}: {}", prompt_file_for_cleanup, e);
+            debug!(
+                "Failed to clean up prompt file {:?}: {}",
+                prompt_file_for_cleanup, e
+            );
         }
     });
 
@@ -749,7 +883,10 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 
     loop {
         if state.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            info!("Shutdown signal received, stopping drain loop for {}", repo_name);
+            info!(
+                "Shutdown signal received, stopping drain loop for {}",
+                repo_name
+            );
             break;
         }
         // 1. Peek the queue for the next event.
@@ -803,16 +940,18 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         let response_text = {
             let mut orchestrators = state.orchestrators.lock().await;
             let registry = state.registry.read().await;
-            let session = orchestrators.entry(repo_name.to_string()).or_insert_with(|| {
-                let entry = registry.get(repo_name).unwrap();
-                OrchestratorSession::new(
-                    repo_name,
-                    &entry.local_path,
-                    state.orchestrator_backend.clone(),
-                    None,
-                    None,
-                )
-            });
+            let session = orchestrators
+                .entry(repo_name.to_string())
+                .or_insert_with(|| {
+                    let entry = registry.get(repo_name).unwrap();
+                    OrchestratorSession::new(
+                        repo_name,
+                        &entry.local_path,
+                        state.orchestrator_backend.clone(),
+                        None,
+                        None,
+                    )
+                });
             match session.process_event(&event_json).await {
                 Ok(text) => text,
                 Err(e) => {
@@ -889,36 +1028,34 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                     repo,
                     payload,
                     context,
-                } => {
-                    match chrono::DateTime::parse_from_rfc3339(trigger_at) {
-                        Ok(dt) => {
-                            let mut scheduler = state.scheduler.lock().await;
-                            let id = scheduler.create_event(
-                                repo,
-                                dt.with_timezone(&chrono::Utc),
-                                payload.clone(),
-                                true,
-                                None,
-                                context,
-                            );
-                            info!(
-                                repo = %repo_name,
-                                event_id = %id,
-                                trigger_at = %trigger_at,
-                                "Scheduled event created",
-                            );
-                        }
-                        Err(e) => {
-                            error!(
-                                repo = %repo_name,
-                                "Invalid trigger_at '{}': {}",
-                                trigger_at,
-                                e,
-                            );
-                            all_ok = false;
-                        }
+                } => match chrono::DateTime::parse_from_rfc3339(trigger_at) {
+                    Ok(dt) => {
+                        let mut scheduler = state.scheduler.lock().await;
+                        let id = scheduler.create_event(
+                            repo,
+                            dt.with_timezone(&chrono::Utc),
+                            payload.clone(),
+                            true,
+                            None,
+                            context,
+                        );
+                        info!(
+                            repo = %repo_name,
+                            event_id = %id,
+                            trigger_at = %trigger_at,
+                            "Scheduled event created",
+                        );
                     }
-                }
+                    Err(e) => {
+                        error!(
+                            repo = %repo_name,
+                            "Invalid trigger_at '{}': {}",
+                            trigger_at,
+                            e,
+                        );
+                        all_ok = false;
+                    }
+                },
                 Action::CancelEvent { event_id } => {
                     let mut scheduler = state.scheduler.lock().await;
                     let cancelled = scheduler.cancel_event(event_id);
@@ -958,12 +1095,9 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         if all_ok {
             let mut queues = state.queues.lock().await;
             let registry = registry_snapshot(state).await;
-            if let Ok(q) = get_or_create_queue(
-                &mut queues,
-                &registry,
-                &state.githubclaw_home,
-                repo_name,
-            ) {
+            if let Ok(q) =
+                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+            {
                 if let Err(e) = q.dequeue() {
                     error!(repo = %repo_name, "Failed to dequeue after success: {}", e);
                 }
@@ -979,12 +1113,8 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 async fn nack_head_event(state: &Arc<ServerState>, repo_name: &str, _filename: &str) {
     let mut queues = state.queues.lock().await;
     let registry = registry_snapshot(state).await;
-    let queue = match get_or_create_queue(
-        &mut queues,
-        &registry,
-        &state.githubclaw_home,
-        repo_name,
-    ) {
+    let queue = match get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+    {
         Ok(q) => q,
         Err(e) => {
             error!(repo = %repo_name, "Failed to get queue for nack: {}", e);
@@ -1018,8 +1148,10 @@ async fn nack_head_event(state: &Arc<ServerState>, repo_name: &str, _filename: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registration::{mint_claim_proof, ClaimProofClaims};
     use axum::body::Body;
     use axum::http::Request;
+    use chrono::{Duration, Utc};
     use hmac::{Hmac, Mac};
     use http_body_util::BodyExt;
     use sha2::Sha256;
@@ -1027,6 +1159,7 @@ mod tests {
     use tower::ServiceExt;
 
     const TEST_SECRET: &str = "test-webhook-secret";
+    const TEST_REGISTRATION_SECRET: &str = "test-registration-secret";
 
     /// Compute a valid HMAC SHA-256 signature for testing.
     fn sign_payload(payload: &[u8], secret: &str) -> String {
@@ -1053,6 +1186,13 @@ mod tests {
             started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
             githubclaw_home: tmp.path().to_path_buf(),
+            registration: Arc::new(
+                RegistrationState::new_for_tests(
+                    tmp.path().join(".githubclaw").join("registration.json"),
+                    "test-registration-secret",
+                )
+                .unwrap(),
+            ),
             process_manager: Arc::new(ProcessManager::new(
                 crate::constants::DEFAULT_MAX_CONCURRENT_AGENTS,
             )),
@@ -1078,6 +1218,18 @@ mod tests {
     async fn body_string(response: axum::http::Response<Body>) -> String {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn claim_proof_for(installation_id: u64, proof_id: &str) -> String {
+        mint_claim_proof(
+            &ClaimProofClaims {
+                installation_id,
+                proof_id: proof_id.to_string(),
+                issued_at: Utc::now(),
+                expires_at: Utc::now() + Duration::minutes(10),
+            },
+            TEST_REGISTRATION_SECRET,
+        )
     }
 
     // ---------------------------------------------------------------
@@ -1382,6 +1534,258 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn test_register_claim_returns_201_and_rotated_false() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        let app = create_router(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 42,
+                            "tunnel_url": "https://ABC.trycloudflare.com",
+                            "claim_proof": claim_proof_for(42, "proof-1"),
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["status"], "claimed");
+        assert_eq!(body["tunnel_url"], "https://abc.trycloudflare.com");
+        assert_eq!(body["rotated"], false);
+        assert!(body["update_secret"].as_str().unwrap().starts_with("us_"));
+
+        let stored = state.registration.get(42).await.unwrap();
+        assert_eq!(stored.tunnel_url, "https://abc.trycloudflare.com");
+    }
+
+    #[tokio::test]
+    async fn test_register_update_returns_200_and_rotates_secret() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        let app = create_router(Arc::clone(&state));
+
+        let claim_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 42,
+                            "tunnel_url": "https://first.trycloudflare.com",
+                            "claim_proof": claim_proof_for(42, "proof-1"),
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let claim_body: Value = serde_json::from_str(&body_string(claim_response).await).unwrap();
+        let initial_secret = claim_body["update_secret"].as_str().unwrap().to_string();
+
+        let update_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 42,
+                            "tunnel_url": "https://second.trycloudflare.com",
+                            "update_secret": initial_secret,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_string(update_response).await).unwrap();
+        assert_eq!(body["status"], "updated");
+        assert_eq!(body["rotated"], true);
+        assert_eq!(body["tunnel_url"], "https://second.trycloudflare.com");
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_replayed_claim_proof() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        let app = create_router(state);
+        let proof = claim_proof_for(42, "proof-1");
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 42,
+                            "tunnel_url": "https://first.trycloudflare.com",
+                            "claim_proof": proof,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 42,
+                            "tunnel_url": "https://second.trycloudflare.com",
+                            "claim_proof": claim_proof_for(42, "proof-1"),
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second.status(), StatusCode::FORBIDDEN);
+        let body: Value = serde_json::from_str(&body_string(second).await).unwrap();
+        assert_eq!(body["error"]["code"], "claim_proof_already_used");
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_cross_installation_update_secret() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        let app = create_router(state);
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 42,
+                            "tunnel_url": "https://first.trycloudflare.com",
+                            "claim_proof": claim_proof_for(42, "proof-1"),
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let first_body: Value = serde_json::from_str(&body_string(first).await).unwrap();
+        let first_secret = first_body["update_secret"].as_str().unwrap().to_string();
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 99,
+                            "tunnel_url": "https://second.trycloudflare.com",
+                            "claim_proof": claim_proof_for(99, "proof-2"),
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CREATED);
+
+        let attack = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 99,
+                            "tunnel_url": "https://evil.trycloudflare.com",
+                            "update_secret": first_secret,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(attack.status(), StatusCode::FORBIDDEN);
+        let body: Value = serde_json::from_str(&body_string(attack).await).unwrap();
+        assert_eq!(body["error"]["code"], "ownership_mismatch");
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_missing_or_double_auth_fields() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        let app = create_router(state);
+
+        for body in [
+            serde_json::json!({
+                "installation_id": 42,
+                "tunnel_url": "https://first.trycloudflare.com",
+            }),
+            serde_json::json!({
+                "installation_id": 42,
+                "tunnel_url": "https://first.trycloudflare.com",
+                "claim_proof": claim_proof_for(42, "proof-1"),
+                "update_secret": "us_duplicate",
+            }),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/register")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let parsed: Value = serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(parsed["error"]["code"], "invalid_request");
+        }
+    }
+
     // ---------------------------------------------------------------
     // 11. Webhook enqueues event with correct label
     // ---------------------------------------------------------------
@@ -1453,8 +1857,7 @@ mod tests {
             "repository": { "full_name": "owner/repo" },
         });
 
-        let result =
-            execute_dispatch(&state, &dispatch, &event_payload, "owner/repo").await;
+        let result = execute_dispatch(&state, &dispatch, &event_payload, "owner/repo").await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1503,8 +1906,7 @@ mod tests {
             }
         });
 
-        let result =
-            execute_dispatch(&state, &dispatch, &event_payload, "owner/repo").await;
+        let result = execute_dispatch(&state, &dispatch, &event_payload, "owner/repo").await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
