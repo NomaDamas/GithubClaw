@@ -41,7 +41,8 @@ async fn test_webhook_to_queue_roundtrip() {
 
     let state = Arc::new(ServerState {
         webhook_secret: secret.to_string(),
-        registry,
+        registry: tokio::sync::RwLock::new(registry),
+        started_repos: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         queues: Mutex::new(HashMap::new()),
         githubclaw_home: tmp.path().to_path_buf(),
         process_manager: Arc::new(ProcessManager::new(5)),

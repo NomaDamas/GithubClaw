@@ -13,10 +13,10 @@ use axum::{
     Router,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::agents::parser::load_agent_definition;
@@ -36,7 +36,8 @@ use crate::signature::verify_webhook_signature;
 /// All shared state for the running webhook server.
 pub struct ServerState {
     pub webhook_secret: String,
-    pub registry: HashMap<String, RegistryEntry>,
+    pub registry: RwLock<HashMap<String, RegistryEntry>>,
+    pub started_repos: RwLock<HashSet<String>>,
     pub queues: Mutex<HashMap<String, DiskPersistedQueue>>,
     pub githubclaw_home: PathBuf,
     pub process_manager: Arc<ProcessManager>,
@@ -207,6 +208,49 @@ pub fn get_or_create_queue_pub<'a>(
     get_or_create_queue(queues, registry, githubclaw_home, repo_full_name)
 }
 
+async fn registry_snapshot(state: &Arc<ServerState>) -> HashMap<String, RegistryEntry> {
+    state.registry.read().await.clone()
+}
+
+pub async fn start_repo_processing(state: Arc<ServerState>, repo_name: &str, entry: &RegistryEntry) {
+    {
+        let mut started = state.started_repos.write().await;
+        if !started.insert(repo_name.to_string()) {
+            return;
+        }
+    }
+
+    let state_clone = Arc::clone(&state);
+    let repo = repo_name.to_string();
+    let entry_clone = entry.clone();
+    tokio::spawn(async move {
+        event_drain_loop(&state_clone, &repo, &entry_clone).await;
+    });
+}
+
+async fn ensure_repo_registered(state: &Arc<ServerState>, repo_full_name: &str) -> Option<RegistryEntry> {
+    if let Some(entry) = state.registry.read().await.get(repo_full_name).cloned() {
+        return Some(entry);
+    }
+
+    let registry_path = state.githubclaw_home.join("registry.json");
+    let latest = load_registry(&registry_path);
+    let entry = latest.get(repo_full_name).cloned()?;
+
+    {
+        let mut registry = state.registry.write().await;
+        *registry = latest;
+    }
+
+    if let Err(e) = bootstrap_repo(state, repo_full_name, &entry, false).await {
+        warn!("Bootstrap failed for {} after registry refresh: {}", repo_full_name, e);
+    }
+    start_repo_processing(Arc::clone(state), repo_full_name, &entry).await;
+    info!("Hot-registered repo {} from refreshed registry", repo_full_name);
+
+    Some(entry)
+}
+
 fn fallback_queue_dir(githubclaw_home: &Path, repo_full_name: &str) -> PathBuf {
     let slug = repo_full_name.replace('/', "_");
     let dir = githubclaw_home.join("queues").join(slug).join("queue");
@@ -260,9 +304,20 @@ async fn webhook_handler(
         .unwrap_or("")
         .to_string();
 
-    if repo_full_name.is_empty() || !state.registry.contains_key(&repo_full_name) {
+    if repo_full_name.is_empty() {
         debug!(
             "Discarding event for unregistered repo: {}",
+            repo_full_name
+        );
+        return Ok((
+            StatusCode::OK,
+            "Ignored: repo not registered".to_string(),
+        ));
+    }
+
+    if ensure_repo_registered(&state, &repo_full_name).await.is_none() {
+        debug!(
+            "Discarding event for unregistered repo after refresh: {}",
             repo_full_name
         );
         return Ok((
@@ -293,9 +348,10 @@ async fn webhook_handler(
 
     // 6. Enqueue
     let mut queues = state.queues.lock().await;
+    let registry = registry_snapshot(&state).await;
     let queue = get_or_create_queue(
         &mut queues,
-        &state.registry,
+        &registry,
         &state.githubclaw_home,
         &repo_full_name,
     )
@@ -325,7 +381,7 @@ async fn webhook_handler(
 async fn health_handler(State(state): State<Arc<ServerState>>) -> Json<Value> {
     Json(serde_json::json!({
         "status": "ok",
-        "registered_repos": state.registry.len(),
+        "registered_repos": state.registry.read().await.len(),
     }))
 }
 
@@ -333,20 +389,22 @@ async fn health_handler(State(state): State<Arc<ServerState>>) -> Json<Value> {
 // Bootstrap
 // ---------------------------------------------------------------------------
 
-/// Bootstrap a repo on first start by scanning existing open issues and PRs.
+/// Bootstrap a repo by scanning existing open issues and PRs.
 ///
-/// Skips if the queue already has events (not a first start).
+/// When `force` is false, skips if the queue already has events.
 pub async fn bootstrap_repo(
     state: &Arc<ServerState>,
     repo_name: &str,
     _entry: &RegistryEntry,
+    force: bool,
 ) -> Result<(), String> {
     // Check if queue already has events
-    {
+    if !force {
         let mut queues = state.queues.lock().await;
+        let registry = registry_snapshot(state).await;
         let queue = get_or_create_queue(
             &mut queues,
-            &state.registry,
+            &registry,
             &state.githubclaw_home,
             repo_name,
         )
@@ -385,9 +443,10 @@ pub async fn bootstrap_repo(
             serde_json::from_slice(&issue_output.stdout).unwrap_or_default();
         if !issues.is_empty() {
             let mut queues = state.queues.lock().await;
+            let registry = registry_snapshot(state).await;
             let queue = get_or_create_queue(
                 &mut queues,
-                &state.registry,
+                &registry,
                 &state.githubclaw_home,
                 repo_name,
             )
@@ -443,9 +502,10 @@ pub async fn bootstrap_repo(
             serde_json::from_slice(&pr_output.stdout).unwrap_or_default();
         if !prs.is_empty() {
             let mut queues = state.queues.lock().await;
+            let registry = registry_snapshot(state).await;
             let queue = get_or_create_queue(
                 &mut queues,
-                &state.registry,
+                &registry,
                 &state.githubclaw_home,
                 repo_name,
             )
@@ -514,8 +574,8 @@ async fn execute_dispatch(
     }
 
     // 1. Resolve the repo's local path from the registry.
-    let entry = state
-        .registry
+    let registry = state.registry.read().await;
+    let entry = registry
         .get(repo_full_name)
         .ok_or_else(|| format!("Repo {} not in registry", repo_full_name))?;
     let repo_root = Path::new(&entry.local_path);
@@ -541,10 +601,17 @@ async fn execute_dispatch(
     }
 
     // 5. Assemble the 4-layer prompt.
+    //    IMPORTANT: We must NOT drop the assembler here because its Drop impl
+    //    deletes the temp file. The agent subprocess reads the file asynchronously
+    //    after we spawn it. We leak the assembler and schedule cleanup after the
+    //    agent process exits.
     let mut assembler = PromptAssembler::new(repo_root);
     let prompt_file = assembler
         .assemble(&agent_def, &dispatch.task_context)
         .map_err(|e| format!("Prompt assembly failed: {}", e))?;
+    let prompt_file_for_cleanup = prompt_file.clone();
+    // Prevent Drop from deleting the temp file — we'll clean up after agent exits.
+    std::mem::forget(assembler);
 
     // 6. Build command + env via AgentSpawner.
     let spawner = AgentSpawner::new(repo_root, crate::constants::DEFAULT_AGENT_MAX_TURNS);
@@ -664,15 +731,11 @@ pub async fn start_event_processing(state: Arc<ServerState>) {
         rate_limiter.start_recovery_probe().await;
     });
 
-    for (repo_name, entry) in &state.registry {
-        let state = state.clone();
-        let repo_name = repo_name.clone();
-        let entry = entry.clone();
-        tokio::spawn(async move {
-            event_drain_loop(&state, &repo_name, &entry).await;
-        });
+    let registry = registry_snapshot(&state).await;
+    for (repo_name, entry) in &registry {
+        start_repo_processing(state.clone(), repo_name, entry).await;
     }
-    info!("Event processing started for {} repos", state.registry.len());
+    info!("Event processing started for {} repos", registry.len());
 }
 
 /// Per-repo drain loop: peek the queue, send to orchestrator, execute actions.
@@ -688,9 +751,10 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         // 1. Peek the queue for the next event.
         let peeked = {
             let mut queues = state.queues.lock().await;
+            let registry = registry_snapshot(state).await;
             let queue = match get_or_create_queue(
                 &mut queues,
-                &state.registry,
+                &registry,
                 &state.githubclaw_home,
                 repo_name,
             ) {
@@ -734,8 +798,9 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         // Get or create the orchestrator session for this repo.
         let response_text = {
             let mut orchestrators = state.orchestrators.lock().await;
+            let registry = state.registry.read().await;
             let session = orchestrators.entry(repo_name.to_string()).or_insert_with(|| {
-                let entry = state.registry.get(repo_name).unwrap();
+                let entry = registry.get(repo_name).unwrap();
                 OrchestratorSession::new(
                     repo_name,
                     &entry.local_path,
@@ -888,9 +953,10 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 
         if all_ok {
             let mut queues = state.queues.lock().await;
+            let registry = registry_snapshot(state).await;
             if let Ok(q) = get_or_create_queue(
                 &mut queues,
-                &state.registry,
+                &registry,
                 &state.githubclaw_home,
                 repo_name,
             ) {
@@ -908,9 +974,10 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 /// or move to dead-letter if max retries exceeded).
 async fn nack_head_event(state: &Arc<ServerState>, repo_name: &str, _filename: &str) {
     let mut queues = state.queues.lock().await;
+    let registry = registry_snapshot(state).await;
     let queue = match get_or_create_queue(
         &mut queues,
-        &state.registry,
+        &registry,
         &state.githubclaw_home,
         repo_name,
     ) {
@@ -978,7 +1045,8 @@ mod tests {
         let scheduler_path = tmp.path().join(".githubclaw").join("scheduled.json");
         Arc::new(ServerState {
             webhook_secret: TEST_SECRET.to_string(),
-            registry,
+            registry: RwLock::new(registry),
+            started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
             githubclaw_home: tmp.path().to_path_buf(),
             process_manager: Arc::new(ProcessManager::new(

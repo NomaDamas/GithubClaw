@@ -55,6 +55,7 @@ impl AgentSpawner {
         extra_env: Option<&HashMap<String, String>>,
     ) -> HashMap<String, String> {
         let mut env = HashMap::new();
+        let prompt_text = std::fs::read_to_string(prompt_file).unwrap_or_default();
 
         // Git identity
         env.insert(
@@ -84,7 +85,14 @@ impl AgentSpawner {
             "PROMPT_FILE".into(),
             prompt_file.to_string_lossy().into_owned(),
         );
-        env.insert("TASK_PROMPT".into(), task_prompt.to_string());
+        env.insert("SYSTEM_PROMPT".into(), prompt_text.clone());
+        env.insert("TASK_CONTEXT".into(), task_prompt.to_string());
+        let task_prompt_value = if agent_def.backend == "codex" {
+            prompt_text
+        } else {
+            task_prompt.to_string()
+        };
+        env.insert("TASK_PROMPT".into(), task_prompt_value);
         env.insert("MAX_TURNS".into(), self.max_turns.to_string());
 
         // GithubClaw metadata
@@ -218,11 +226,14 @@ mod tests {
         let spawner = AgentSpawner::new(tmp.path(), 100);
         let def = make_agent_def("claude-code");
         let prompt = tmp.path().join("prompt.md");
+        std::fs::write(&prompt, "System prompt text").unwrap();
 
         let env = spawner.build_env(&def, &prompt, "task", None);
 
         assert_eq!(env["ALLOWED_TOOLS"], "Read,Write");
         assert_eq!(env["DISALLOWED_TOOLS"], "Shell");
+        assert_eq!(env["SYSTEM_PROMPT"], "System prompt text");
+        assert_eq!(env["TASK_CONTEXT"], "task");
     }
 
     // 3. build_env sets prompt and task info
@@ -232,11 +243,14 @@ mod tests {
         let spawner = AgentSpawner::new(tmp.path(), 50);
         let def = make_agent_def("codex");
         let prompt = tmp.path().join("prompt.md");
+        std::fs::write(&prompt, "full prompt").unwrap();
 
         let env = spawner.build_env(&def, &prompt, "implement caching", None);
 
         assert_eq!(env["PROMPT_FILE"], prompt.to_string_lossy().as_ref());
-        assert_eq!(env["TASK_PROMPT"], "implement caching");
+        assert_eq!(env["SYSTEM_PROMPT"], "full prompt");
+        assert_eq!(env["TASK_CONTEXT"], "implement caching");
+        assert_eq!(env["TASK_PROMPT"], "full prompt");
         assert_eq!(env["MAX_TURNS"], "50");
         assert_eq!(env["GITHUBCLAW_AGENT_TYPE"], "coder");
         assert_eq!(env["GITHUBCLAW_BACKEND"], "codex");
@@ -253,6 +267,7 @@ mod tests {
         let spawner = AgentSpawner::new(tmp.path(), 100);
         let def = make_agent_def("claude-code");
         let prompt = tmp.path().join("prompt.md");
+        std::fs::write(&prompt, "System prompt text").unwrap();
 
         let mut extra = HashMap::new();
         extra.insert("CUSTOM_VAR".into(), "custom_value".into());

@@ -23,18 +23,19 @@ const DEFAULT_MEMORY_MD: &str = include_str!("../defaults/memory.md");
 const DEFAULT_SPAWN_CLAUDE_SH: &str = r#"#!/usr/bin/env bash
 # GithubClaw spawn template for Claude Code.
 set -euo pipefail
-exec claude --print --output-format=stream-json \
-  --model sonnet \
+exec claude -p \
+  --dangerously-skip-permissions \
+  --allowedTools "${ALLOWED_TOOLS}" \
+  --disallowedTools "${DISALLOWED_TOOLS}" \
   --max-turns "${MAX_TURNS:-200}" \
-  --permission-mode bypassPermissions \
-  --system-prompt "$SYSTEM_PROMPT" \
+  --append-system-prompt-file "${PROMPT_FILE}" \
   "$TASK_PROMPT"
 "#;
 const DEFAULT_SPAWN_CODEX_SH: &str = r#"#!/usr/bin/env bash
 # GithubClaw spawn template for Codex CLI.
 set -euo pipefail
-exec codex --approval-mode full-auto \
-  "$TASK_PROMPT"
+cat "${PROMPT_FILE}" | codex exec - \
+  --dangerously-bypass-approvals-and-sandbox
 "#;
 const DEFAULT_GITIGNORE: &str = "secrets/\nqueue/\nlogs/\nmemory.md\n";
 const DEFAULT_REPO_CONFIG_YAML: &str = "# GithubClaw per-repo configuration.\n# See https://github.com/GithubClaw/githubclaw for options.\n";
@@ -77,6 +78,8 @@ struct Cli {
 enum Commands {
     /// Scaffold the .githubclaw/ directory in the current repository
     Init,
+    /// Re-scan the current repository's open issues and PRs into the bootstrap queue
+    Bootstrap,
     /// Start the webhook server as a background daemon
     Start,
     /// Stop the webhook server
@@ -108,6 +111,7 @@ pub fn run() {
     let cli = Cli::parse();
     match cli.command {
         Commands::Init => cmd_init(),
+        Commands::Bootstrap => cmd_bootstrap(),
         Commands::Start => cmd_start(),
         Commands::Stop { force } => cmd_stop(force),
         Commands::Status => cmd_status(),
@@ -151,7 +155,9 @@ fn cmd_init() {
         });
     }
 
-    // Files to write (path -> content). Never overwrite existing files.
+    // Files to write (path -> content). Prompt/config files are user-owned and
+    // are never overwritten. Runtime spawn scripts are refreshed so existing
+    // repos pick up compatible launcher behavior after upgrades.
     let files: Vec<(PathBuf, &str)> = vec![
         (claw_dir.join("orchestrator.md"), DEFAULT_ORCHESTRATOR_MD),
         (claw_dir.join("global-prompt.md"), DEFAULT_GLOBAL_PROMPT_MD),
@@ -176,9 +182,17 @@ fn cmd_init() {
 
     let mut created: usize = 0;
     let mut skipped: usize = 0;
+    let mut refreshed: usize = 0;
 
     for (filepath, content) in &files {
-        if filepath.exists() {
+        let existed = filepath.exists();
+        let is_spawn_script = filepath
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n == "spawn_claude.sh" || n == "spawn_codex.sh")
+            .unwrap_or(false);
+
+        if existed && !is_spawn_script {
             skipped += 1;
             continue;
         }
@@ -188,7 +202,11 @@ fn cmd_init() {
         if let Err(e) = fs::write(filepath, content) {
             eprintln!("Error writing {}: {e}", filepath.display());
         } else {
-            created += 1;
+            if existed && is_spawn_script {
+                refreshed += 1;
+            } else {
+                created += 1;
+            }
         }
     }
 
@@ -201,7 +219,9 @@ fn cmd_init() {
     }
 
     println!("Initialized .githubclaw/ in {}", repo_root.display());
-    println!("  Created {created} files, skipped {skipped} existing files.");
+    println!(
+        "  Created {created} files, refreshed {refreshed} runtime scripts, skipped {skipped} existing files."
+    );
     println!();
 
     // (a) Auto-register the repo
@@ -231,6 +251,87 @@ fn cmd_init() {
     println!("  2. Create a GitHub App and set webhook URL + secret");
     println!("  3. Set up a tunnel (cloudflare tunnel, ngrok, etc.)");
     println!("  4. githubclaw start");
+}
+
+fn cmd_bootstrap() {
+    use tokio::sync::{Mutex, RwLock};
+    use crate::server::{bootstrap_repo, load_registry, ServerState};
+    use crate::process_manager::ProcessManager;
+    use crate::scheduler::ScheduledEventManager;
+    use std::collections::HashSet;
+
+    let repo_root = match find_repo_root(None) {
+        Some(r) => r,
+        None => {
+            eprintln!("Error: not inside a git repository.");
+            std::process::exit(1);
+        }
+    };
+
+    let output = match Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(&repo_root)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("Error running git remote get-url origin: {e}");
+            std::process::exit(1);
+        }
+    };
+    if !output.status.success() {
+        eprintln!("Error: no 'origin' remote found.");
+        std::process::exit(1);
+    }
+
+    let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let owner_repo = match parse_github_remote(&remote_url) {
+        Some(or) => or,
+        None => {
+            eprintln!("Error: could not parse GitHub owner/repo from: {remote_url}");
+            std::process::exit(1);
+        }
+    };
+
+    let global_dir = global_config_dir();
+    let registry = load_registry(&global_dir.join("registry.json"));
+    let entry = match registry.get(&owner_repo).cloned() {
+        Some(entry) => entry,
+        None => {
+            eprintln!("Error: repo {owner_repo} is not registered. Run `githubclaw init` first.");
+            std::process::exit(1);
+        }
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("Failed to create tokio runtime: {e}");
+        std::process::exit(1);
+    });
+
+    rt.block_on(async move {
+        let scheduler_path = global_dir.join("scheduled_events.json");
+        let state = Arc::new(ServerState {
+            webhook_secret: String::new(),
+            registry: RwLock::new(registry),
+            started_repos: RwLock::new(HashSet::new()),
+            queues: Mutex::new(HashMap::new()),
+            githubclaw_home: global_dir.clone(),
+            process_manager: Arc::new(ProcessManager::new(1)),
+            scheduler: Mutex::new(ScheduledEventManager::new(&scheduler_path)),
+            rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            orchestrator_backend: crate::orchestrator::session::OrchestratorBackend::Codex,
+            orchestrators: Mutex::new(HashMap::new()),
+        });
+
+        match bootstrap_repo(&state, &owner_repo, &entry, true).await {
+            Ok(()) => println!("Bootstrapped open issues/PRs for {owner_repo}."),
+            Err(e) => {
+                eprintln!("Bootstrap failed for {owner_repo}: {e}");
+                std::process::exit(1);
+            }
+        }
+    });
 }
 
 // ===========================================================================
@@ -686,12 +787,13 @@ fn cmd_logs(follow: bool) {
 // ===========================================================================
 
 fn cmd_serve(host: &str, port: u16) {
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, RwLock};
     use crate::server::{
         bootstrap_repo, create_router, load_registry, load_webhook_secret, ServerState,
     };
     use crate::process_manager::ProcessManager;
     use crate::scheduler::ScheduledEventManager;
+    use std::collections::HashSet;
 
     // Build the tokio runtime for the async server
     let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
@@ -741,7 +843,8 @@ fn cmd_serve(host: &str, port: u16) {
         // Create server state
         let state = Arc::new(ServerState {
             webhook_secret,
-            registry: registry.clone(),
+            registry: RwLock::new(registry.clone()),
+            started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
             githubclaw_home: global_dir.clone(),
             process_manager: Arc::new(ProcessManager::new(config.max_concurrent_agents)),
@@ -754,7 +857,7 @@ fn cmd_serve(host: &str, port: u16) {
 
         // Bootstrap repos: scan existing open issues/PRs for each repo
         for (repo_name, entry) in &registry {
-            if let Err(e) = bootstrap_repo(&state, repo_name, entry).await {
+            if let Err(e) = bootstrap_repo(&state, repo_name, entry, false).await {
                 tracing::warn!("Bootstrap failed for {}: {}", repo_name, e);
             }
         }
@@ -780,9 +883,10 @@ fn cmd_serve(host: &str, port: u16) {
                         let st = Arc::clone(&sched_state_inner);
                         async move {
                             let mut queues = st.queues.lock().await;
+                            let registry = st.registry.read().await;
                             let queue = crate::server::get_or_create_queue_pub(
                                 &mut queues,
-                                &st.registry,
+                                &*registry,
                                 &st.githubclaw_home,
                                 &repo,
                             ).map_err(|e| e.to_string())?;
