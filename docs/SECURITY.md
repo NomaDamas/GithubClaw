@@ -56,6 +56,21 @@ fn verify_signature(payload_body: &[u8], signature_header: &str, secret: &str) -
 - Set during GitHub App creation
 - Requests without valid `X-Hub-Signature-256` are rejected (403)
 
+## Hosted Proxy Registration Boundary
+
+Hosted proxy setup and registration use a separate narrow trust boundary:
+
+- the trusted setup callback (`GET /setup/install`) mints `claim_proof` only after GitHub identifies the installation
+- the first claim uses a short-lived single-use `claim_proof` bound to one `installation_id`
+- success returns an `update_secret` scoped to that same `installation_id`
+- later updates authenticate by presenting the latest `update_secret`
+- every successful update rotates the secret immediately
+- replayed, expired, or mismatched proofs must fail
+
+This boundary is intentionally minimal. It bootstraps installation registration only; it does not replace webhook HMAC verification, fork gating, orchestrator isolation, or branch protection.
+
+See [HOSTED_PROXY.md](/Users/jeffrey/Projects/GithubClaw-claim-proof/docs/HOSTED_PROXY.md) for the setup-callback handoff and exact `POST /register` contract.
+
 ## Fork PR Gate
 
 **Mechanical enforcement** — not dependent on LLM judgment:
