@@ -30,9 +30,19 @@ POST /webhook
   - Discards events from repos not in registry.json
   - Checks fork PR gate before queuing
   - Persists to disk-backed serial queue
+
+GET /setup/claim-proof?installation_id=123456
+  - Hosted setup callback endpoint for hosted-proxy mode
+  - Mints a short-lived one-time `claim_proof` bound to one installation
+  - Returns proof expiry metadata for CLI consumption
+
+POST /register
+  - Claims or updates one installation's hosted-proxy tunnel URL
+  - Uses one-time `claim_proof` for the first claim
+  - Returns and rotates installation-scoped `update_secret`
 ```
 
-No internal HTTP endpoints needed — scheduled events use tokio timers in-process.
+No other internal HTTP endpoints needed — scheduled events use tokio timers in-process.
 
 ## Event Queue
 

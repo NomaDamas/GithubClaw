@@ -83,6 +83,30 @@ curl http://localhost:8000/health   # should return {"status":"ok"}
 
 To test the webhook delivery, open an issue on your repo. You should see it appear in the queue and get processed by the orchestrator.
 
+### Hosted proxy registration
+
+If you run GithubClaw behind a hosted proxy, set the GitHub App setup URL to:
+
+```text
+https://your-hosted-proxy.example.com/setup/claim-proof
+```
+
+After GitHub redirects back with `installation_id`, mint a proof and register the tunnel:
+
+```bash
+curl "https://your-hosted-proxy.example.com/setup/claim-proof?installation_id=123456"
+
+curl -X POST "https://your-hosted-proxy.example.com/register" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "installation_id": 123456,
+    "tunnel_url": "https://abc123.trycloudflare.com",
+    "claim_proof": "cp_v1.opaque_proof_id.opaque_secret"
+  }'
+```
+
+Persist the returned `update_secret`. Every later tunnel update must send that secret to `/register`, and every successful update rotates it.
+
 ## How It Works
 
 ```
