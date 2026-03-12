@@ -12,8 +12,11 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use chrono::{DateTime, Utc};
+use reqwest::Url;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -48,6 +51,7 @@ pub struct ServerState {
     pub orchestrator_backend: crate::orchestrator::session::OrchestratorBackend,
     /// Per-repo orchestrator sessions (created on demand in the drain loop).
     pub orchestrators: Mutex<HashMap<String, OrchestratorSession>>,
+    pub registration_store: Mutex<RegistrationStore>,
 }
 
 /// A single entry in `registry.json`.
@@ -65,6 +69,246 @@ pub struct RegistryFile {
     pub repos: HashMap<String, RegistryEntry>,
 }
 
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RegistrationStoreFile {
+    #[serde(default)]
+    pub installations: HashMap<String, InstallationRegistration>,
+    #[serde(default)]
+    pub claim_proofs: HashMap<String, ClaimProofRecord>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InstallationRegistration {
+    pub tunnel_url: String,
+    pub update_secret_hash: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClaimProofRecord {
+    pub installation_id: u64,
+    pub expires_at: DateTime<Utc>,
+    #[serde(default)]
+    pub used_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug)]
+pub struct RegistrationStore {
+    path: PathBuf,
+    installations: HashMap<String, InstallationRegistration>,
+    claim_proofs: HashMap<String, ClaimProofRecord>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RegisterRequest {
+    installation_id: u64,
+    tunnel_url: String,
+    #[serde(default)]
+    claim_proof: Option<String>,
+    #[serde(default)]
+    update_secret: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RegisterSuccessResponse {
+    status: &'static str,
+    installation_id: u64,
+    tunnel_url: String,
+    update_secret: String,
+    rotated: bool,
+}
+
+#[derive(Debug, Clone)]
+enum RegisterCredential {
+    ClaimProof(String),
+    UpdateSecret(String),
+}
+
+#[derive(Debug, Clone)]
+enum RegisterError {
+    InvalidRequest(&'static str),
+    InvalidTunnelUrl(&'static str),
+    UnsafeTunnelUrl(&'static str),
+    InvalidClaimProof,
+    ExpiredClaimProof,
+    ClaimProofAlreadyUsed,
+    InvalidUpdateSecret,
+    OwnershipMismatch,
+    AlreadyClaimed,
+    PersistenceFailure(String),
+    SecretRotationFailure,
+}
+
+#[derive(Debug, Clone)]
+struct ValidRegisterRequest {
+    installation_id: u64,
+    tunnel_url: String,
+    credential: RegisterCredential,
+}
+
+impl RegistrationStore {
+    pub fn load(path: &Path) -> Result<Self, String> {
+        if !path.exists() {
+            return Ok(Self {
+                path: path.to_path_buf(),
+                installations: HashMap::new(),
+                claim_proofs: HashMap::new(),
+            });
+        }
+
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            format!(
+                "Failed to read registration store {}: {}",
+                path.display(),
+                e
+            )
+        })?;
+        let file: RegistrationStoreFile = serde_json::from_str(&content).map_err(|e| {
+            format!(
+                "Failed to parse registration store {}: {}",
+                path.display(),
+                e
+            )
+        })?;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            installations: file.installations,
+            claim_proofs: file.claim_proofs,
+        })
+    }
+
+    pub fn persist(&self) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "Failed to create registration store directory {}: {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+        }
+
+        let file = RegistrationStoreFile {
+            installations: self.installations.clone(),
+            claim_proofs: self.claim_proofs.clone(),
+        };
+        let data = serde_json::to_string_pretty(&file)
+            .map_err(|e| format!("Failed to serialize registration store: {}", e))?;
+        let tmp_path = self.path.with_extension("tmp");
+        std::fs::write(&tmp_path, data)
+            .map_err(|e| format!("Failed to write temp registration store: {}", e))?;
+        std::fs::rename(&tmp_path, &self.path)
+            .map_err(|e| format!("Failed to finalize registration store write: {}", e))?;
+        Ok(())
+    }
+
+    fn claim(
+        &mut self,
+        installation_id: u64,
+        tunnel_url: &str,
+        claim_proof: &str,
+    ) -> Result<String, RegisterError> {
+        let installation_key = installation_id.to_string();
+        let proof_hash = hash_secret(claim_proof);
+        let now = Utc::now();
+
+        let record = self
+            .claim_proofs
+            .get(&proof_hash)
+            .cloned()
+            .ok_or(RegisterError::InvalidClaimProof)?;
+
+        if record.installation_id != installation_id {
+            return Err(RegisterError::OwnershipMismatch);
+        }
+        if record.used_at.is_some() {
+            return Err(RegisterError::ClaimProofAlreadyUsed);
+        }
+        if record.expires_at < now {
+            return Err(RegisterError::ExpiredClaimProof);
+        }
+        if self.installations.contains_key(&installation_key) {
+            return Err(RegisterError::AlreadyClaimed);
+        }
+
+        let update_secret =
+            generate_update_secret().map_err(|_| RegisterError::SecretRotationFailure)?;
+        let update_secret_hash = hash_secret(&update_secret);
+        let registration = InstallationRegistration {
+            tunnel_url: tunnel_url.to_string(),
+            update_secret_hash,
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.installations.insert(installation_key, registration);
+        if let Some(proof) = self.claim_proofs.get_mut(&proof_hash) {
+            proof.used_at = Some(now);
+        }
+
+        self.persist().map_err(RegisterError::PersistenceFailure)?;
+        Ok(update_secret)
+    }
+
+    fn update(
+        &mut self,
+        installation_id: u64,
+        tunnel_url: &str,
+        update_secret: &str,
+    ) -> Result<String, RegisterError> {
+        let installation_key = installation_id.to_string();
+        let supplied_hash = hash_secret(update_secret);
+        let secret_belongs_elsewhere = self.installations.iter().any(|(key, entry)| {
+            key != &installation_key && entry.update_secret_hash == supplied_hash
+        });
+
+        let registration =
+            self.installations
+                .get_mut(&installation_key)
+                .ok_or(if secret_belongs_elsewhere {
+                    RegisterError::OwnershipMismatch
+                } else {
+                    RegisterError::InvalidUpdateSecret
+                })?;
+
+        if registration.update_secret_hash != supplied_hash {
+            return Err(if secret_belongs_elsewhere {
+                RegisterError::OwnershipMismatch
+            } else {
+                RegisterError::InvalidUpdateSecret
+            });
+        }
+
+        let next_secret =
+            generate_update_secret().map_err(|_| RegisterError::SecretRotationFailure)?;
+        registration.tunnel_url = tunnel_url.to_string();
+        registration.update_secret_hash = hash_secret(&next_secret);
+        registration.updated_at = Utc::now();
+
+        self.persist().map_err(RegisterError::PersistenceFailure)?;
+        Ok(next_secret)
+    }
+
+    #[cfg(test)]
+    fn seed_claim_proof_for_test(
+        &mut self,
+        proof: &str,
+        installation_id: u64,
+        expires_at: DateTime<Utc>,
+    ) {
+        self.claim_proofs.insert(
+            hash_secret(proof),
+            ClaimProofRecord {
+                installation_id,
+                expires_at,
+                used_at: None,
+            },
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration helpers
 // ---------------------------------------------------------------------------
@@ -73,7 +317,13 @@ pub struct RegistryFile {
 pub fn load_webhook_secret(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path)
         .map(|s| s.trim().to_string())
-        .map_err(|e| format!("Failed to read webhook secret from {}: {}", path.display(), e))
+        .map_err(|e| {
+            format!(
+                "Failed to read webhook secret from {}: {}",
+                path.display(),
+                e
+            )
+        })
 }
 
 /// Load the repo registry mapping `full_name -> RegistryEntry`.
@@ -83,7 +333,10 @@ pub fn load_webhook_secret(path: &Path) -> Result<String, String> {
 /// - Flat: `{ "owner/repo": { "local_path": "..." } }`
 pub fn load_registry(path: &Path) -> HashMap<String, RegistryEntry> {
     if !path.exists() {
-        warn!("Registry file not found at {} -- no repos registered", path.display());
+        warn!(
+            "Registry file not found at {} -- no repos registered",
+            path.display()
+        );
         return HashMap::new();
     }
 
@@ -110,6 +363,189 @@ pub fn load_registry(path: &Path) -> HashMap<String, RegistryEntry> {
             HashMap::new()
         }
     }
+}
+
+fn hash_secret(value: &str) -> String {
+    use sha2::Digest;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn generate_update_secret() -> Result<String, String> {
+    use uuid::Uuid;
+
+    Ok(format!("us_{}", Uuid::new_v4().simple()))
+}
+
+pub fn registration_store_path(githubclaw_home: &Path) -> PathBuf {
+    githubclaw_home.join("hosted_proxy_registrations.json")
+}
+
+fn register_error_response(error: RegisterError) -> (StatusCode, Json<Value>) {
+    let (status, code, message) = match error {
+        RegisterError::InvalidRequest(message) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            message.to_string(),
+        ),
+        RegisterError::InvalidTunnelUrl(message) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_tunnel_url",
+            message.to_string(),
+        ),
+        RegisterError::UnsafeTunnelUrl(message) => (
+            StatusCode::BAD_REQUEST,
+            "unsafe_tunnel_url",
+            message.to_string(),
+        ),
+        RegisterError::InvalidClaimProof => (
+            StatusCode::FORBIDDEN,
+            "invalid_claim_proof",
+            "Claim proof was not recognized.".to_string(),
+        ),
+        RegisterError::ExpiredClaimProof => (
+            StatusCode::FORBIDDEN,
+            "expired_claim_proof",
+            "Claim proof has expired.".to_string(),
+        ),
+        RegisterError::ClaimProofAlreadyUsed => (
+            StatusCode::FORBIDDEN,
+            "claim_proof_already_used",
+            "Claim proof was already used.".to_string(),
+        ),
+        RegisterError::InvalidUpdateSecret => (
+            StatusCode::FORBIDDEN,
+            "invalid_update_secret",
+            "Update secret is invalid.".to_string(),
+        ),
+        RegisterError::OwnershipMismatch => (
+            StatusCode::FORBIDDEN,
+            "ownership_mismatch",
+            "Credential belongs to a different installation.".to_string(),
+        ),
+        RegisterError::AlreadyClaimed => (
+            StatusCode::CONFLICT,
+            "already_claimed",
+            "Installation is already claimed.".to_string(),
+        ),
+        RegisterError::PersistenceFailure(message) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "persistence_failure",
+            message,
+        ),
+        RegisterError::SecretRotationFailure => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "secret_rotation_failure",
+            "Failed to rotate update secret.".to_string(),
+        ),
+    };
+
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message,
+            }
+        })),
+    )
+}
+
+fn normalize_tunnel_url(raw: &str) -> Result<String, RegisterError> {
+    let parsed = Url::parse(raw)
+        .map_err(|_| RegisterError::InvalidTunnelUrl("Tunnel URL must be a valid absolute URL."))?;
+
+    if parsed.scheme() != "https" {
+        return Err(RegisterError::InvalidTunnelUrl(
+            "Tunnel URL must use https.",
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(RegisterError::InvalidTunnelUrl(
+            "Tunnel URL must not include userinfo.",
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(RegisterError::InvalidTunnelUrl(
+            "Tunnel URL must not include query or fragment.",
+        ));
+    }
+    if parsed.path() != "/" && !parsed.path().is_empty() {
+        return Err(RegisterError::InvalidTunnelUrl(
+            "Tunnel URL must be an origin only, without a path.",
+        ));
+    }
+
+    let host = parsed.host_str().ok_or(RegisterError::InvalidTunnelUrl(
+        "Tunnel URL must include a host.",
+    ))?;
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return Err(RegisterError::UnsafeTunnelUrl(
+            "Tunnel URL must not target localhost.",
+        ));
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        let unsafe_ip = match ip {
+            IpAddr::V4(ipv4) => {
+                ipv4.is_private()
+                    || ipv4.is_loopback()
+                    || ipv4.is_link_local()
+                    || ipv4.is_multicast()
+                    || ipv4.is_unspecified()
+            }
+            IpAddr::V6(ipv6) => {
+                ipv6.is_loopback()
+                    || ipv6.is_multicast()
+                    || ipv6.is_unspecified()
+                    || ipv6.is_unique_local()
+                    || ipv6.is_unicast_link_local()
+            }
+        };
+
+        if unsafe_ip {
+            return Err(RegisterError::UnsafeTunnelUrl(
+                "Tunnel URL must not target a loopback or private-network address.",
+            ));
+        }
+    }
+
+    Ok(parsed.origin().ascii_serialization())
+}
+
+fn validate_register_request(
+    request: RegisterRequest,
+) -> Result<ValidRegisterRequest, RegisterError> {
+    if request.installation_id == 0 {
+        return Err(RegisterError::InvalidRequest(
+            "installation_id must be a positive integer.",
+        ));
+    }
+
+    let tunnel_url = normalize_tunnel_url(&request.tunnel_url)?;
+    let credential = match (request.claim_proof, request.update_secret) {
+        (Some(_), Some(_)) => {
+            return Err(RegisterError::InvalidRequest(
+                "Exactly one of claim_proof or update_secret must be present.",
+            ))
+        }
+        (None, None) => {
+            return Err(RegisterError::InvalidRequest(
+                "Exactly one of claim_proof or update_secret must be present.",
+            ))
+        }
+        (Some(claim_proof), None) => RegisterCredential::ClaimProof(claim_proof),
+        (None, Some(update_secret)) => RegisterCredential::UpdateSecret(update_secret),
+    };
+
+    Ok(ValidRegisterRequest {
+        installation_id: request.installation_id,
+        tunnel_url,
+        credential,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -140,10 +576,7 @@ fn annotate_fork_status(mut payload: Value) -> Value {
 
     if !has_approved_label {
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert(
-                "_githubclaw_fork_unapproved".to_string(),
-                Value::Bool(true),
-            );
+            obj.insert("_githubclaw_fork_unapproved".to_string(), Value::Bool(true));
         }
         let pr_number = payload
             .pointer("/pull_request/number")
@@ -189,10 +622,7 @@ fn get_or_create_queue<'a>(
             fallback_queue_dir(githubclaw_home, repo_full_name)
         };
 
-        let q = DiskPersistedQueue::new(
-            &queue_dir,
-            crate::constants::DEFAULT_QUEUE_MAX_RETRY,
-        )?;
+        let q = DiskPersistedQueue::new(&queue_dir, crate::constants::DEFAULT_QUEUE_MAX_RETRY)?;
         queues.insert(repo_full_name.to_string(), q);
     }
     Ok(queues.get_mut(repo_full_name).unwrap())
@@ -212,7 +642,11 @@ async fn registry_snapshot(state: &Arc<ServerState>) -> HashMap<String, Registry
     state.registry.read().await.clone()
 }
 
-pub async fn start_repo_processing(state: Arc<ServerState>, repo_name: &str, entry: &RegistryEntry) {
+pub async fn start_repo_processing(
+    state: Arc<ServerState>,
+    repo_name: &str,
+    entry: &RegistryEntry,
+) {
     {
         let mut started = state.started_repos.write().await;
         if !started.insert(repo_name.to_string()) {
@@ -228,7 +662,10 @@ pub async fn start_repo_processing(state: Arc<ServerState>, repo_name: &str, ent
     });
 }
 
-async fn ensure_repo_registered(state: &Arc<ServerState>, repo_full_name: &str) -> Option<RegistryEntry> {
+async fn ensure_repo_registered(
+    state: &Arc<ServerState>,
+    repo_full_name: &str,
+) -> Option<RegistryEntry> {
     if let Some(entry) = state.registry.read().await.get(repo_full_name).cloned() {
         return Some(entry);
     }
@@ -243,10 +680,16 @@ async fn ensure_repo_registered(state: &Arc<ServerState>, repo_full_name: &str) 
     }
 
     if let Err(e) = bootstrap_repo(state, repo_full_name, &entry, false).await {
-        warn!("Bootstrap failed for {} after registry refresh: {}", repo_full_name, e);
+        warn!(
+            "Bootstrap failed for {} after registry refresh: {}",
+            repo_full_name, e
+        );
     }
     start_repo_processing(Arc::clone(state), repo_full_name, &entry).await;
-    info!("Hot-registered repo {} from refreshed registry", repo_full_name);
+    info!(
+        "Hot-registered repo {} from refreshed registry",
+        repo_full_name
+    );
 
     Some(entry)
 }
@@ -305,25 +748,19 @@ async fn webhook_handler(
         .to_string();
 
     if repo_full_name.is_empty() {
-        debug!(
-            "Discarding event for unregistered repo: {}",
-            repo_full_name
-        );
-        return Ok((
-            StatusCode::OK,
-            "Ignored: repo not registered".to_string(),
-        ));
+        debug!("Discarding event for unregistered repo: {}", repo_full_name);
+        return Ok((StatusCode::OK, "Ignored: repo not registered".to_string()));
     }
 
-    if ensure_repo_registered(&state, &repo_full_name).await.is_none() {
+    if ensure_repo_registered(&state, &repo_full_name)
+        .await
+        .is_none()
+    {
         debug!(
             "Discarding event for unregistered repo after refresh: {}",
             repo_full_name
         );
-        return Ok((
-            StatusCode::OK,
-            "Ignored: repo not registered".to_string(),
-        ));
+        return Ok((StatusCode::OK, "Ignored: repo not registered".to_string()));
     }
 
     // 4. Fork PR annotation
@@ -335,10 +772,7 @@ async fn webhook_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
 
-    let action = payload
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let action = payload.get("action").and_then(Value::as_str).unwrap_or("");
 
     let event_label = if action.is_empty() {
         event_type.to_string()
@@ -385,6 +819,67 @@ async fn health_handler(State(state): State<Arc<ServerState>>) -> Json<Value> {
     }))
 }
 
+async fn register_handler(
+    State(state): State<Arc<ServerState>>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<Value>) {
+    let request: RegisterRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return register_error_response(RegisterError::InvalidRequest(
+                "Request body must be valid JSON.",
+            ));
+        }
+    };
+
+    let request = match validate_register_request(request) {
+        Ok(request) => request,
+        Err(error) => return register_error_response(error),
+    };
+
+    let mut store = state.registration_store.lock().await;
+    let result = match request.credential {
+        RegisterCredential::ClaimProof(claim_proof) => store
+            .claim(request.installation_id, &request.tunnel_url, &claim_proof)
+            .map(|update_secret| {
+                (
+                    StatusCode::CREATED,
+                    RegisterSuccessResponse {
+                        status: "claimed",
+                        installation_id: request.installation_id,
+                        tunnel_url: request.tunnel_url.clone(),
+                        update_secret,
+                        rotated: false,
+                    },
+                )
+            }),
+        RegisterCredential::UpdateSecret(update_secret) => store
+            .update(request.installation_id, &request.tunnel_url, &update_secret)
+            .map(|next_secret| {
+                (
+                    StatusCode::OK,
+                    RegisterSuccessResponse {
+                        status: "updated",
+                        installation_id: request.installation_id,
+                        tunnel_url: request.tunnel_url.clone(),
+                        update_secret: next_secret,
+                        rotated: true,
+                    },
+                )
+            }),
+    };
+
+    match result {
+        Ok((status, response)) => match serde_json::to_value(response) {
+            Ok(value) => (status, Json(value)),
+            Err(_) => register_error_response(RegisterError::PersistenceFailure(
+                "Failed to serialize registration response.".to_string(),
+            )),
+        },
+        Err(error) => register_error_response(error),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
@@ -402,13 +897,8 @@ pub async fn bootstrap_repo(
     if !force {
         let mut queues = state.queues.lock().await;
         let registry = registry_snapshot(state).await;
-        let queue = get_or_create_queue(
-            &mut queues,
-            &registry,
-            &state.githubclaw_home,
-            repo_name,
-        )
-        .map_err(|e| format!("Queue creation error: {}", e))?;
+        let queue = get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+            .map_err(|e| format!("Queue creation error: {}", e))?;
 
         if queue.size() > 0 {
             info!(
@@ -444,13 +934,9 @@ pub async fn bootstrap_repo(
         if !issues.is_empty() {
             let mut queues = state.queues.lock().await;
             let registry = registry_snapshot(state).await;
-            let queue = get_or_create_queue(
-                &mut queues,
-                &registry,
-                &state.githubclaw_home,
-                repo_name,
-            )
-            .map_err(|e| format!("Queue creation error: {}", e))?;
+            let queue =
+                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+                    .map_err(|e| format!("Queue creation error: {}", e))?;
 
             for issue in &issues {
                 queue
@@ -503,13 +989,9 @@ pub async fn bootstrap_repo(
         if !prs.is_empty() {
             let mut queues = state.queues.lock().await;
             let registry = registry_snapshot(state).await;
-            let queue = get_or_create_queue(
-                &mut queues,
-                &registry,
-                &state.githubclaw_home,
-                repo_name,
-            )
-            .map_err(|e| format!("Queue creation error: {}", e))?;
+            let queue =
+                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+                    .map_err(|e| format!("Queue creation error: {}", e))?;
 
             for pr in &prs {
                 queue
@@ -545,6 +1027,7 @@ pub async fn bootstrap_repo(
 pub fn create_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/webhook", post(webhook_handler))
+        .route("/register", post(register_handler))
         .route("/health", get(health_handler))
         .with_state(state)
 }
@@ -653,13 +1136,16 @@ async fn execute_dispatch(
 
     // 8. Register with ProcessManager for monitoring.
     let label = format!("{}/{}", dispatch.agent_type, dispatch.issue_ref);
-    state.process_manager.register(
-        pid,
-        crate::process_manager::ProcessKind::Worker,
-        repo_full_name,
-        &label,
-        crate::constants::DEFAULT_PROCESS_TIMEOUT_SECONDS,
-    ).await;
+    state
+        .process_manager
+        .register(
+            pid,
+            crate::process_manager::ProcessKind::Worker,
+            repo_full_name,
+            &label,
+            crate::constants::DEFAULT_PROCESS_TIMEOUT_SECONDS,
+        )
+        .await;
 
     info!(
         pid,
@@ -713,7 +1199,10 @@ async fn execute_dispatch(
         }
         // Clean up the temp prompt file now that the agent has exited.
         if let Err(e) = std::fs::remove_file(&prompt_file_for_cleanup) {
-            debug!("Failed to clean up prompt file {:?}: {}", prompt_file_for_cleanup, e);
+            debug!(
+                "Failed to clean up prompt file {:?}: {}",
+                prompt_file_for_cleanup, e
+            );
         }
     });
 
@@ -749,7 +1238,10 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 
     loop {
         if state.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            info!("Shutdown signal received, stopping drain loop for {}", repo_name);
+            info!(
+                "Shutdown signal received, stopping drain loop for {}",
+                repo_name
+            );
             break;
         }
         // 1. Peek the queue for the next event.
@@ -803,16 +1295,18 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         let response_text = {
             let mut orchestrators = state.orchestrators.lock().await;
             let registry = state.registry.read().await;
-            let session = orchestrators.entry(repo_name.to_string()).or_insert_with(|| {
-                let entry = registry.get(repo_name).unwrap();
-                OrchestratorSession::new(
-                    repo_name,
-                    &entry.local_path,
-                    state.orchestrator_backend.clone(),
-                    None,
-                    None,
-                )
-            });
+            let session = orchestrators
+                .entry(repo_name.to_string())
+                .or_insert_with(|| {
+                    let entry = registry.get(repo_name).unwrap();
+                    OrchestratorSession::new(
+                        repo_name,
+                        &entry.local_path,
+                        state.orchestrator_backend.clone(),
+                        None,
+                        None,
+                    )
+                });
             match session.process_event(&event_json).await {
                 Ok(text) => text,
                 Err(e) => {
@@ -889,36 +1383,34 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                     repo,
                     payload,
                     context,
-                } => {
-                    match chrono::DateTime::parse_from_rfc3339(trigger_at) {
-                        Ok(dt) => {
-                            let mut scheduler = state.scheduler.lock().await;
-                            let id = scheduler.create_event(
-                                repo,
-                                dt.with_timezone(&chrono::Utc),
-                                payload.clone(),
-                                true,
-                                None,
-                                context,
-                            );
-                            info!(
-                                repo = %repo_name,
-                                event_id = %id,
-                                trigger_at = %trigger_at,
-                                "Scheduled event created",
-                            );
-                        }
-                        Err(e) => {
-                            error!(
-                                repo = %repo_name,
-                                "Invalid trigger_at '{}': {}",
-                                trigger_at,
-                                e,
-                            );
-                            all_ok = false;
-                        }
+                } => match chrono::DateTime::parse_from_rfc3339(trigger_at) {
+                    Ok(dt) => {
+                        let mut scheduler = state.scheduler.lock().await;
+                        let id = scheduler.create_event(
+                            repo,
+                            dt.with_timezone(&chrono::Utc),
+                            payload.clone(),
+                            true,
+                            None,
+                            context,
+                        );
+                        info!(
+                            repo = %repo_name,
+                            event_id = %id,
+                            trigger_at = %trigger_at,
+                            "Scheduled event created",
+                        );
                     }
-                }
+                    Err(e) => {
+                        error!(
+                            repo = %repo_name,
+                            "Invalid trigger_at '{}': {}",
+                            trigger_at,
+                            e,
+                        );
+                        all_ok = false;
+                    }
+                },
                 Action::CancelEvent { event_id } => {
                     let mut scheduler = state.scheduler.lock().await;
                     let cancelled = scheduler.cancel_event(event_id);
@@ -958,12 +1450,9 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         if all_ok {
             let mut queues = state.queues.lock().await;
             let registry = registry_snapshot(state).await;
-            if let Ok(q) = get_or_create_queue(
-                &mut queues,
-                &registry,
-                &state.githubclaw_home,
-                repo_name,
-            ) {
+            if let Ok(q) =
+                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+            {
                 if let Err(e) = q.dequeue() {
                     error!(repo = %repo_name, "Failed to dequeue after success: {}", e);
                 }
@@ -979,12 +1468,8 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 async fn nack_head_event(state: &Arc<ServerState>, repo_name: &str, _filename: &str) {
     let mut queues = state.queues.lock().await;
     let registry = registry_snapshot(state).await;
-    let queue = match get_or_create_queue(
-        &mut queues,
-        &registry,
-        &state.githubclaw_home,
-        repo_name,
-    ) {
+    let queue = match get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+    {
         Ok(q) => q,
         Err(e) => {
             error!(repo = %repo_name, "Failed to get queue for nack: {}", e);
@@ -1061,6 +1546,9 @@ mod tests {
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             orchestrator_backend: crate::orchestrator::session::OrchestratorBackend::Codex,
             orchestrators: Mutex::new(HashMap::new()),
+            registration_store: Mutex::new(
+                RegistrationStore::load(&registration_store_path(tmp.path())).unwrap(),
+            ),
         })
     }
 
@@ -1078,6 +1566,17 @@ mod tests {
     async fn body_string(response: axum::http::Response<Body>) -> String {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn seed_claim_proof(
+        state: &Arc<ServerState>,
+        proof: &str,
+        installation_id: u64,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let mut store = state.registration_store.lock().await;
+        store.seed_claim_proof_for_test(proof, installation_id, expires_at);
+        store.persist().unwrap();
     }
 
     // ---------------------------------------------------------------
@@ -1417,6 +1916,392 @@ mod tests {
         assert_eq!(queue.size(), 1);
     }
 
+    #[tokio::test]
+    async fn test_register_rejects_missing_auth_fields() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 123,
+                            "tunnel_url": "https://agent.example.com"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_both_auth_fields_present() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 123,
+                            "tunnel_url": "https://agent.example.com",
+                            "claim_proof": "cp_test",
+                            "update_secret": "us_test"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_unsafe_tunnel_urls() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        seed_claim_proof(
+            &state,
+            "cp_test",
+            123,
+            chrono::Utc::now() + chrono::Duration::minutes(10),
+        )
+        .await;
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 123,
+                            "tunnel_url": "http://localhost:8080/path",
+                            "claim_proof": "cp_test"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_tunnel_url");
+    }
+
+    #[tokio::test]
+    async fn test_register_claim_returns_201_and_persists_mapping() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        seed_claim_proof(
+            &state,
+            "cp_claim_ok",
+            123,
+            chrono::Utc::now() + chrono::Duration::minutes(10),
+        )
+        .await;
+        let app = create_router(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 123,
+                            "tunnel_url": "https://Agent.Example.com:8443/",
+                            "claim_proof": "cp_claim_ok"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["status"], "claimed");
+        assert_eq!(body["installation_id"], 123);
+        assert_eq!(body["tunnel_url"], "https://agent.example.com:8443");
+        assert_eq!(body["rotated"], false);
+        assert!(body["update_secret"].as_str().unwrap().starts_with("us_"));
+
+        let persisted = RegistrationStore::load(&registration_store_path(tmp.path())).unwrap();
+        let record = persisted.installations.get("123").unwrap();
+        assert_eq!(record.tunnel_url, "https://agent.example.com:8443");
+        let claim = persisted
+            .claim_proofs
+            .get(&hash_secret("cp_claim_ok"))
+            .unwrap();
+        assert!(claim.used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_reused_claim_proof_after_success() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        seed_claim_proof(
+            &state,
+            "cp_once",
+            123,
+            chrono::Utc::now() + chrono::Duration::minutes(10),
+        )
+        .await;
+        let app = create_router(state);
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 123,
+                            "tunnel_url": "https://one.example.com",
+                            "claim_proof": "cp_once"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 123,
+                            "tunnel_url": "https://two.example.com",
+                            "claim_proof": "cp_once"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second.status(), StatusCode::FORBIDDEN);
+        let body: Value = serde_json::from_str(&body_string(second).await).unwrap();
+        assert_eq!(body["error"]["code"], "claim_proof_already_used");
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_expired_claim_proof() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        seed_claim_proof(
+            &state,
+            "cp_expired",
+            123,
+            chrono::Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await;
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 123,
+                            "tunnel_url": "https://expired.example.com",
+                            "claim_proof": "cp_expired"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "expired_claim_proof");
+    }
+
+    #[tokio::test]
+    async fn test_register_update_rotates_secret_and_invalidates_old_secret() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        seed_claim_proof(
+            &state,
+            "cp_rotate",
+            123,
+            chrono::Utc::now() + chrono::Duration::minutes(10),
+        )
+        .await;
+        let app = create_router(state);
+
+        let claim = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 123,
+                            "tunnel_url": "https://first.example.com",
+                            "claim_proof": "cp_rotate"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let claim_body: Value = serde_json::from_str(&body_string(claim).await).unwrap();
+        let first_secret = claim_body["update_secret"].as_str().unwrap().to_string();
+
+        let update = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 123,
+                            "tunnel_url": "https://second.example.com",
+                            "update_secret": first_secret
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        let update_body: Value = serde_json::from_str(&body_string(update).await).unwrap();
+        assert_eq!(update_body["status"], "updated");
+        assert_eq!(update_body["rotated"], true);
+        let second_secret = update_body["update_secret"].as_str().unwrap().to_string();
+
+        let stale = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 123,
+                            "tunnel_url": "https://third.example.com",
+                            "update_secret": first_secret
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+        let stale_body: Value = serde_json::from_str(&body_string(stale).await).unwrap();
+        assert_eq!(stale_body["error"]["code"], "invalid_update_secret");
+        assert_ne!(second_secret, "");
+    }
+
+    #[tokio::test]
+    async fn test_register_returns_ownership_mismatch_for_wrong_installation_secret() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        seed_claim_proof(
+            &state,
+            "cp_owner",
+            123,
+            chrono::Utc::now() + chrono::Duration::minutes(10),
+        )
+        .await;
+        let app = create_router(state);
+
+        let claim = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 123,
+                            "tunnel_url": "https://owned.example.com",
+                            "claim_proof": "cp_owner"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let claim_body: Value = serde_json::from_str(&body_string(claim).await).unwrap();
+        let secret = claim_body["update_secret"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "installation_id": 999,
+                            "tunnel_url": "https://wrong.example.com",
+                            "update_secret": secret
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "ownership_mismatch");
+    }
+
     // ---------------------------------------------------------------
     // 12. annotate_fork_status passes through non-PR payloads
     // ---------------------------------------------------------------
@@ -1453,8 +2338,7 @@ mod tests {
             "repository": { "full_name": "owner/repo" },
         });
 
-        let result =
-            execute_dispatch(&state, &dispatch, &event_payload, "owner/repo").await;
+        let result = execute_dispatch(&state, &dispatch, &event_payload, "owner/repo").await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1503,8 +2387,7 @@ mod tests {
             }
         });
 
-        let result =
-            execute_dispatch(&state, &dispatch, &event_payload, "owner/repo").await;
+        let result = execute_dispatch(&state, &dispatch, &event_payload, "owner/repo").await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
