@@ -5,12 +5,13 @@
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use crate::config::{find_repo_root, global_config_dir, get_log_file, get_pid_file, GlobalConfig};
+use crate::config::{find_repo_root, get_log_file, get_pid_file, global_config_dir, GlobalConfig};
 
 // ---------------------------------------------------------------------------
 // Embedded default templates (compile-time via include_str!)
@@ -48,9 +49,11 @@ const DEFAULT_AGENT_PROJECT_MANAGER: &str = include_str!("../defaults/agents/pro
 const DEFAULT_AGENT_CODER: &str = include_str!("../defaults/agents/coder.md");
 const DEFAULT_AGENT_QA: &str = include_str!("../defaults/agents/qa.md");
 const DEFAULT_AGENT_REVIEWER: &str = include_str!("../defaults/agents/reviewer.md");
-const DEFAULT_AGENT_CONTENTS_MARKETER: &str = include_str!("../defaults/agents/contents_marketer.md");
+const DEFAULT_AGENT_CONTENTS_MARKETER: &str =
+    include_str!("../defaults/agents/contents_marketer.md");
 const DEFAULT_AGENT_VISIONARY: &str = include_str!("../defaults/agents/visionary.md");
-const DEFAULT_AGENT_SECURITY_REVIEWER: &str = include_str!("../defaults/agents/security_reviewer.md");
+const DEFAULT_AGENT_SECURITY_REVIEWER: &str =
+    include_str!("../defaults/agents/security_reviewer.md");
 
 // ---------------------------------------------------------------------------
 // Launchd / systemd constants
@@ -171,13 +174,22 @@ fn cmd_init() {
         (agents_dir.join("cs.md"), DEFAULT_AGENT_CS),
         (agents_dir.join("bug_tracker.md"), DEFAULT_AGENT_BUG_TRACKER),
         (agents_dir.join("librarian.md"), DEFAULT_AGENT_LIBRARIAN),
-        (agents_dir.join("project_manager.md"), DEFAULT_AGENT_PROJECT_MANAGER),
+        (
+            agents_dir.join("project_manager.md"),
+            DEFAULT_AGENT_PROJECT_MANAGER,
+        ),
         (agents_dir.join("coder.md"), DEFAULT_AGENT_CODER),
         (agents_dir.join("qa.md"), DEFAULT_AGENT_QA),
         (agents_dir.join("reviewer.md"), DEFAULT_AGENT_REVIEWER),
-        (agents_dir.join("contents_marketer.md"), DEFAULT_AGENT_CONTENTS_MARKETER),
+        (
+            agents_dir.join("contents_marketer.md"),
+            DEFAULT_AGENT_CONTENTS_MARKETER,
+        ),
         (agents_dir.join("visionary.md"), DEFAULT_AGENT_VISIONARY),
-        (agents_dir.join("security_reviewer.md"), DEFAULT_AGENT_SECURITY_REVIEWER),
+        (
+            agents_dir.join("security_reviewer.md"),
+            DEFAULT_AGENT_SECURITY_REVIEWER,
+        ),
     ];
 
     let mut created: usize = 0;
@@ -229,6 +241,7 @@ fn cmd_init() {
 
     // (b) One-time webhook secret setup
     setup_webhook_secret();
+    setup_registration_secret();
 
     // (c) Backend detection
     detect_backends();
@@ -254,11 +267,11 @@ fn cmd_init() {
 }
 
 fn cmd_bootstrap() {
-    use tokio::sync::{Mutex, RwLock};
-    use crate::server::{bootstrap_repo, load_registry, ServerState};
     use crate::process_manager::ProcessManager;
     use crate::scheduler::ScheduledEventManager;
+    use crate::server::{bootstrap_repo, load_registry, ServerState};
     use std::collections::HashSet;
+    use tokio::sync::{Mutex, RwLock};
 
     let repo_root = match find_repo_root(None) {
         Some(r) => r,
@@ -316,6 +329,11 @@ fn cmd_bootstrap() {
             started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
             githubclaw_home: global_dir.clone(),
+            registration: crate::registration::RegistrationState::new_for_tests(
+                global_dir.join("hosted_proxy").join("installations.json"),
+                "bootstrap-registration-secret",
+            )
+            .unwrap(),
             process_manager: Arc::new(ProcessManager::new(1)),
             scheduler: Mutex::new(ScheduledEventManager::new(&scheduler_path)),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
@@ -373,7 +391,11 @@ fn cmd_start() {
 
             // Unload stale definition first
             let _ = Command::new("launchctl")
-                .args(["bootout", &format!("gui/{uid}"), &plist_path.to_string_lossy()])
+                .args([
+                    "bootout",
+                    &format!("gui/{uid}"),
+                    &plist_path.to_string_lossy(),
+                ])
                 .output();
 
             let result = Command::new("launchctl")
@@ -417,7 +439,10 @@ fn cmd_start() {
                 }
             }
 
-            println!("Webhook server started via launchd on port {}.", config.port);
+            println!(
+                "Webhook server started via launchd on port {}.",
+                config.port
+            );
             println!("  Logs: {}", log_path.display());
             println!("  Plist: {}", plist_path.display());
         }
@@ -474,9 +499,7 @@ fn cmd_start() {
             println!("  Unit: {}", unit_path.display());
         }
         _ => {
-            eprintln!(
-                "Unsupported platform: {system}. Only macOS and Linux are supported."
-            );
+            eprintln!("Unsupported platform: {system}. Only macOS and Linux are supported.");
             std::process::exit(1);
         }
     }
@@ -733,9 +756,7 @@ fn cmd_status() {
                         .filter_map(|e| e.ok())
                         .filter(|e| {
                             e.path().is_file()
-                                && e.path()
-                                    .extension()
-                                    .map_or(false, |ext| ext == "json")
+                                && e.path().extension().is_some_and(|ext| ext == "json")
                         })
                         .count()
                 })
@@ -769,7 +790,11 @@ fn cmd_logs(follow: bool) {
         match fs::read_to_string(&log_path) {
             Ok(contents) => {
                 let lines: Vec<&str> = contents.lines().collect();
-                let start = if lines.len() > 50 { lines.len() - 50 } else { 0 };
+                let start = if lines.len() > 50 {
+                    lines.len() - 50
+                } else {
+                    0
+                };
                 for line in &lines[start..] {
                     println!("{line}");
                 }
@@ -787,13 +812,13 @@ fn cmd_logs(follow: bool) {
 // ===========================================================================
 
 fn cmd_serve(host: &str, port: u16) {
-    use tokio::sync::{Mutex, RwLock};
+    use crate::process_manager::ProcessManager;
+    use crate::scheduler::ScheduledEventManager;
     use crate::server::{
         bootstrap_repo, create_router, load_registry, load_webhook_secret, ServerState,
     };
-    use crate::process_manager::ProcessManager;
-    use crate::scheduler::ScheduledEventManager;
     use std::collections::HashSet;
+    use tokio::sync::{Mutex, RwLock};
 
     // Build the tokio runtime for the async server
     let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
@@ -824,6 +849,13 @@ fn cmd_serve(host: &str, port: u16) {
             eprintln!("Error loading webhook secret: {e}");
             std::process::exit(1);
         });
+        let registration_secret_path = global_dir.join("secrets").join("registration_secret");
+        ensure_secret_file(&registration_secret_path, "registration", false);
+        let registration_secret =
+            load_webhook_secret(&registration_secret_path).unwrap_or_else(|e| {
+                eprintln!("Error loading registration secret: {e}");
+                std::process::exit(1);
+            });
 
         // Load registry
         let registry_path = global_dir.join("registry.json");
@@ -847,6 +879,14 @@ fn cmd_serve(host: &str, port: u16) {
             started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
             githubclaw_home: global_dir.clone(),
+            registration: crate::registration::RegistrationState::load(
+                global_dir.join("hosted_proxy").join("installations.json"),
+                registration_secret,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error loading installation registrations: {e}");
+                std::process::exit(1);
+            }),
             process_manager: Arc::new(ProcessManager::new(config.max_concurrent_agents)),
             scheduler: Mutex::new(scheduler),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
@@ -869,34 +909,45 @@ fn cmd_serve(host: &str, port: u16) {
         {
             let sched_state = Arc::clone(&state);
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(
-                    std::time::Duration::from_secs(crate::constants::SCHEDULER_CHECK_INTERVAL_SECONDS),
-                );
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                    crate::constants::SCHEDULER_CHECK_INTERVAL_SECONDS,
+                ));
                 loop {
                     interval.tick().await;
-                    if sched_state.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    if sched_state
+                        .shutdown
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         break;
                     }
                     let mut scheduler = sched_state.scheduler.lock().await;
                     let sched_state_inner = Arc::clone(&sched_state);
-                    scheduler.fire_due_events_with_callback(|repo, payload| {
-                        let st = Arc::clone(&sched_state_inner);
-                        async move {
-                            let mut queues = st.queues.lock().await;
-                            let registry = st.registry.read().await;
-                            let queue = crate::server::get_or_create_queue_pub(
-                                &mut queues,
-                                &*registry,
-                                &st.githubclaw_home,
-                                &repo,
-                            ).map_err(|e| e.to_string())?;
-                            queue.enqueue(serde_json::json!({
-                                "type": "scheduled_fired",
-                                "scheduled_payload": payload,
-                            }), "scheduled_fired").map_err(|e| e.to_string())?;
-                            Ok(())
-                        }
-                    }).await;
+                    scheduler
+                        .fire_due_events_with_callback(|repo, payload| {
+                            let st = Arc::clone(&sched_state_inner);
+                            async move {
+                                let mut queues = st.queues.lock().await;
+                                let registry = st.registry.read().await;
+                                let queue = crate::server::get_or_create_queue_pub(
+                                    &mut queues,
+                                    &registry,
+                                    &st.githubclaw_home,
+                                    &repo,
+                                )
+                                .map_err(|e| e.to_string())?;
+                                queue
+                                    .enqueue(
+                                        serde_json::json!({
+                                            "type": "scheduled_fired",
+                                            "scheduled_payload": payload,
+                                        }),
+                                        "scheduled_fired",
+                                    )
+                                    .map_err(|e| e.to_string())?;
+                                Ok(())
+                            }
+                        })
+                        .await;
                 }
             });
         }
@@ -977,8 +1028,7 @@ fn parse_github_remote(url: &str) -> Option<String> {
         return Some(format!("{}/{}", &caps[1], &caps[2]));
     }
 
-    let re_https =
-        regex::Regex::new(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?$").ok()?;
+    let re_https = regex::Regex::new(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?$").ok()?;
     if let Some(caps) = re_https.captures(url) {
         return Some(format!("{}/{}", &caps[1], &caps[2]));
     }
@@ -1014,7 +1064,7 @@ fn register_repo(repo_root: &Path) {
         }
     };
 
-    let repo_name = owner_repo.split('/').last().unwrap_or(&owner_repo);
+    let repo_name = owner_repo.split('/').next_back().unwrap_or(&owner_repo);
     let global_dir = global_config_dir();
     let _ = fs::create_dir_all(&global_dir);
     let registry_path = global_dir.join("registry.json");
@@ -1032,8 +1082,7 @@ fn register_repo(repo_root: &Path) {
         registry["repos"] = serde_json::json!({});
     }
 
-    let resolved = fs::canonicalize(repo_root)
-        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let resolved = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
 
     registry["repos"][&owner_repo] = serde_json::json!({
         "local_path": resolved.to_string_lossy(),
@@ -1051,27 +1100,51 @@ fn setup_webhook_secret() {
     let secrets_dir = global_config_dir().join("secrets");
     let _ = fs::create_dir_all(&secrets_dir);
     let secret_path = secrets_dir.join("webhook_secret");
+    ensure_secret_file(&secret_path, "webhook", true);
+}
 
-    if secret_path.exists() {
-        println!("  Webhook secret already configured.");
+fn setup_registration_secret() {
+    let secrets_dir = global_config_dir().join("secrets");
+    let _ = fs::create_dir_all(&secrets_dir);
+    let secret_path = secrets_dir.join("registration_secret");
+    ensure_secret_file(&secret_path, "registration", true);
+}
+
+fn ensure_secret_file(path: &Path, label: &str, announce_existing: bool) {
+    if path.exists() {
+        if announce_existing {
+            println!("  {} secret already configured.", capitalize(label));
+        }
         return;
     }
 
-    // Generate 32 random bytes as hex (64 hex chars)
-    use std::io::Read;
     let mut buf = [0u8; 32];
     if let Ok(mut f) = fs::File::open("/dev/urandom") {
         if f.read_exact(&mut buf).is_ok() {
             let secret = hex::encode(buf);
-            if fs::write(&secret_path, &secret).is_ok() {
-                let _ = fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600));
-                println!("  Generated webhook secret at ~/.githubclaw/secrets/webhook_secret");
-                println!("  Use this secret when creating your GitHub App webhook.");
+            if fs::write(path, &secret).is_ok() {
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+                println!("  Generated {} secret at {}", label, path.display());
+                if label == "webhook" {
+                    println!("  Use this secret when creating your GitHub App webhook.");
+                }
                 return;
             }
         }
     }
-    eprintln!("  Warning: could not generate webhook secret.");
+    eprintln!("  Warning: could not generate {} secret.", label);
+}
+
+fn capitalize(input: &str) -> String {
+    let mut chars = input.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut capitalized = first.to_uppercase().collect::<String>();
+            capitalized.push_str(chars.as_str());
+            capitalized
+        }
+        None => String::new(),
+    }
 }
 
 /// Check which agent backends are available.
@@ -1151,8 +1224,7 @@ fn write_launchd_plist(label: &str, port: u16, log_path: &Path) -> PathBuf {
     let _ = fs::create_dir_all(&plist_dir);
     let plist_path = plist_dir.join(format!("{label}.plist"));
 
-    let exe_path = std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("githubclaw"));
+    let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("githubclaw"));
     let path_env = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
 
     let plist_content = format!(
@@ -1199,15 +1271,11 @@ fn write_launchd_plist(label: &str, port: u16, log_path: &Path) -> PathBuf {
 
 /// Write a Linux systemd user unit file and return its path.
 fn write_systemd_unit(unit_name: &str, port: u16, log_path: &Path) -> PathBuf {
-    let unit_dir = home_dir()
-        .join(".config")
-        .join("systemd")
-        .join("user");
+    let unit_dir = home_dir().join(".config").join("systemd").join("user");
     let _ = fs::create_dir_all(&unit_dir);
     let unit_path = unit_dir.join(format!("{unit_name}.service"));
 
-    let exe_path = std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("githubclaw"));
+    let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("githubclaw"));
     let path_env = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
 
     let unit_content = format!(
