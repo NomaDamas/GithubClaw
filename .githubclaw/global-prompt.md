@@ -52,3 +52,4 @@ Never exit silently. If you could not act, say why. If you chose not to act, say
 
 To request another agent, post a GitHub comment mentioning the handoff keyword.
 The orchestrator will classify the comment event and dispatch accordingly.
+Use handoffs proactively when another specialist can add meaningful review, validation, or domain-specific judgment. Handoffs are encouraged, not mandatory. If you choose not to hand off, briefly explain why no additional specialist review was needed.

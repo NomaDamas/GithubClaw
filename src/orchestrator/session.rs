@@ -22,11 +22,21 @@ use crate::orchestrator::schema::Action;
 // Session struct
 // ---------------------------------------------------------------------------
 
+/// Backend for the orchestrator CLI process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrchestratorBackend {
+    /// Use `codex exec` as the orchestrator.
+    Codex,
+    /// Use `claude -p` as the orchestrator.
+    ClaudeCode,
+}
+
 pub struct OrchestratorSession {
     pub repo: String,
     pub repo_name: String,
     pub repo_dir: String,
     pub socket_path: String,
+    pub backend: OrchestratorBackend,
     model: String,
     idle_timeout: u64,
     system_prompt_path: String,
@@ -44,6 +54,7 @@ impl OrchestratorSession {
     pub fn new(
         repo: &str,
         repo_dir: &str,
+        backend: OrchestratorBackend,
         model: Option<&str>,
         idle_timeout: Option<u64>,
     ) -> Self {
@@ -51,7 +62,6 @@ impl OrchestratorSession {
         let socket_path = format!("/tmp/githubclaw-{}.sock", repo_name);
         let persistence_dir = home_dir().join(".githubclaw/sessions").join(&repo_name);
 
-        // Attempt to load persisted conversation history
         let conversation_history =
             Self::load_persisted_state(&persistence_dir).unwrap_or_default();
 
@@ -60,6 +70,7 @@ impl OrchestratorSession {
             repo_name: repo_name.clone(),
             repo_dir: repo_dir.to_string(),
             socket_path,
+            backend,
             model: model.unwrap_or("claude-sonnet-4-20250514").to_string(),
             idle_timeout: idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECONDS),
             system_prompt_path: format!("{}/.githubclaw/orchestrator.md", repo_dir),
@@ -232,10 +243,16 @@ impl OrchestratorSession {
     // Event processing — core method
     // -----------------------------------------------------------------------
 
-    /// Process a single event: build messages, call the Anthropic API (with
-    /// agentic tool-use loop), extract an ActionList, and return serialized JSON.
+    /// Process a single event by spawning a Claude Code or Codex CLI subprocess.
+    ///
+    /// The CLI process acts as the orchestrator agent — it uses its built-in
+    /// tools (Bash for `gh` CLI, Read for files, etc.) to gather context, then
+    /// outputs a structured ActionList JSON.
+    ///
+    /// This replaces the hand-rolled Anthropic API agentic loop with the
+    /// battle-tested tool calling of Claude Code / Codex.
     pub async fn process_event(&mut self, event_json: &str) -> Result<String, String> {
-        // 1. Re-read global-prompt.md (fresh every time)
+        // 1. Re-read prompts fresh every time
         let global_prompt = self.load_global_prompt();
         let system_prompt = self.load_system_prompt();
 
@@ -245,168 +262,165 @@ impl OrchestratorSession {
             format!("{}\n\n---\n\n{}", global_prompt, system_prompt)
         };
 
-        // 2. Build messages: conversation history + new event
-        let event_message = serde_json::json!({
-            "role": "user",
-            "content": format!(
-                "Process this GitHub webhook event and respond with an ActionList JSON:\n\n{}",
-                event_json
-            )
-        });
-        self.conversation_history.push(event_message.clone());
+        // 2. Build the orchestrator instruction
+        let orchestrator_prompt = format!(
+            "{}\n\n\
+            # Orchestrator Instructions\n\n\
+            You are the orchestrator for the **{}** repository (local path: `{}`).\n\n\
+            ## Available Agents\n\
+            cs, bug_tracker, librarian, project_manager, coder, qa, reviewer, \
+            contents_marketer, visionary, security_reviewer\n\n\
+            ## Your Task\n\
+            Process the GitHub webhook event below. Use your tools to gather context:\n\
+            - Run `gh issue view <N> --repo {}` to read issue details\n\
+            - Run `gh pr view <N> --repo {}` to read PR details\n\
+            - Read `.githubclaw/memory.md` for project memory\n\
+            - Search code if needed to understand context\n\n\
+            Then decide what action(s) to take.\n\n\
+            ## Output Format\n\
+            You MUST output ONLY a JSON object (no other text) matching this schema:\n\
+            ```json\n\
+            {{\n\
+              \"actions\": [\n\
+                {{\"type\": \"dispatch\", \"agent_type\": \"<agent>\", \"issue_ref\": \"#N\", \"task_context\": \"brief context\"}}\n\
+              ],\n\
+              \"reasoning\": \"why you made this decision\"\n\
+            }}\n\
+            ```\n\
+            Action types: `no_action` (with reasoning), `dispatch`, `schedule_event`, `cancel_event`.\n\n\
+            ## Event\n\
+            ```json\n{}\n```",
+            full_system, self.repo, self.repo_dir, self.repo, self.repo, event_json,
+        );
 
-        // Trim history if it gets too long
-        if self.conversation_history.len() > MESSAGE_HISTORY_WARNING_THRESHOLD {
-            warn!(
-                "Conversation history for {} has {} messages, trimming oldest",
-                self.repo,
-                self.conversation_history.len()
-            );
-            let keep = MESSAGE_HISTORY_WARNING_THRESHOLD / 2;
-            self.conversation_history =
-                self.conversation_history[self.conversation_history.len() - keep..].to_vec();
-        }
+        // 3. Spawn the configured backend CLI
+        let output = match self.backend {
+            OrchestratorBackend::Codex => self.run_codex(&orchestrator_prompt).await?,
+            OrchestratorBackend::ClaudeCode => self.run_claude_code(&orchestrator_prompt).await?,
+        };
 
-        // 3. Define tools (the orchestrator output schema)
-        let tools = orchestrator_tools();
+        info!(
+            repo = %self.repo,
+            output_len = output.len(),
+            "Orchestrator CLI output received",
+        );
 
-        // 4. Call Anthropic API (agentic loop)
-        let mut messages = self.conversation_history.clone();
-        let mut max_iterations = 10;
+        // 4. Parse ActionList from output
+        let action_list = Self::extract_action_list(&output);
+        let result = serde_json::to_string(&action_list)
+            .map_err(|e| format!("Failed to serialize ActionList: {}", e))?;
 
-        loop {
-            let api_response = self
-                .call_anthropic_api(&messages, &tools, &full_system)
-                .await?;
-
-            // Check stop reason
-            let _stop_reason = api_response
-                .get("stop_reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("end_turn");
-
-            // Extract content blocks
-            let content = api_response
-                .get("content")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-
-            // Collect text from content blocks
-            let mut text_parts = Vec::new();
-            let mut has_tool_use = false;
-
-            for block in &content {
-                match block.get("type").and_then(|v| v.as_str()) {
-                    Some("text") => {
-                        if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                            text_parts.push(text.to_string());
-                        }
-                    }
-                    Some("tool_use") => {
-                        has_tool_use = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            // Add assistant response to messages
-            messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": content
-            }));
-
-            if has_tool_use && max_iterations > 0 {
-                // Handle tool_use: send back tool results
-                let mut tool_results = Vec::new();
-                for block in &content {
-                    if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                        let tool_id = block
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        // For now, acknowledge the tool use -- real tool execution
-                        // would dispatch to gh CLI, file reads, etc.
-                        tool_results.push(serde_json::json!({
-                            "type": "tool_result",
-                            "tool_use_id": tool_id,
-                            "content": "Tool execution acknowledged."
-                        }));
-                    }
-                }
-
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": tool_results
-                }));
-
-                max_iterations -= 1;
-                continue;
-            }
-
-            // Extract ActionList from final text
-            let full_text = text_parts.join("\n");
-            let action_list = Self::extract_action_list(&full_text);
-
-            // Update conversation history with the final assistant message
-            self.conversation_history.push(serde_json::json!({
-                "role": "assistant",
-                "content": full_text
-            }));
-
-            let result = serde_json::to_string(&action_list)
-                .map_err(|e| format!("Failed to serialize ActionList: {}", e))?;
-
-            return Ok(result);
-        }
+        Ok(result)
     }
 
-    /// Call the Anthropic Messages API.
-    async fn call_anthropic_api(
-        &self,
-        messages: &[serde_json::Value],
-        tools: &[serde_json::Value],
-        system_prompt: &str,
-    ) -> Result<serde_json::Value, String> {
-        let api_key =
-            std::env::var("ANTHROPIC_API_KEY").map_err(|_| "ANTHROPIC_API_KEY not set".to_string())?;
+    /// Check if a CLI binary is available on PATH.
+    fn has_cli(name: &str) -> bool {
+        which::which(name).is_ok()
+    }
 
-        let client = reqwest::Client::new();
+    /// Run Claude Code CLI as the orchestrator.
+    async fn run_claude_code(&self, prompt: &str) -> Result<String, String> {
+        use tokio::process::Command;
 
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "max_tokens": 4096,
-            "system": system_prompt,
-            "messages": messages,
-        });
+        info!(repo = %self.repo, "Spawning Claude Code as orchestrator");
 
-        if !tools.is_empty() {
-            body["tools"] = serde_json::json!(tools);
-        }
-
-        let response = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
+        let output = Command::new("claude")
+            .args([
+                "-p",                        // print mode (non-interactive)
+                "--output-format", "text",   // plain text output
+                "--max-turns", "15",         // allow multi-step investigation
+                "--model", &self.model,
+            ])
+            .arg(prompt)
+            .current_dir(&self.repo_dir)
+            .env("ANTHROPIC_API_KEY", std::env::var("ANTHROPIC_API_KEY").unwrap_or_default())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
             .await
-            .map_err(|e| format!("Anthropic API request failed: {}", e))?;
+            .map_err(|e| format!("Failed to spawn claude CLI: {}", e))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_body = response.text().await.unwrap_or_default();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
-                "Anthropic API error ({}): {}",
-                status, error_body
+                "Claude Code exited with {}: {}",
+                output.status,
+                stderr.trim()
             ));
         }
 
-        response
-            .json()
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|e| format!("Non-UTF8 output from claude: {}", e))?;
+
+        Ok(stdout)
+    }
+
+    /// Run Codex CLI as the orchestrator.
+    ///
+    /// Uses `--full-auto` for autonomous execution and `--output-schema` to
+    /// force a structured ActionList JSON response.
+    async fn run_codex(&self, prompt: &str) -> Result<String, String> {
+        use tokio::process::Command;
+
+        info!(repo = %self.repo, "Spawning Codex as orchestrator");
+
+        // Write the ActionList JSON schema to a temp file for --output-schema
+        let schema_path = std::env::temp_dir().join(format!(
+            "githubclaw_schema_{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&schema_path, include_str!("../../defaults/action_list_schema.json"))
+            .map_err(|e| format!("Failed to write schema file: {}", e))?;
+
+        // Write output to a temp file via -o
+        let output_path = std::env::temp_dir().join(format!(
+            "githubclaw_output_{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut child = Command::new("codex")
+            .arg("exec")
+            .arg("--full-auto")
+            .arg("--output-schema")
+            .arg(&schema_path)
+            .arg("-o")
+            .arg(&output_path)
+            .arg(prompt)
+            .current_dir(&self.repo_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn codex CLI: {}", e))?;
+
+        let result = child.wait_with_output()
             .await
-            .map_err(|e| format!("Failed to parse Anthropic API response: {}", e))
+            .map_err(|e| format!("Codex process failed: {}", e))?;
+
+        // Clean up schema temp file
+        let _ = std::fs::remove_file(&schema_path);
+
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let _ = std::fs::remove_file(&output_path);
+            return Err(format!(
+                "Codex exited with {}: {}",
+                result.status,
+                stderr.trim()
+            ));
+        }
+
+        // Read structured output from -o file, fallback to stdout
+        let output = if output_path.exists() {
+            let content = std::fs::read_to_string(&output_path)
+                .map_err(|e| format!("Failed to read codex output file: {}", e))?;
+            let _ = std::fs::remove_file(&output_path);
+            content
+        } else {
+            String::from_utf8(result.stdout)
+                .map_err(|e| format!("Non-UTF8 output from codex: {}", e))?
+        };
+
+        Ok(output)
     }
 
     // -----------------------------------------------------------------------
@@ -448,43 +462,6 @@ impl OrchestratorSession {
             .and_then(|v| v.as_array())
             .cloned()
     }
-}
-
-/// Define the orchestrator's available tools for the Anthropic API.
-fn orchestrator_tools() -> Vec<serde_json::Value> {
-    vec![serde_json::json!({
-        "name": "emit_action_list",
-        "description": "Emit a list of actions for the orchestrator to execute. Use this to dispatch agents, schedule events, or decide to take no action.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "actions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "type": {
-                                "type": "string",
-                                "enum": ["no_action", "dispatch", "schedule_event", "cancel_event"]
-                            },
-                            "reasoning": { "type": "string" },
-                            "agent_type": { "type": "string" },
-                            "issue_ref": { "type": "string" },
-                            "task_context": { "type": "string" },
-                            "event_id": { "type": "string" },
-                            "trigger_at": { "type": "string" },
-                            "repo": { "type": "string" },
-                            "payload": { "type": "object" },
-                            "context": { "type": "string" }
-                        },
-                        "required": ["type"]
-                    }
-                },
-                "reasoning": { "type": "string" }
-            },
-            "required": ["actions", "reasoning"]
-        }
-    })]
 }
 
 /// Extract the first `` ```json ... ``` `` fenced code block from text.
@@ -582,6 +559,7 @@ mod tests {
         let session = OrchestratorSession::new(
             "acme/widgets",
             "/home/user/repos/widgets",
+            OrchestratorBackend::Codex,
             None,
             None,
         );
@@ -667,6 +645,7 @@ That's my decision."#;
         let session = OrchestratorSession::new(
             "owner/repo-name",
             "/tmp/repo",
+            OrchestratorBackend::Codex,
             None,
             None,
         );
@@ -682,7 +661,7 @@ That's my decision."#;
         fs::create_dir_all(&gc_dir).unwrap();
         fs::write(gc_dir.join("orchestrator.md"), "Custom system prompt.").unwrap();
 
-        let session = OrchestratorSession::new("owner/repo", repo_dir, None, None);
+        let session = OrchestratorSession::new("owner/repo", repo_dir, OrchestratorBackend::Codex, None, None);
         let prompt = session.load_system_prompt();
         assert_eq!(prompt, "Custom system prompt.");
     }
@@ -693,7 +672,7 @@ That's my decision."#;
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().to_str().unwrap();
 
-        let session = OrchestratorSession::new("owner/repo", repo_dir, None, None);
+        let session = OrchestratorSession::new("owner/repo", repo_dir, OrchestratorBackend::Codex, None, None);
         let prompt = session.load_system_prompt();
         assert!(prompt.contains("owner/repo"));
         assert!(prompt.contains("orchestrator"));
@@ -705,6 +684,7 @@ That's my decision."#;
         let session = OrchestratorSession::new(
             "acme/widgets",
             "/tmp/repo",
+            OrchestratorBackend::Codex,
             None,
             None,
         );
@@ -724,7 +704,7 @@ That's my decision."#;
         let socket_path = tmp.path().join("test-serve.sock");
         let socket_path_str = socket_path.to_str().unwrap().to_string();
 
-        let mut session = OrchestratorSession::new("test/serve-repo", repo_dir, None, Some(2));
+        let mut session = OrchestratorSession::new("test/serve-repo", repo_dir, OrchestratorBackend::Codex, None, Some(2));
         session.socket_path = socket_path_str.clone();
 
         // Spawn serve in background -- it will time out after 2 seconds
@@ -788,7 +768,7 @@ That's my decision."#;
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().to_str().unwrap();
 
-        let mut session = OrchestratorSession::new("test/persist", repo_dir, None, None);
+        let mut session = OrchestratorSession::new("test/persist", repo_dir, OrchestratorBackend::Codex, None, None);
         // Override persistence_dir to use temp
         session.persistence_dir = tmp.path().join("sessions").join("test-persist");
 
@@ -819,12 +799,14 @@ That's my decision."#;
         assert!(result.is_none());
     }
 
-    // 13. orchestrator_tools returns valid tool definitions
+    // 13. has_cli detects available CLI tools
     #[test]
-    fn orchestrator_tools_valid() {
-        let tools = orchestrator_tools();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "emit_action_list");
-        assert!(tools[0]["input_schema"]["properties"]["actions"].is_object());
+    fn has_cli_detects_tools() {
+        // At least one of claude or codex should be available in dev env
+        // (this test just verifies the function doesn't panic)
+        let _has_claude = OrchestratorSession::has_cli("claude");
+        let _has_codex = OrchestratorSession::has_cli("codex");
+        // A definitely missing binary should return false
+        assert!(!OrchestratorSession::has_cli("definitely_not_a_real_binary_xyz"));
     }
 }

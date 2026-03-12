@@ -1,0 +1,31 @@
+{
+  "type": "object",
+  "required": ["actions", "reasoning"],
+  "additionalProperties": false,
+  "properties": {
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "reasoning", "agent_type", "issue_ref", "task_context", "event_id", "trigger_at", "repo", "payload", "context"],
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["no_action", "dispatch", "schedule_event", "cancel_event"]
+          },
+          "reasoning": { "type": "string" },
+          "agent_type": { "type": "string" },
+          "issue_ref": { "type": "string" },
+          "task_context": { "type": "string" },
+          "event_id": { "type": "string" },
+          "trigger_at": { "type": "string" },
+          "repo": { "type": "string" },
+          "payload": { "type": "string" },
+          "context": { "type": "string" }
+        }
+      }
+    },
+    "reasoning": { "type": "string" }
+  }
+}

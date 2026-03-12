@@ -43,6 +43,8 @@ pub struct ServerState {
     pub scheduler: Mutex<ScheduledEventManager>,
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Which CLI backend to use for the orchestrator (codex or claude-code).
+    pub orchestrator_backend: crate::orchestrator::session::OrchestratorBackend,
     /// Per-repo orchestrator sessions (created on demand in the drain loop).
     pub orchestrators: Mutex<HashMap<String, OrchestratorSession>>,
 }
@@ -688,7 +690,13 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             let mut orchestrators = state.orchestrators.lock().await;
             let session = orchestrators.entry(repo_name.to_string()).or_insert_with(|| {
                 let entry = state.registry.get(repo_name).unwrap();
-                OrchestratorSession::new(repo_name, &entry.local_path, None, None)
+                OrchestratorSession::new(
+                    repo_name,
+                    &entry.local_path,
+                    state.orchestrator_backend.clone(),
+                    None,
+                    None,
+                )
             });
             match session.process_event(&event_json).await {
                 Ok(text) => text,
@@ -915,6 +923,7 @@ mod tests {
             scheduler: Mutex::new(ScheduledEventManager::new(scheduler_path)),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            orchestrator_backend: crate::orchestrator::session::OrchestratorBackend::Codex,
             orchestrators: Mutex::new(HashMap::new()),
         })
     }

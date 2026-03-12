@@ -748,6 +748,7 @@ fn cmd_serve(host: &str, port: u16) {
             scheduler: Mutex::new(scheduler),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            orchestrator_backend: crate::orchestrator::session::OrchestratorBackend::Codex,
             orchestrators: Mutex::new(HashMap::new()),
         });
 
