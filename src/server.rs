@@ -337,7 +337,7 @@ async fn webhook_handler(
     }
 
     // 4. Fork PR annotation
-    let payload = annotate_fork_status(payload);
+    let mut payload = annotate_fork_status(payload);
 
     // 5. Build event label
     let event_type = headers
@@ -352,6 +352,14 @@ async fn webhook_handler(
     } else {
         format!("{}_{}", event_type, action)
     };
+
+    // Before enqueue, tag the payload with the event type
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(
+            "_githubclaw_event_type".to_string(),
+            serde_json::Value::String(event_type.to_string()),
+        );
+    }
 
     // 6. Enqueue
     let mut queues = state.queues.lock().await;
@@ -742,6 +750,54 @@ pub async fn start_event_processing(state: Arc<ServerState>) {
     info!("Event processing started for {} repos", registry.len());
 }
 
+/// Events worth sending to the orchestrator. Everything else is noise.
+fn is_actionable_event(event: &serde_json::Value) -> bool {
+    // Check the webhook event type stored in the payload
+    let event_type = event
+        .get("_githubclaw_event_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let action = event.get("action").and_then(|v| v.as_str()).unwrap_or("");
+
+    matches!(
+        (event_type, action),
+        ("issues", "opened")
+            | ("issues", "closed")
+            | ("issue_comment", "created")
+            | ("pull_request", "opened")
+            | ("pull_request", "closed")
+            | ("pull_request_review", "submitted")
+            | ("discussion", "created")
+            | ("discussion_comment", "created")
+            // check_run only on failure
+            | ("check_run", "completed") // will further filter by conclusion below
+    )
+    // For check_run.completed, only pass through failures
+    && if event_type == "check_run" {
+        event
+            .pointer("/check_run/conclusion")
+            .and_then(|v| v.as_str())
+            .map_or(false, |c| c == "failure")
+    } else {
+        true
+    }
+    // Special case: issues.labeled only for "githubclaw-approved" (fork PR gate)
+    || (event_type == "issues"
+        && action == "labeled"
+        && event
+            .get("label")
+            .and_then(|l| l.get("name"))
+            .and_then(|n| n.as_str())
+            == Some("githubclaw-approved"))
+    || (event_type == "pull_request"
+        && action == "labeled"
+        && event
+            .get("label")
+            .and_then(|l| l.get("name"))
+            .and_then(|n| n.as_str())
+            == Some("githubclaw-approved"))
+}
+
 /// Per-repo drain loop: peek the queue, send to orchestrator, execute actions.
 async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &RegistryEntry) {
     let _repo_slug = repo_name.replace('/', "-");
@@ -792,14 +848,33 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             }
         };
 
-        // 2. Check rate limiter before sending to orchestrator.
+        // 2. Filter: only actionable events reach the orchestrator
+        if !is_actionable_event(&event.payload)
+            && event
+                .payload
+                .get("type")
+                .and_then(|v| v.as_str())
+                != Some("virtual_bootstrap")
+        {
+            // Silently dequeue and skip
+            let mut queues = state.queues.lock().await;
+            let registry = registry_snapshot(state).await;
+            if let Ok(q) =
+                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+            {
+                let _ = q.dequeue();
+            }
+            continue;
+        }
+
+        // 3. Check rate limiter before sending to orchestrator.
         if state.rate_limiter.is_orchestrator_paused() {
             tracing::warn!("Rate limited (orchestrator paused), sleeping...");
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             continue;
         }
 
-        // 3. Send event to orchestrator (in-process).
+        // 4. Send event to orchestrator (in-process).
         let event_json = serde_json::to_string(&event.payload).unwrap_or_default();
 
         // Get or create the orchestrator session for this repo.
@@ -837,7 +912,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             }
         };
 
-        // 4. Parse the ActionList response.
+        // 5. Parse the ActionList response.
         let action_list = OrchestratorSession::extract_action_list(&response_text);
         if let Err(e) = action_list.validate() {
             warn!(
@@ -851,7 +926,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             continue;
         }
 
-        // 4. Execute each action.
+        // 6. Execute each action.
         let mut all_ok = true;
         let mut capacity_wait = false;
         for action in &action_list.actions {
@@ -866,26 +941,40 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                         issue_ref: issue_ref.clone(),
                         task_context: task_context.clone(),
                     };
-                    if let Err(e) =
-                        execute_dispatch(state, &dispatch, &event.payload, repo_name).await
+                    match execute_dispatch(state, &dispatch, &event.payload, repo_name)
+                        .await
                     {
-                        if e.starts_with("CAPACITY_FULL:") {
-                            // Don't nack — just wait and retry later.
-                            info!(
+                        Ok(()) => {
+                            // Record in dispatch_log for orchestrator context
+                            let timestamp = chrono::Utc::now().format("%H:%M").to_string();
+                            let mut orchestrators = state.orchestrators.lock().await;
+                            if let Some(session) = orchestrators.get_mut(repo_name) {
+                                session.dispatch_log.push((
+                                    timestamp,
+                                    issue_ref.clone(),
+                                    agent_type.clone(),
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            if e.starts_with("CAPACITY_FULL:") {
+                                // Don't nack — just wait and retry later.
+                                info!(
+                                    repo = %repo_name,
+                                    agent_type = %agent_type,
+                                    "Concurrency full, will retry after slot frees up",
+                                );
+                                capacity_wait = true;
+                                break;
+                            }
+                            error!(
                                 repo = %repo_name,
                                 agent_type = %agent_type,
-                                "Concurrency full, will retry after slot frees up",
+                                "Dispatch failed: {}",
+                                e,
                             );
-                            capacity_wait = true;
-                            break;
+                            all_ok = false;
                         }
-                        error!(
-                            repo = %repo_name,
-                            agent_type = %agent_type,
-                            "Dispatch failed: {}",
-                            e,
-                        );
-                        all_ok = false;
                     }
                 }
                 Action::ScheduleEvent {
@@ -950,7 +1039,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             }
         }
 
-        // 5. Handle result.
+        // 7. Handle result.
         if capacity_wait {
             // Concurrency full — don't dequeue, don't nack. Just sleep and
             // the event stays at the head of the queue for the next loop.
@@ -1507,5 +1596,57 @@ mod tests {
             "Expected 'Fork PR gate blocked' but got: {}",
             err,
         );
+    }
+
+    // ---------------------------------------------------------------
+    // 15. is_actionable_event filtering
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_is_actionable_event() {
+        // issues.opened → actionable
+        assert!(is_actionable_event(&serde_json::json!({
+            "_githubclaw_event_type": "issues",
+            "action": "opened"
+        })));
+
+        // issues.labeled → NOT actionable (unless githubclaw-approved)
+        assert!(!is_actionable_event(&serde_json::json!({
+            "_githubclaw_event_type": "issues",
+            "action": "labeled",
+            "label": { "name": "bug" }
+        })));
+
+        // issues.labeled with githubclaw-approved → actionable
+        assert!(is_actionable_event(&serde_json::json!({
+            "_githubclaw_event_type": "issues",
+            "action": "labeled",
+            "label": { "name": "githubclaw-approved" }
+        })));
+
+        // check_run.completed failure → actionable
+        assert!(is_actionable_event(&serde_json::json!({
+            "_githubclaw_event_type": "check_run",
+            "action": "completed",
+            "check_run": { "conclusion": "failure" }
+        })));
+
+        // check_run.completed success → NOT actionable
+        assert!(!is_actionable_event(&serde_json::json!({
+            "_githubclaw_event_type": "check_run",
+            "action": "completed",
+            "check_run": { "conclusion": "success" }
+        })));
+
+        // check_run.created → NOT actionable
+        assert!(!is_actionable_event(&serde_json::json!({
+            "_githubclaw_event_type": "check_run",
+            "action": "created"
+        })));
+
+        // label.created → NOT actionable
+        assert!(!is_actionable_event(&serde_json::json!({
+            "_githubclaw_event_type": "label",
+            "action": "created"
+        })));
     }
 }

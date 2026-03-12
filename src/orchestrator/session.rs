@@ -43,6 +43,10 @@ pub struct OrchestratorSession {
     global_prompt_path: String,
     persistence_dir: PathBuf,
     conversation_history: Vec<serde_json::Value>,
+    /// Recent dispatch history: (timestamp, issue_ref, agent_type).
+    /// Prepended to the orchestrator prompt so the model has context
+    /// about previous dispatches and can avoid duplicates.
+    pub dispatch_log: Vec<(String, String, String)>,
 }
 
 impl OrchestratorSession {
@@ -76,6 +80,7 @@ impl OrchestratorSession {
             global_prompt_path: format!("{}/.githubclaw/global-prompt.md", repo_dir),
             persistence_dir,
             conversation_history,
+            dispatch_log: Vec::new(),
         }
     }
 
@@ -261,7 +266,27 @@ impl OrchestratorSession {
             format!("{}\n\n---\n\n{}", global_prompt, system_prompt)
         };
 
-        // 2. Build the orchestrator instruction
+        // 2. Build recent dispatch history section (last 10 entries)
+        let dispatch_history = if self.dispatch_log.is_empty() {
+            String::new()
+        } else {
+            let recent: Vec<&(String, String, String)> = self
+                .dispatch_log
+                .iter()
+                .rev()
+                .take(10)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let mut lines = String::from("\n\n## Recent Dispatch History (last 10)\n");
+            for (ts, issue_ref, agent_type) in recent {
+                lines.push_str(&format!("- {} {} → {}\n", ts, issue_ref, agent_type));
+            }
+            lines
+        };
+
+        // 3. Build the orchestrator instruction
         let orchestrator_prompt = format!(
             "{}\n\n\
             # Orchestrator Instructions\n\n\
@@ -288,11 +313,12 @@ impl OrchestratorSession {
             ```\n\
             Action types: `no_action` (with reasoning), `dispatch`, `schedule_event`, `cancel_event`.\n\n\
             ## Event\n\
-            ```json\n{}\n```",
-            full_system, self.repo, self.repo_dir, self.repo, self.repo, event_json,
+            ```json\n{}\n```\
+            {}",
+            full_system, self.repo, self.repo_dir, self.repo, self.repo, event_json, dispatch_history,
         );
 
-        // 3. Spawn the configured backend CLI
+        // 4. Spawn the configured backend CLI
         let output = match self.backend {
             OrchestratorBackend::Codex => self.run_codex(&orchestrator_prompt).await?,
             OrchestratorBackend::ClaudeCode => self.run_claude_code(&orchestrator_prompt).await?,
@@ -304,7 +330,7 @@ impl OrchestratorSession {
             "Orchestrator CLI output received",
         );
 
-        // 4. Parse ActionList from output
+        // 5. Parse ActionList from output
         let action_list = Self::extract_action_list(&output);
         let result = serde_json::to_string(&action_list)
             .map_err(|e| format!("Failed to serialize ActionList: {}", e))?;
@@ -357,7 +383,8 @@ impl OrchestratorSession {
 
     /// Run Codex CLI as the orchestrator.
     ///
-    /// Uses `--full-auto` for autonomous execution and `--output-schema` to
+    /// Uses `--dangerously-bypass-approvals-and-sandbox` for autonomous execution
+    /// with full network access (needed for `gh` CLI), and `--output-schema` to
     /// force a structured ActionList JSON response.
     async fn run_codex(&self, prompt: &str) -> Result<String, String> {
         use tokio::process::Command;
@@ -379,7 +406,7 @@ impl OrchestratorSession {
 
         let child = Command::new("codex")
             .arg("exec")
-            .arg("--full-auto")
+            .arg("--dangerously-bypass-approvals-and-sandbox")
             .arg("--output-schema")
             .arg(&schema_path)
             .arg("-o")
