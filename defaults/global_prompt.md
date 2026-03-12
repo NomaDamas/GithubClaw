@@ -11,9 +11,9 @@
 | Coder | Implementation, CI fixes, rebases | @coder |
 | QA | E2E testing, Playwright | @qa |
 | Reviewer | Code review, merge authority (dev) | @reviewer |
-| Contents Marketer | External content drafting & publishing | @marketer |
+| Contents Marketer | Contents marketer of this repo | @marketer |
 | Visionary | Daily summaries, strategic proposals | @visionary |
-| Security Reviewer | Fork PR security audit (read-only) | @security-reviewer |
+| Security Reviewer | security audit (read-only) | @security-reviewer |
 
 ## Common Rules (All Agents)
 
