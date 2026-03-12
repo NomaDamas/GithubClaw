@@ -531,10 +531,11 @@ async fn execute_dispatch(
         ));
     }
 
-    // 4. Check concurrency capacity.
+    // 4. Check concurrency capacity — return a special error so the drain
+    //    loop knows to wait instead of nacking.
     if !state.process_manager.has_capacity().await {
         return Err(format!(
-            "No concurrency capacity for agent '{}' — {} agents already running",
+            "CAPACITY_FULL: No concurrency capacity for agent '{}' — {} agents already running",
             dispatch.agent_type, state.process_manager.max_concurrent_agents,
         ));
     }
@@ -599,6 +600,51 @@ async fn execute_dispatch(
         "Agent registered with process manager (pid={})",
         pid,
     );
+
+    let process_manager = Arc::clone(&state.process_manager);
+    let agent_type = dispatch.agent_type.clone();
+    let repo_name = repo_full_name.to_string();
+    tokio::spawn(async move {
+        match child.wait_with_output().await {
+            Ok(output) => {
+                let exit_code = output.status.code().unwrap_or(1);
+                process_manager.report_exit(pid, exit_code).await;
+
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+                if output.status.success() {
+                    info!(
+                        pid,
+                        agent_type = %agent_type,
+                        repo = %repo_name,
+                        stdout = %stdout,
+                        "Agent exited successfully",
+                    );
+                } else {
+                    warn!(
+                        pid,
+                        agent_type = %agent_type,
+                        repo = %repo_name,
+                        exit_code,
+                        stdout = %stdout,
+                        stderr = %stderr,
+                        "Agent exited with failure",
+                    );
+                }
+            }
+            Err(e) => {
+                process_manager.report_exit(pid, 1).await;
+                warn!(
+                    pid,
+                    agent_type = %agent_type,
+                    repo = %repo_name,
+                    error = %e,
+                    "Failed while waiting for agent process",
+                );
+            }
+        }
+    });
 
     Ok(())
 }
@@ -733,6 +779,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 
         // 4. Execute each action.
         let mut all_ok = true;
+        let mut capacity_wait = false;
         for action in &action_list.actions {
             match action {
                 Action::Dispatch {
@@ -748,6 +795,16 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                     if let Err(e) =
                         execute_dispatch(state, &dispatch, &event.payload, repo_name).await
                     {
+                        if e.starts_with("CAPACITY_FULL:") {
+                            // Don't nack — just wait and retry later.
+                            info!(
+                                repo = %repo_name,
+                                agent_type = %agent_type,
+                                "Concurrency full, will retry after slot frees up",
+                            );
+                            capacity_wait = true;
+                            break;
+                        }
                         error!(
                             repo = %repo_name,
                             agent_type = %agent_type,
@@ -821,7 +878,14 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             }
         }
 
-        // 5. On success: dequeue the event. On failure: nack (retry).
+        // 5. Handle result.
+        if capacity_wait {
+            // Concurrency full — don't dequeue, don't nack. Just sleep and
+            // the event stays at the head of the queue for the next loop.
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            continue;
+        }
+
         if all_ok {
             let mut queues = state.queues.lock().await;
             if let Ok(q) = get_or_create_queue(
