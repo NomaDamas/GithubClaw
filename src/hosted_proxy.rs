@@ -1,12 +1,12 @@
 //! Hosted proxy registration helpers.
 //!
 //! The hosted proxy stores one canonical tunnel origin per installation.
-//! Validation stays conservative: HTTPS only, origin-only URLs, and public DNS
-//! hostnames rather than localhost, internal names, or IP literals.
+//! Validation stays conservative: HTTPS only, origin-only URLs, and no
+//! localhost, loopback, or private-network targets.
 
 use reqwest::Url;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TunnelUrlError {
@@ -42,6 +42,8 @@ impl std::error::Error for TunnelUrlError {}
 /// The canonical form is `https://host[:port]` with a lowercase host and the
 /// default HTTPS port removed.
 pub fn canonicalize_tunnel_url(input: &str) -> Result<String, TunnelUrlError> {
+    ensure_origin_form(input)?;
+
     let url = Url::parse(input)
         .map_err(|_| TunnelUrlError::Invalid("tunnel_url must be a valid absolute URL"))?;
 
@@ -69,26 +71,24 @@ pub fn canonicalize_tunnel_url(input: &str) -> Result<String, TunnelUrlError> {
         ));
     }
 
-    if url.path() != "/" {
-        return Err(TunnelUrlError::Invalid(
-            "tunnel_url must be an origin without a path",
-        ));
-    }
-
     let host = url
         .host_str()
         .ok_or(TunnelUrlError::Invalid("tunnel_url must include a host"))?;
 
-    if is_unsafe_host(host) {
+    if is_local_hostname(host) {
         return Err(TunnelUrlError::Unsafe(
-            "tunnel_url must use a public DNS hostname",
+            "tunnel_url must not target localhost",
         ));
     }
+    if let Some(ip) = host_to_ip(host) {
+        if !is_public_ip(ip) {
+            return Err(TunnelUrlError::Unsafe(
+                "tunnel_url must use a public host or IP",
+            ));
+        }
+    }
 
-    let mut canonical = format!(
-        "https://{}",
-        host.trim_end_matches('.').to_ascii_lowercase()
-    );
+    let mut canonical = format!("https://{}", host.to_ascii_lowercase());
     if let Some(port) = url.port() {
         if port != 443 {
             canonical.push(':');
@@ -99,26 +99,71 @@ pub fn canonicalize_tunnel_url(input: &str) -> Result<String, TunnelUrlError> {
     Ok(canonical)
 }
 
-fn is_unsafe_host(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+fn ensure_origin_form(input: &str) -> Result<(), TunnelUrlError> {
+    let (scheme, rest) = input.split_once("://").ok_or(TunnelUrlError::Invalid(
+        "tunnel_url must be a valid absolute URL",
+    ))?;
 
-    if host.is_empty() || !host.contains('.') {
-        return true;
+    if !scheme.eq_ignore_ascii_case("https") {
+        return Err(TunnelUrlError::Invalid(
+            "tunnel_url must use the https scheme",
+        ));
+    }
+    if rest.is_empty() || rest.contains('/') || rest.contains('?') || rest.contains('#') {
+        return Err(TunnelUrlError::Invalid(
+            "tunnel_url must be exactly https://host[:port]",
+        ));
     }
 
-    if host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-    {
-        return true;
-    }
+    Ok(())
+}
 
-    if host.parse::<IpAddr>().is_ok() {
-        return true;
-    }
+fn is_local_hostname(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost")
+}
 
-    false
+fn host_to_ip(host: &str) -> Option<IpAddr> {
+    host.parse::<IpAddr>().ok().or_else(|| {
+        host.strip_prefix('[')?
+            .strip_suffix(']')?
+            .parse::<IpAddr>()
+            .ok()
+    })
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_public_ipv4(ip),
+        IpAddr::V6(ip) => is_public_ipv6(ip),
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || octets[0] == 0
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        || (octets[0] & 0xf0) == 240)
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_unique_local()
+        || ip.is_unicast_link_local()
+        || ip.is_multicast()
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8))
 }
 
 #[cfg(test)]
@@ -126,14 +171,14 @@ mod tests {
     use super::{canonicalize_tunnel_url, TunnelUrlError};
 
     #[test]
-    fn canonicalizes_host_case_default_port_and_root_slash() {
+    fn canonicalizes_host_case_and_default_port() {
         let cases = [
             (
                 "https://AbC123.TryCloudflare.com:443",
                 "https://abc123.trycloudflare.com",
             ),
-            ("HTTPS://EXAMPLE.com/", "https://example.com"),
-            ("https://Example.com.:8443/", "https://example.com:8443"),
+            ("HTTPS://EXAMPLE.com", "https://example.com"),
+            ("https://Example.com:8443", "https://example.com:8443"),
         ];
 
         for (input, expected) in cases {
@@ -161,20 +206,24 @@ mod tests {
     fn rejects_paths_queries_fragments_and_credentials() {
         let cases = [
             (
+                "https://example.com/",
+                TunnelUrlError::Invalid("tunnel_url must be exactly https://host[:port]"),
+            ),
+            (
                 "https://example.com/webhook",
-                TunnelUrlError::Invalid("tunnel_url must be an origin without a path"),
+                TunnelUrlError::Invalid("tunnel_url must be exactly https://host[:port]"),
             ),
             (
                 "https://example.com//",
-                TunnelUrlError::Invalid("tunnel_url must be an origin without a path"),
+                TunnelUrlError::Invalid("tunnel_url must be exactly https://host[:port]"),
             ),
             (
                 "https://example.com?token=1",
-                TunnelUrlError::Invalid("tunnel_url must not include a query string"),
+                TunnelUrlError::Invalid("tunnel_url must be exactly https://host[:port]"),
             ),
             (
                 "https://example.com/#frag",
-                TunnelUrlError::Invalid("tunnel_url must not include a fragment"),
+                TunnelUrlError::Invalid("tunnel_url must be exactly https://host[:port]"),
             ),
             (
                 "https://user@example.com",
@@ -192,36 +241,51 @@ mod tests {
     }
 
     #[test]
-    fn rejects_localhost_internal_and_single_label_hosts() {
-        for input in [
-            "https://localhost",
-            "https://api.localhost",
-            "https://service.local",
-            "https://service.internal",
-            "https://devbox",
-        ] {
+    fn rejects_localhost_targets() {
+        for input in ["https://localhost", "https://api.localhost"] {
             let error = canonicalize_tunnel_url(input).unwrap_err();
             assert_eq!(
                 error,
-                TunnelUrlError::Unsafe("tunnel_url must use a public DNS hostname")
+                TunnelUrlError::Unsafe("tunnel_url must not target localhost")
             );
         }
     }
 
     #[test]
-    fn rejects_ip_literals() {
+    fn rejects_private_or_local_ip_literals() {
         for input in [
+            "https://0.0.0.0",
             "https://127.0.0.1",
             "https://10.0.0.8",
             "https://192.168.1.10:8443",
+            "https://169.254.10.20",
+            "https://172.16.0.10",
+            "https://100.64.0.1",
             "https://[::1]",
+            "https://[fc00::1]",
+            "https://[fe80::1]",
             "https://[2001:db8::1]",
         ] {
             let error = canonicalize_tunnel_url(input).unwrap_err();
             assert_eq!(
                 error,
-                TunnelUrlError::Unsafe("tunnel_url must use a public DNS hostname")
+                TunnelUrlError::Unsafe("tunnel_url must use a public host or IP")
             );
+        }
+    }
+
+    #[test]
+    fn accepts_public_ip_literals() {
+        let cases = [
+            ("https://1.1.1.1", "https://1.1.1.1"),
+            (
+                "https://[2606:4700:4700::1111]",
+                "https://[2606:4700:4700::1111]",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(canonicalize_tunnel_url(input), Ok(expected.to_string()));
         }
     }
 }
