@@ -132,7 +132,14 @@ impl ProcessManager {
     }
 
     /// Register a spawned process for tracking.
-    pub async fn register(&self, pid: u32, kind: ProcessKind, repo: &str, label: &str, timeout_seconds: u64) {
+    pub async fn register(
+        &self,
+        pid: u32,
+        kind: ProcessKind,
+        repo: &str,
+        label: &str,
+        timeout_seconds: u64,
+    ) {
         let managed = ManagedProcess {
             pid,
             kind,
@@ -150,7 +157,11 @@ impl ProcessManager {
     pub async fn report_exit(&self, pid: u32, exit_code: i32) {
         if let Some(proc) = self.processes.lock().await.get_mut(&pid) {
             proc.exit_code = Some(exit_code);
-            proc.state = if exit_code == 0 { ProcessState::Finished } else { ProcessState::Crashed };
+            proc.state = if exit_code == 0 {
+                ProcessState::Finished
+            } else {
+                ProcessState::Crashed
+            };
         }
     }
 
@@ -169,7 +180,9 @@ impl ProcessManager {
                             proc.state = ProcessState::TimedOut;
                             tracing::warn!(
                                 "Process [{}] pid={} timed out after {}s",
-                                proc.label, proc.pid, elapsed
+                                proc.label,
+                                proc.pid,
+                                elapsed
                             );
                         }
                     }
@@ -277,7 +290,8 @@ mod tests {
         let pm = ProcessManager::new(4);
         assert_eq!(pm.active_count().await, 0);
 
-        pm.register(1001, ProcessKind::Worker, "owner/repo", "test-worker", 3600).await;
+        pm.register(1001, ProcessKind::Worker, "owner/repo", "test-worker", 3600)
+            .await;
         assert_eq!(pm.active_count().await, 1);
 
         let procs = pm.all_processes().await;
@@ -288,7 +302,8 @@ mod tests {
     #[tokio::test]
     async fn report_exit_updates_state_success() {
         let pm = ProcessManager::new(4);
-        pm.register(2001, ProcessKind::Orchestrator, "owner/repo", "orch", 3600).await;
+        pm.register(2001, ProcessKind::Orchestrator, "owner/repo", "orch", 3600)
+            .await;
 
         pm.report_exit(2001, 0).await;
         let procs = pm.all_processes().await;
@@ -300,7 +315,8 @@ mod tests {
     #[tokio::test]
     async fn report_exit_updates_state_crash() {
         let pm = ProcessManager::new(4);
-        pm.register(3001, ProcessKind::Worker, "owner/repo", "worker", 3600).await;
+        pm.register(3001, ProcessKind::Worker, "owner/repo", "worker", 3600)
+            .await;
 
         pm.report_exit(3001, 1).await;
         let procs = pm.all_processes().await;

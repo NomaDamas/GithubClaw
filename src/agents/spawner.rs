@@ -58,10 +58,7 @@ impl AgentSpawner {
         let prompt_text = std::fs::read_to_string(prompt_file).unwrap_or_default();
 
         // Git identity
-        env.insert(
-            "GIT_AUTHOR_NAME".into(),
-            agent_def.git_author_name.clone(),
-        );
+        env.insert("GIT_AUTHOR_NAME".into(), agent_def.git_author_name.clone());
         env.insert(
             "GIT_AUTHOR_EMAIL".into(),
             agent_def.git_author_email.clone(),
@@ -307,7 +304,9 @@ mod tests {
         let def = make_agent_def("codex");
         let prompt = tmp.path().join("prompt.md");
 
-        let cmd = spawner.build_command(&def, &prompt, "implement feature").unwrap();
+        let cmd = spawner
+            .build_command(&def, &prompt, "implement feature")
+            .unwrap();
 
         assert_eq!(cmd[0], "codex");
         assert!(cmd.contains(&"--prompt-file".to_string()));
