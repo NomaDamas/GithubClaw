@@ -220,13 +220,9 @@ impl HostedProxyState {
         update_secret: String,
     ) -> Result<RegisterSuccess, HostedProxyError> {
         let mut store = self.inner.lock().await;
-        if store
-            .installations
-            .iter()
-            .any(|(id, installation)| {
-                *id != installation_id && installation.update_secret == update_secret
-            })
-        {
+        if store.installations.iter().any(|(id, installation)| {
+            *id != installation_id && installation.update_secret == update_secret
+        }) {
             return Err(HostedProxyError::OwnershipMismatch);
         }
 
@@ -419,30 +415,13 @@ pub fn canonicalize_tunnel_url(input: &str) -> Result<String, HostedProxyError> 
         });
     }
 
-    let host = match url.host() {
-        Some(url::Host::Domain(domain)) => domain.trim_end_matches('.').to_ascii_lowercase(),
-        Some(url::Host::Ipv4(ipv4)) => {
-            let message = if is_forbidden_ip(IpAddr::V4(ipv4)) {
-                "tunnel_url must not target loopback or private network addresses"
-            } else {
-                "tunnel_url must use a DNS hostname instead of an IP literal"
-            };
-            return Err(HostedProxyError::UnsafeTunnelUrl { message });
-        }
-        Some(url::Host::Ipv6(ipv6)) => {
-            let message = if is_forbidden_ip(IpAddr::V6(ipv6)) {
-                "tunnel_url must not target loopback or private network addresses"
-            } else {
-                "tunnel_url must use a DNS hostname instead of an IP literal"
-            };
-            return Err(HostedProxyError::UnsafeTunnelUrl { message });
-        }
-        None => {
-            return Err(HostedProxyError::InvalidTunnelUrl {
-                message: "tunnel_url must include a host",
-            });
-        }
-    };
+    let host = url
+        .host_str()
+        .ok_or(HostedProxyError::InvalidTunnelUrl {
+            message: "tunnel_url must include a host",
+        })?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
 
     if host.is_empty() {
         return Err(HostedProxyError::InvalidTunnelUrl {
@@ -458,6 +437,16 @@ pub fn canonicalize_tunnel_url(input: &str) -> Result<String, HostedProxyError> 
         return Err(HostedProxyError::UnsafeTunnelUrl {
             message: "tunnel_url must not target localhost or an internal host",
         });
+    }
+
+    let ip_candidate = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = ip_candidate.parse::<IpAddr>() {
+        let message = if is_forbidden_ip(ip) {
+            "tunnel_url must not target loopback or private network addresses"
+        } else {
+            "tunnel_url must use a DNS hostname instead of an IP literal"
+        };
+        return Err(HostedProxyError::UnsafeTunnelUrl { message });
     }
 
     let mut canonical = format!("https://{host}");
