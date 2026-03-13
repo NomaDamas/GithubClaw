@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use crate::agents::parser::load_agent_definition;
 use crate::agents::prompt_assembler::PromptAssembler;
 use crate::agents::spawner::AgentSpawner;
+use crate::hosted_proxy::{HostedProxyStore, RegisterRequest, RegisterSuccess};
 use crate::orchestrator::schema::Action;
 use crate::orchestrator::session::OrchestratorSession;
 use crate::process_manager::{check_fork_pr_gate, ProcessManager};
@@ -36,6 +37,7 @@ use crate::signature::verify_webhook_signature;
 /// All shared state for the running webhook server.
 pub struct ServerState {
     pub webhook_secret: String,
+    pub hosted_proxy_store: Mutex<HostedProxyStore>,
     pub registry: RwLock<HashMap<String, RegistryEntry>>,
     pub started_repos: RwLock<HashSet<String>>,
     pub queues: Mutex<HashMap<String, DiskPersistedQueue>>,
@@ -400,6 +402,60 @@ async fn health_handler(State(state): State<Arc<ServerState>>) -> Json<Value> {
     }))
 }
 
+async fn register_handler(
+    State(state): State<Arc<ServerState>>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<Value>) {
+    let request = match serde_json::from_slice::<RegisterRequest>(&body) {
+        Ok(request) => request,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("Invalid JSON payload: {e}"),
+            );
+        }
+    };
+
+    let mut store = state.hosted_proxy_store.lock().await;
+    match store.register_with_now(request, chrono::Utc::now()) {
+        Ok(success) => success_response(success),
+        Err(err) => error_response(
+            StatusCode::from_u16(err.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            err.code,
+            err.message,
+        ),
+    }
+}
+
+fn success_response(success: RegisterSuccess) -> (StatusCode, Json<Value>) {
+    let status = if success.status == "claimed" {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        Json(serde_json::to_value(success).expect("register success is serializable")),
+    )
+}
+
+fn error_response(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+) -> (StatusCode, Json<Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message.into(),
+            }
+        })),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
@@ -547,6 +603,7 @@ pub async fn bootstrap_repo(
 pub fn create_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/webhook", post(webhook_handler))
+        .route("/register", post(register_handler))
         .route("/health", get(health_handler))
         .with_state(state)
 }
@@ -1128,6 +1185,13 @@ mod tests {
         let scheduler_path = tmp.path().join(".githubclaw").join("scheduled.json");
         Arc::new(ServerState {
             webhook_secret: TEST_SECRET.to_string(),
+            hosted_proxy_store: Mutex::new(
+                HostedProxyStore::load(
+                    tmp.path().join("hosted_proxy_registrations.json"),
+                    TEST_SECRET,
+                )
+                .unwrap(),
+            ),
             registry: RwLock::new(registry),
             started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
@@ -1304,6 +1368,132 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let text = body_string(response).await;
         assert!(text.contains("Ignored"));
+    }
+
+    #[tokio::test]
+    async fn test_register_claim_and_update_flow() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        let claim_proof = {
+            let store = state.hosted_proxy_store.lock().await;
+            store.mint_claim_proof_for_test(123, chrono::Utc::now())
+        };
+        let app = create_router(state.clone());
+
+        let claim_payload = serde_json::to_vec(&serde_json::json!({
+            "installation_id": 123,
+            "tunnel_url": "https://EXAMPLE.com",
+            "claim_proof": claim_proof,
+        }))
+        .unwrap();
+
+        let claim_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(claim_payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(claim_response.status(), StatusCode::CREATED);
+        let claim_body: Value = serde_json::from_str(&body_string(claim_response).await).unwrap();
+        assert_eq!(claim_body["status"], "claimed");
+        assert_eq!(claim_body["tunnel_url"], "https://example.com");
+        let update_secret = claim_body["update_secret"].as_str().unwrap().to_string();
+
+        let update_payload = serde_json::to_vec(&serde_json::json!({
+            "installation_id": 123,
+            "tunnel_url": "https://www.example.com",
+            "update_secret": update_secret,
+        }))
+        .unwrap();
+
+        let update_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(update_payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let update_body: Value = serde_json::from_str(&body_string(update_response).await).unwrap();
+        assert_eq!(update_body["status"], "updated");
+        assert_eq!(update_body["tunnel_url"], "https://www.example.com");
+        assert_eq!(update_body["rotated"], true);
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_invalid_shapes_and_unsafe_urls() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_test_state(&tmp);
+        let claim_proof = {
+            let store = state.hosted_proxy_store.lock().await;
+            store.mint_claim_proof_for_test(222, chrono::Utc::now())
+        };
+        let unsafe_claim_proof = {
+            let store = state.hosted_proxy_store.lock().await;
+            store.mint_claim_proof_for_test(222, chrono::Utc::now())
+        };
+        let app = create_router(state);
+
+        let invalid_shape = serde_json::to_vec(&serde_json::json!({
+            "installation_id": 222,
+            "tunnel_url": "https://good.example.com",
+            "claim_proof": claim_proof,
+            "update_secret": "us_fake",
+        }))
+        .unwrap();
+
+        let invalid_shape_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(invalid_shape))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(invalid_shape_response.status(), StatusCode::BAD_REQUEST);
+        let invalid_shape_body: Value =
+            serde_json::from_str(&body_string(invalid_shape_response).await).unwrap();
+        assert_eq!(invalid_shape_body["error"]["code"], "invalid_request");
+
+        let unsafe_url = serde_json::to_vec(&serde_json::json!({
+            "installation_id": 222,
+            "tunnel_url": "https://127.0.0.1",
+            "claim_proof": unsafe_claim_proof,
+        }))
+        .unwrap();
+
+        let unsafe_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(unsafe_url))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(unsafe_response.status(), StatusCode::BAD_REQUEST);
+        let unsafe_body: Value = serde_json::from_str(&body_string(unsafe_response).await).unwrap();
+        assert_eq!(unsafe_body["error"]["code"], "unsafe_tunnel_url");
     }
 
     // ---------------------------------------------------------------
