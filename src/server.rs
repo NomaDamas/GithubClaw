@@ -1382,7 +1382,7 @@ mod tests {
 
         let claim_payload = serde_json::to_vec(&serde_json::json!({
             "installation_id": 123,
-            "tunnel_url": "https://Tunnel.Example.com",
+            "tunnel_url": "https://EXAMPLE.com",
             "claim_proof": claim_proof,
         }))
         .unwrap();
@@ -1403,12 +1403,12 @@ mod tests {
         assert_eq!(claim_response.status(), StatusCode::CREATED);
         let claim_body: Value = serde_json::from_str(&body_string(claim_response).await).unwrap();
         assert_eq!(claim_body["status"], "claimed");
-        assert_eq!(claim_body["tunnel_url"], "https://tunnel.example.com");
+        assert_eq!(claim_body["tunnel_url"], "https://example.com");
         let update_secret = claim_body["update_secret"].as_str().unwrap().to_string();
 
         let update_payload = serde_json::to_vec(&serde_json::json!({
             "installation_id": 123,
-            "tunnel_url": "https://next.example.com",
+            "tunnel_url": "https://www.example.com",
             "update_secret": update_secret,
         }))
         .unwrap();
@@ -1428,7 +1428,7 @@ mod tests {
         assert_eq!(update_response.status(), StatusCode::OK);
         let update_body: Value = serde_json::from_str(&body_string(update_response).await).unwrap();
         assert_eq!(update_body["status"], "updated");
-        assert_eq!(update_body["tunnel_url"], "https://next.example.com");
+        assert_eq!(update_body["tunnel_url"], "https://www.example.com");
         assert_eq!(update_body["rotated"], true);
     }
 

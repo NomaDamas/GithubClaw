@@ -448,14 +448,13 @@ where
         ));
     }
 
-    if let Ok(resolved_ips) = resolver(host) {
-        if resolved_ips.into_iter().any(is_unsafe_ip) {
-            return Err(RegisterError::new(
-                "unsafe_tunnel_url",
-                "Tunnel URL host points to a loopback or private-network destination",
-                400,
-            ));
-        }
+    let resolved_ips = resolver(host)?;
+    if resolved_ips.into_iter().any(is_unsafe_ip) {
+        return Err(RegisterError::new(
+            "unsafe_tunnel_url",
+            "Tunnel URL host points to a loopback or private-network destination",
+            400,
+        ));
     }
 
     let normalized_host = host.to_ascii_lowercase();
@@ -698,6 +697,21 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_tunnel_url_rejects_unresolvable_hostname() {
+        let resolved = normalize_tunnel_url_with_resolver("https://public.example.com", |_| {
+            Err(RegisterError::new(
+                "invalid_tunnel_url",
+                "Tunnel URL host could not be resolved",
+                400,
+            ))
+        });
+
+        let error = resolved.unwrap_err();
+        assert_eq!(error.code, "invalid_tunnel_url");
+        assert_eq!(error.status_code, 400);
+    }
+
+    #[test]
     fn test_claim_then_update_rotates_secret_and_normalizes_url() {
         let tmp = TempDir::new().unwrap();
         let store_path = tmp.path().join("hosted_proxy_registrations.json");
@@ -707,33 +721,29 @@ mod tests {
 
         let claimed = store
             .register_with_now(
-                request_with_claim(42, "https://Tunnel.EXAMPLE.com", claim_proof),
+                request_with_claim(42, "https://EXAMPLE.com", claim_proof),
                 now,
             )
             .unwrap();
 
         assert_eq!(claimed.status, "claimed");
-        assert_eq!(claimed.tunnel_url, "https://tunnel.example.com");
+        assert_eq!(claimed.tunnel_url, "https://example.com");
         assert!(!claimed.rotated);
 
         let updated = store
             .register_with_now(
-                request_with_secret(
-                    42,
-                    "https://next.example.com",
-                    claimed.update_secret.clone(),
-                ),
+                request_with_secret(42, "https://www.example.com", claimed.update_secret.clone()),
                 now + Duration::minutes(1),
             )
             .unwrap();
 
         assert_eq!(updated.status, "updated");
-        assert_eq!(updated.tunnel_url, "https://next.example.com");
+        assert_eq!(updated.tunnel_url, "https://www.example.com");
         assert!(updated.rotated);
         assert_ne!(updated.update_secret, claimed.update_secret);
 
         let stale = store.register_with_now(
-            request_with_secret(42, "https://another.example.com", claimed.update_secret),
+            request_with_secret(42, "https://example.com", claimed.update_secret),
             now + Duration::minutes(2),
         );
         assert_eq!(stale.unwrap_err().code, "invalid_update_secret");
@@ -749,20 +759,20 @@ mod tests {
 
         store
             .register_with_now(
-                request_with_claim(77, "https://first.example.com", claim_proof.clone()),
+                request_with_claim(77, "https://example.com", claim_proof.clone()),
                 now,
             )
             .unwrap();
 
         let replay = store.register_with_now(
-            request_with_claim(77, "https://second.example.com", claim_proof),
+            request_with_claim(77, "https://www.example.com", claim_proof),
             now + Duration::seconds(10),
         );
         assert_eq!(replay.unwrap_err().code, "claim_proof_already_used");
 
         let fresh_proof = store.mint_claim_proof_for_test(77, now + Duration::seconds(20));
         let already_claimed = store.register_with_now(
-            request_with_claim(77, "https://second.example.com", fresh_proof),
+            request_with_claim(77, "https://www.example.com", fresh_proof),
             now + Duration::seconds(20),
         );
         assert_eq!(already_claimed.unwrap_err().code, "already_claimed");
@@ -777,16 +787,14 @@ mod tests {
         let expired_proof = store.mint_claim_proof_for_test(55, now - Duration::minutes(11));
 
         let expired = store.register_with_now(
-            request_with_claim(55, "https://valid.example.com", expired_proof),
+            request_with_claim(55, "https://example.com", expired_proof),
             now,
         );
         assert_eq!(expired.unwrap_err().code, "expired_claim_proof");
 
         let proof = store.mint_claim_proof_for_test(55, now);
-        let mismatched = store.register_with_now(
-            request_with_claim(56, "https://valid.example.com", proof),
-            now,
-        );
+        let mismatched =
+            store.register_with_now(request_with_claim(56, "https://example.com", proof), now);
         assert_eq!(mismatched.unwrap_err().code, "ownership_mismatch");
     }
 
@@ -801,7 +809,7 @@ mod tests {
             .register_with_now(
                 request_with_claim(
                     1,
-                    "https://one.example.com",
+                    "https://example.com",
                     store.mint_claim_proof_for_test(1, now),
                 ),
                 now,
@@ -812,7 +820,7 @@ mod tests {
             .register_with_now(
                 request_with_claim(
                     2,
-                    "https://two.example.com",
+                    "https://www.example.com",
                     store.mint_claim_proof_for_test(2, now),
                 ),
                 now,
@@ -820,7 +828,7 @@ mod tests {
             .unwrap();
 
         let mismatch = store.register_with_now(
-            request_with_secret(2, "https://swap.example.com", first.update_secret),
+            request_with_secret(2, "https://example.com", first.update_secret),
             now + Duration::seconds(5),
         );
         assert_eq!(mismatch.unwrap_err().code, "ownership_mismatch");
@@ -840,7 +848,7 @@ mod tests {
             let claim_proof = store.mint_claim_proof_for_test(404, now);
             let claimed = store
                 .register_with_now(
-                    request_with_claim(404, "https://persist.example.com", claim_proof),
+                    request_with_claim(404, "https://example.com", claim_proof),
                     now,
                 )
                 .unwrap();
@@ -850,14 +858,14 @@ mod tests {
         let mut reloaded = HostedProxyStore::load(&store_path, "test-secret").unwrap();
         let updated = reloaded
             .register_with_now(
-                request_with_secret(404, "https://persist-2.example.com", claimed_secret),
+                request_with_secret(404, "https://www.example.com", claimed_secret),
                 now + Duration::minutes(1),
             )
             .unwrap();
 
         assert_eq!(updated.status, "updated");
         let (tunnel_url, _, updated_at) = reloaded.registration(404).unwrap();
-        assert_eq!(tunnel_url, "https://persist-2.example.com");
+        assert_eq!(tunnel_url, "https://www.example.com");
         assert_eq!(updated_at, now + Duration::minutes(1));
     }
 
@@ -875,7 +883,7 @@ mod tests {
             let mut store = HostedProxyStore::load(&store_path, "test-secret").unwrap();
             store
                 .register_with_now(
-                    request_with_claim(505, "https://persist.example.com", claim_proof.clone()),
+                    request_with_claim(505, "https://example.com", claim_proof.clone()),
                     now,
                 )
                 .unwrap();
@@ -883,7 +891,7 @@ mod tests {
 
         let mut reloaded = HostedProxyStore::load(&store_path, "test-secret").unwrap();
         let replay = reloaded.register_with_now(
-            request_with_claim(505, "https://persist-2.example.com", claim_proof),
+            request_with_claim(505, "https://www.example.com", claim_proof),
             now + Duration::seconds(10),
         );
         assert_eq!(replay.unwrap_err().code, "claim_proof_already_used");
@@ -901,7 +909,7 @@ mod tests {
                 .register_with_now(
                     request_with_claim(
                         606,
-                        "https://persist.example.com",
+                        "https://example.com",
                         store.mint_claim_proof_for_test(606, now),
                     ),
                     now,
@@ -912,7 +920,7 @@ mod tests {
                 .register_with_now(
                     request_with_secret(
                         606,
-                        "https://persist-2.example.com",
+                        "https://www.example.com",
                         claimed.update_secret.clone(),
                     ),
                     now + Duration::minutes(1),
@@ -924,7 +932,7 @@ mod tests {
 
         let mut reloaded = HostedProxyStore::load(&store_path, "test-secret").unwrap();
         let replay = reloaded.register_with_now(
-            request_with_secret(606, "https://persist-3.example.com", stale_secret),
+            request_with_secret(606, "https://example.com", stale_secret),
             now + Duration::minutes(2),
         );
         assert_eq!(replay.unwrap_err().code, "invalid_update_secret");
