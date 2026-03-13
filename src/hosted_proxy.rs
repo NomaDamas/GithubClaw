@@ -392,6 +392,13 @@ impl HostedProxyStore {
 }
 
 pub fn normalize_tunnel_url(raw: &str) -> Result<String, RegisterError> {
+    normalize_tunnel_url_with_resolver(raw, resolve_host_ips)
+}
+
+fn normalize_tunnel_url_with_resolver<F>(raw: &str, resolver: F) -> Result<String, RegisterError>
+where
+    F: Fn(&str) -> Result<Vec<IpAddr>, RegisterError>,
+{
     let url = Url::parse(raw).map_err(|_| {
         RegisterError::new(
             "invalid_tunnel_url",
@@ -439,6 +446,16 @@ pub fn normalize_tunnel_url(raw: &str) -> Result<String, RegisterError> {
             "Tunnel URL host points to a loopback or private-network destination",
             400,
         ));
+    }
+
+    if let Ok(resolved_ips) = resolver(host) {
+        if resolved_ips.into_iter().any(is_unsafe_ip) {
+            return Err(RegisterError::new(
+                "unsafe_tunnel_url",
+                "Tunnel URL host points to a loopback or private-network destination",
+                400,
+            ));
+        }
     }
 
     let normalized_host = host.to_ascii_lowercase();
@@ -564,6 +581,18 @@ fn sha256_hex(value: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn resolve_host_ips(host: &str) -> Result<Vec<IpAddr>, RegisterError> {
+    let socket_addrs = std::net::ToSocketAddrs::to_socket_addrs(&(host, 443)).map_err(|_| {
+        RegisterError::new(
+            "invalid_tunnel_url",
+            "Tunnel URL host could not be resolved",
+            400,
+        )
+    })?;
+
+    Ok(socket_addrs.map(|addr| addr.ip()).collect())
+}
+
 fn is_unsafe_host(host: &str) -> bool {
     let lower = host.to_ascii_lowercase();
     if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
@@ -578,6 +607,13 @@ fn is_unsafe_host(host: &str) -> bool {
     }
 
     false
+}
+
+fn is_unsafe_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_unsafe_ipv4(v4),
+        IpAddr::V6(v6) => is_unsafe_ipv6(v6),
+    }
 }
 
 fn is_unsafe_ipv4(ip: Ipv4Addr) -> bool {
@@ -644,6 +680,21 @@ mod tests {
 
         let with_path = normalize_tunnel_url("https://example.com/hook");
         assert_eq!(with_path.unwrap_err().code, "invalid_tunnel_url");
+    }
+
+    #[test]
+    fn test_normalize_tunnel_url_rejects_hostname_resolving_to_unsafe_ip() {
+        for resolved_ip in [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 9)),
+        ] {
+            let resolved = normalize_tunnel_url_with_resolver("https://public.example.com", |_| {
+                Ok(vec![resolved_ip])
+            });
+
+            assert_eq!(resolved.unwrap_err().code, "unsafe_tunnel_url");
+        }
     }
 
     #[test]
@@ -808,5 +859,74 @@ mod tests {
         let (tunnel_url, _, updated_at) = reloaded.registration(404).unwrap();
         assert_eq!(tunnel_url, "https://persist-2.example.com");
         assert_eq!(updated_at, now + Duration::minutes(1));
+    }
+
+    #[test]
+    fn test_reused_claim_proof_is_still_rejected_after_reload() {
+        let tmp = TempDir::new().unwrap();
+        let store_path = tmp.path().join("hosted_proxy_registrations.json");
+        let now = DateTime::<Utc>::from_timestamp(1_700_001_100, 0).unwrap();
+        let claim_proof = {
+            let store = HostedProxyStore::load(&store_path, "test-secret").unwrap();
+            store.mint_claim_proof_for_test(505, now)
+        };
+
+        {
+            let mut store = HostedProxyStore::load(&store_path, "test-secret").unwrap();
+            store
+                .register_with_now(
+                    request_with_claim(505, "https://persist.example.com", claim_proof.clone()),
+                    now,
+                )
+                .unwrap();
+        }
+
+        let mut reloaded = HostedProxyStore::load(&store_path, "test-secret").unwrap();
+        let replay = reloaded.register_with_now(
+            request_with_claim(505, "https://persist-2.example.com", claim_proof),
+            now + Duration::seconds(10),
+        );
+        assert_eq!(replay.unwrap_err().code, "claim_proof_already_used");
+    }
+
+    #[test]
+    fn test_stale_update_secret_is_still_rejected_after_reload() {
+        let tmp = TempDir::new().unwrap();
+        let store_path = tmp.path().join("hosted_proxy_registrations.json");
+        let now = DateTime::<Utc>::from_timestamp(1_700_001_200, 0).unwrap();
+
+        let stale_secret = {
+            let mut store = HostedProxyStore::load(&store_path, "test-secret").unwrap();
+            let claimed = store
+                .register_with_now(
+                    request_with_claim(
+                        606,
+                        "https://persist.example.com",
+                        store.mint_claim_proof_for_test(606, now),
+                    ),
+                    now,
+                )
+                .unwrap();
+
+            store
+                .register_with_now(
+                    request_with_secret(
+                        606,
+                        "https://persist-2.example.com",
+                        claimed.update_secret.clone(),
+                    ),
+                    now + Duration::minutes(1),
+                )
+                .unwrap();
+
+            claimed.update_secret
+        };
+
+        let mut reloaded = HostedProxyStore::load(&store_path, "test-secret").unwrap();
+        let replay = reloaded.register_with_now(
+            request_with_secret(606, "https://persist-3.example.com", stale_secret),
+            now + Duration::minutes(2),
+        );
+        assert_eq!(replay.unwrap_err().code, "invalid_update_secret");
     }
 }
