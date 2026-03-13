@@ -333,13 +333,13 @@ impl HostedProxyStore {
             })?;
 
         let mut next_state = self.state.clone();
-        let existing = next_state
-            .registrations
-            .get_mut(&installation_id)
-            .expect("registration exists");
-        existing.tunnel_url = normalized_tunnel_url.clone();
-        existing.update_secret_verifier = replacement_verifier;
-        existing.updated_at = now;
+        apply_registration_update(
+            &mut next_state,
+            installation_id,
+            normalized_tunnel_url.clone(),
+            replacement_verifier,
+            now,
+        )?;
         self.persist(next_state)?;
 
         Ok(RegisterSuccess {
@@ -485,6 +485,25 @@ fn validate_auth_shape(request: &RegisterRequest) -> Result<(), RegisterError> {
     }
 }
 
+fn apply_registration_update(
+    state: &mut PersistedState,
+    installation_id: u64,
+    normalized_tunnel_url: String,
+    replacement_verifier: String,
+    now: DateTime<Utc>,
+) -> Result<(), RegisterError> {
+    let existing = state
+        .registrations
+        .get_mut(&installation_id)
+        .ok_or_else(|| {
+            RegisterError::new("internal_error", "Registration state inconsistency", 500)
+        })?;
+    existing.tunnel_url = normalized_tunnel_url;
+    existing.update_secret_verifier = replacement_verifier;
+    existing.updated_at = now;
+    Ok(())
+}
+
 fn mint_claim_proof(secret: &str, installation_id: u64, issued_at: DateTime<Utc>) -> String {
     let nonce = uuid::Uuid::new_v4().simple().to_string();
     let issued_at_ts = issued_at.timestamp();
@@ -521,24 +540,29 @@ fn parse_and_verify_claim_proof(
         )
     })?;
     let nonce = parts[3];
-    let signature = parts[4];
-
-    let payload = format!("{installation_id}.{issued_at_ts}.{nonce}");
-    let expected = sign_with_secret(secret, &payload).map_err(|_| {
+    let signature = hex::decode(parts[4]).map_err(|_| {
         RegisterError::new(
             "invalid_claim_proof",
             "Claim proof could not be verified",
             403,
         )
     })?;
-
-    if expected != signature {
-        return Err(RegisterError::new(
+    let payload = format!("{installation_id}.{issued_at_ts}.{nonce}");
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| {
+        RegisterError::new(
             "invalid_claim_proof",
             "Claim proof could not be verified",
             403,
-        ));
-    }
+        )
+    })?;
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&signature).map_err(|_| {
+        RegisterError::new(
+            "invalid_claim_proof",
+            "Claim proof could not be verified",
+            403,
+        )
+    })?;
 
     let issued_at = DateTime::<Utc>::from_timestamp(issued_at_ts, 0).ok_or_else(|| {
         RegisterError::new(
@@ -799,6 +823,22 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_tampered_claim_proof_signature() {
+        let tmp = TempDir::new().unwrap();
+        let store_path = tmp.path().join("hosted_proxy_registrations.json");
+        let store = HostedProxyStore::load(&store_path, "test-secret").unwrap();
+        let now = DateTime::<Utc>::from_timestamp(1_700_000_600, 0).unwrap();
+        let claim_proof = store.mint_claim_proof_for_test(55, now);
+        let mut parts: Vec<String> = claim_proof.split('.').map(ToString::to_string).collect();
+        parts[4].replace_range(..2, "00");
+        let tampered = parts.join(".");
+
+        let error = parse_and_verify_claim_proof("test-secret", &tampered).unwrap_err();
+        assert_eq!(error.code, "invalid_claim_proof");
+        assert_eq!(error.status_code, 403);
+    }
+
+    #[test]
     fn test_wrong_update_secret_for_other_installation_is_ownership_mismatch() {
         let tmp = TempDir::new().unwrap();
         let store_path = tmp.path().join("hosted_proxy_registrations.json");
@@ -936,5 +976,22 @@ mod tests {
             now + Duration::minutes(2),
         );
         assert_eq!(replay.unwrap_err().code, "invalid_update_secret");
+    }
+
+    #[test]
+    fn test_missing_registration_update_returns_internal_error() {
+        let now = DateTime::<Utc>::from_timestamp(1_700_001_300, 0).unwrap();
+        let error = apply_registration_update(
+            &mut PersistedState::default(),
+            707,
+            "https://example.com".to_string(),
+            "replacement-verifier".to_string(),
+            now,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "internal_error");
+        assert_eq!(error.message, "Registration state inconsistency");
+        assert_eq!(error.status_code, 500);
     }
 }
