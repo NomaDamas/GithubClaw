@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use githubclaw::agents::parser::parse_agent_file;
 use githubclaw::agents::prompt_assembler::PromptAssembler;
 use githubclaw::config::GlobalConfig;
+use githubclaw::hosted_proxy::HostedProxyStore;
 use githubclaw::orchestrator::schema::Action;
 use githubclaw::process_manager::{check_fork_pr_gate, ProcessManager};
 use githubclaw::queue::DiskPersistedQueue;
@@ -44,6 +45,10 @@ async fn test_webhook_to_queue_roundtrip() {
 
     let state = Arc::new(ServerState {
         webhook_secret: secret.to_string(),
+        hosted_proxy_store: Mutex::new(
+            HostedProxyStore::load(tmp.path().join("hosted_proxy_registrations.json"), secret)
+                .unwrap(),
+        ),
         registry: tokio::sync::RwLock::new(registry),
         started_repos: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         queues: Mutex::new(HashMap::new()),

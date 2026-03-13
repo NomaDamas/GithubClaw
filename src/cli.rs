@@ -323,6 +323,16 @@ fn cmd_bootstrap() {
         let scheduler_path = global_dir.join("scheduled_events.json");
         let state = Arc::new(ServerState {
             webhook_secret: String::new(),
+            hosted_proxy_store: Mutex::new(
+                crate::hosted_proxy::HostedProxyStore::load(
+                    global_dir.join("hosted_proxy_registrations.json"),
+                    "bootstrap-only-secret",
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to initialize hosted proxy store: {e}");
+                    std::process::exit(1);
+                }),
+            ),
             registry: RwLock::new(registry),
             started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
@@ -860,7 +870,17 @@ fn cmd_serve(host: &str, port: u16) {
 
         // Create server state
         let state = Arc::new(ServerState {
-            webhook_secret,
+            webhook_secret: webhook_secret.clone(),
+            hosted_proxy_store: Mutex::new(
+                crate::hosted_proxy::HostedProxyStore::load(
+                    global_dir.join("hosted_proxy_registrations.json"),
+                    webhook_secret,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to initialize hosted proxy store: {e}");
+                    std::process::exit(1);
+                }),
+            ),
             registry: RwLock::new(registry.clone()),
             started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
