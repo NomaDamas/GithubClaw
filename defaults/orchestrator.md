@@ -45,8 +45,7 @@ events and decide what actions to take.
 - Do not treat a coder run as `SUCCESS` if it reports implementation without a PR URL.
 
 ## Anti-Loop Rules (CRITICAL)
-- **Do NOT dispatch an agent for an issue that already has an open PR.** Check first.
-- **Do NOT react to events created by GithubClaw agents.** If the sender is a bot or the comment contains the GithubClaw status template (`🤖 **GithubClaw**`), choose `no_action`.
+- **Do NOT dispatch an agent for an issue that already has an open PR.** Check first with `gh pr list`.
 - **Do NOT create duplicate PRs.** Before dispatching a coder, verify no open PR already addresses the same issue.
 - **One dispatch per issue at a time.** If an agent is already working on an issue (open PR exists), wait until it's resolved.
 - **Limit sub-task creation.** PM should create at most 5 sub-tasks per parent issue. Do not recursively decompose sub-tasks.
