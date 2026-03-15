@@ -45,8 +45,9 @@ impl AgentSpawner {
 
     /// Build the full set of environment variables for an agent subprocess.
     ///
-    /// Sets git identity, tool permissions, prompt/task info, and GithubClaw
-    /// metadata. Optionally merges caller-supplied `extra_env`.
+    /// Sets git identity, tool permissions, prompt/task info, GithubClaw
+    /// metadata, root issue tracking, and gh wrapper PATH injection.
+    /// Optionally merges caller-supplied `extra_env`.
     pub fn build_env(
         &self,
         agent_def: &AgentDefinition,
@@ -100,6 +101,27 @@ impl AgentSpawner {
             self.repo_root.to_string_lossy().into_owned(),
         );
 
+        // V2: Root issue tracking for ref #N injection
+        // GITHUBCLAW_ROOT_ISSUE is injected by the caller via extra_env
+
+        // V2: gh wrapper PATH injection
+        // Prepend the scripts/ directory (containing gh-wrapper.sh renamed to gh)
+        // to PATH so all gh CLI calls go through our wrapper.
+        if let Some(wrapper_dir) = self.gh_wrapper_dir() {
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            env.insert(
+                "PATH".into(),
+                format!("{}:{}", wrapper_dir.display(), current_path),
+            );
+            // Tell the wrapper where the real gh binary is
+            if let Ok(real_gh) = which::which("gh") {
+                env.insert(
+                    "GITHUBCLAW_REAL_GH".into(),
+                    real_gh.to_string_lossy().into_owned(),
+                );
+            }
+        }
+
         // Merge extra env (caller overrides take precedence)
         if let Some(extra) = extra_env {
             for (k, v) in extra {
@@ -108,6 +130,28 @@ impl AgentSpawner {
         }
 
         env
+    }
+
+    /// Locate the gh wrapper script directory.
+    ///
+    /// Looks for `scripts/gh-wrapper.sh` relative to the binary location,
+    /// or falls back to the repo root's `scripts/` directory.
+    fn gh_wrapper_dir(&self) -> Option<PathBuf> {
+        // Check repo-local scripts dir first
+        let repo_scripts = self.repo_root.join("scripts");
+        if repo_scripts.join("gh-wrapper.sh").exists() {
+            return Some(repo_scripts);
+        }
+        // Check relative to the running binary
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                let bin_scripts = parent.join("scripts");
+                if bin_scripts.join("gh-wrapper.sh").exists() {
+                    return Some(bin_scripts);
+                }
+            }
+        }
+        None
     }
 
     /// Build the command-line arguments for launching the agent.

@@ -54,6 +54,18 @@ const DEFAULT_AGENT_VISIONARY: &str = include_str!("../defaults/agents/visionary
 const DEFAULT_AGENT_SECURITY_REVIEWER: &str =
     include_str!("../defaults/agents/security_reviewer.md");
 
+// V2 agent definitions
+const DEFAULT_V2_AGENT_ORCHESTRATOR: &str =
+    include_str!("../defaults/agents_v2/orchestrator.md");
+const DEFAULT_V2_AGENT_IMPLEMENTER: &str =
+    include_str!("../defaults/agents_v2/implementer.md");
+const DEFAULT_V2_AGENT_VERIFIER: &str = include_str!("../defaults/agents_v2/verifier.md");
+const DEFAULT_V2_AGENT_REVIEWER: &str = include_str!("../defaults/agents_v2/reviewer.md");
+const DEFAULT_V2_AGENT_VISION_GAP_ANALYST: &str =
+    include_str!("../defaults/agents_v2/vision_gap_analyst.md");
+const DEFAULT_V2_AGENT_BUG_REPRODUCER: &str =
+    include_str!("../defaults/agents_v2/bug_reproducer.md");
+
 // ---------------------------------------------------------------------------
 // Launchd / systemd constants
 // ---------------------------------------------------------------------------
@@ -107,6 +119,28 @@ enum Commands {
         #[arg(long, default_value_t = 8000)]
         port: u16,
     },
+    /// Dispatch a worker agent for a specific issue (called by Orchestrator)
+    Dispatch {
+        /// Agent type: implementer, verifier, reviewer, vision-gap-analyst, bug-reproducer
+        agent_type: String,
+        /// GitHub issue number
+        #[arg(long)]
+        issue: u64,
+        /// Prompt/instructions for the agent
+        #[arg(long)]
+        prompt: String,
+        /// Repository (owner/name). Defaults to current repo.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Start a release pipeline: dev -> release branch + PR
+    Release {
+        /// Repository (owner/name). Defaults to current repo.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Launch the TUI dashboard
+    Tui,
 }
 
 pub fn run() {
@@ -119,6 +153,14 @@ pub fn run() {
         Commands::Status => cmd_status(),
         Commands::Logs { follow } => cmd_logs(follow),
         Commands::Serve { host, port } => cmd_serve(&host, port),
+        Commands::Dispatch {
+            agent_type,
+            issue,
+            prompt,
+            repo,
+        } => cmd_dispatch(&agent_type, issue, &prompt, repo.as_deref()),
+        Commands::Release { repo } => cmd_release(repo.as_deref()),
+        Commands::Tui => cmd_tui(),
     }
 }
 
@@ -1308,6 +1350,296 @@ fn health_check(port: u16, log_path: &Path) {
         "  Warning: Server may not have started correctly. Check logs: {}",
         log_path.display()
     );
+}
+
+// ===========================================================================
+// V2: Helpers
+// ===========================================================================
+
+/// Detect the GitHub owner/repo from the current git remote.
+fn detect_github_remote(repo_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    parse_github_remote(&url)
+}
+
+// ===========================================================================
+// cmd_dispatch — V2: Dispatch a worker agent for a specific issue
+// ===========================================================================
+
+fn cmd_dispatch(agent_type: &str, issue: u64, prompt: &str, repo: Option<&str>) {
+    use crate::constants::V2_AGENT_TYPES;
+
+    // Validate agent type
+    if !V2_AGENT_TYPES.contains(&agent_type) {
+        eprintln!(
+            "Error: unknown agent type '{}'. Valid types: {}",
+            agent_type,
+            V2_AGENT_TYPES.join(", ")
+        );
+        std::process::exit(1);
+    }
+
+    // Resolve repo
+    let repo_name = match repo {
+        Some(r) => r.to_string(),
+        None => {
+            let repo_root = find_repo_root(None).unwrap_or_else(|| {
+                eprintln!("Error: not inside a git repository. Use --repo flag.");
+                std::process::exit(1);
+            });
+            detect_github_remote(&repo_root).unwrap_or_else(|| {
+                eprintln!("Error: cannot detect GitHub remote. Use --repo flag.");
+                std::process::exit(1);
+            })
+        }
+    };
+
+    let repo_root = find_repo_root(None).unwrap_or_else(|| {
+        eprintln!("Error: not inside a git repository.");
+        std::process::exit(1);
+    });
+
+    println!(
+        "Dispatching {} agent for {}#{} ...",
+        agent_type, repo_name, issue
+    );
+
+    // Build environment with root issue tracking
+    let mut extra_env = HashMap::new();
+    extra_env.insert("GITHUBCLAW_ROOT_ISSUE".into(), issue.to_string());
+    extra_env.insert("GITHUBCLAW_REPO".into(), repo_name.clone());
+
+    // Load agent definition: write to temp file, then parse
+    let agent_def_content = load_v2_agent_definition(agent_type, &repo_root);
+    let tmp_dir = std::env::temp_dir().join("githubclaw-dispatch");
+    fs::create_dir_all(&tmp_dir).unwrap_or_default();
+    let agent_file = tmp_dir.join(format!("{}.md", agent_type));
+    fs::write(&agent_file, &agent_def_content).unwrap_or_else(|e| {
+        eprintln!("Error writing temp agent file: {}", e);
+        std::process::exit(1);
+    });
+    let agent_def = match crate::agents::parser::parse_agent_file(&agent_file) {
+        Ok(def) => def,
+        Err(e) => {
+            eprintln!("Error parsing agent definition for '{}': {}", agent_type, e);
+            std::process::exit(1);
+        }
+    };
+
+    // Assemble prompt
+    let mut prompt_assembler = crate::agents::prompt_assembler::PromptAssembler::new(&repo_root);
+    let prompt_file = match prompt_assembler.assemble(&agent_def, prompt) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("Error assembling prompt: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Build and display the command (actual spawn is handled by the webhook server)
+    let spawner = crate::agents::spawner::AgentSpawner::new(
+        &repo_root,
+        crate::constants::DEFAULT_AGENT_MAX_TURNS,
+    );
+    let env = spawner.build_env(&agent_def, &prompt_file, prompt, Some(&extra_env));
+    let cmd = match spawner.build_command(&agent_def, &prompt_file, prompt) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error building command: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Execute the agent subprocess
+    let program = &cmd[0];
+    let args = &cmd[1..];
+    let status = Command::new(program)
+        .args(args)
+        .envs(&env)
+        .current_dir(&repo_root)
+        .status();
+
+    match status {
+        Ok(s) => {
+            let code = s.code().unwrap_or(-1);
+            if code == 0 {
+                println!("Agent '{}' completed successfully.", agent_type);
+            } else {
+                eprintln!("Agent '{}' exited with code {}.", agent_type, code);
+                std::process::exit(code);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error spawning agent '{}': {}", agent_type, e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Load a V2 agent definition, preferring repo-local over embedded defaults.
+fn load_v2_agent_definition(agent_type: &str, repo_root: &Path) -> String {
+    // Check repo-local agents directory first
+    let local_path = repo_root
+        .join(".githubclaw")
+        .join("agents")
+        .join(format!("{}.md", agent_type));
+    if local_path.exists() {
+        return fs::read_to_string(&local_path).unwrap_or_default();
+    }
+
+    // Fall back to embedded defaults
+    match agent_type {
+        "orchestrator" => DEFAULT_V2_AGENT_ORCHESTRATOR.to_string(),
+        "implementer" => DEFAULT_V2_AGENT_IMPLEMENTER.to_string(),
+        "verifier" => DEFAULT_V2_AGENT_VERIFIER.to_string(),
+        "reviewer" => DEFAULT_V2_AGENT_REVIEWER.to_string(),
+        "vision-gap-analyst" => DEFAULT_V2_AGENT_VISION_GAP_ANALYST.to_string(),
+        "bug-reproducer" => DEFAULT_V2_AGENT_BUG_REPRODUCER.to_string(),
+        _ => {
+            eprintln!("Error: no embedded definition for agent type '{}'", agent_type);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ===========================================================================
+// cmd_release — V2: Start release pipeline
+// ===========================================================================
+
+fn cmd_release(repo: Option<&str>) {
+    let repo_root = find_repo_root(None).unwrap_or_else(|| {
+        eprintln!("Error: not inside a git repository.");
+        std::process::exit(1);
+    });
+
+    let repo_name = match repo {
+        Some(r) => r.to_string(),
+        None => detect_github_remote(&repo_root).unwrap_or_else(|| {
+            eprintln!("Error: cannot detect GitHub remote. Use --repo flag.");
+            std::process::exit(1);
+        }),
+    };
+
+    println!("Starting release pipeline for {} ...", repo_name);
+
+    // Create release branch from dev
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&repo_root)
+        .output();
+
+    let current_branch = match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(e) => {
+            eprintln!("Error getting current branch: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if current_branch != "dev" {
+        eprintln!(
+            "Error: release must be started from 'dev' branch (currently on '{}')",
+            current_branch
+        );
+        std::process::exit(1);
+    }
+
+    // Generate release branch name with timestamp
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let release_branch = format!("release/{}", timestamp);
+
+    // Create release branch
+    let status = Command::new("git")
+        .args(["checkout", "-b", &release_branch])
+        .current_dir(&repo_root)
+        .status();
+
+    if let Err(e) = status {
+        eprintln!("Error creating release branch: {}", e);
+        std::process::exit(1);
+    }
+
+    // Push release branch
+    let status = Command::new("git")
+        .args(["push", "-u", "origin", &release_branch])
+        .current_dir(&repo_root)
+        .status();
+
+    if let Err(e) = status {
+        eprintln!("Error pushing release branch: {}", e);
+        std::process::exit(1);
+    }
+
+    // Dispatch orchestrator to generate checklist and create PR
+    println!("Dispatching orchestrator to generate release checklist...");
+    let release_prompt = format!(
+        "Create a release PR from '{}' to 'main' for repository '{}'. \
+         Analyze all changes since the last release, generate a dogfooding checklist, \
+         and create the PR with the checklist in the body. \
+         Do NOT merge — the final merge must be done by a human in GitHub web UI.",
+        release_branch, repo_name
+    );
+
+    // Use dispatch to run the orchestrator
+    cmd_dispatch("orchestrator", 0, &release_prompt, Some(&repo_name));
+}
+
+// ===========================================================================
+// cmd_tui — V2: Launch TUI dashboard (placeholder)
+// ===========================================================================
+
+fn cmd_tui() {
+    use crossterm::execute;
+    use crossterm::terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    };
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::Terminal;
+    use std::io;
+    use std::time::Duration;
+
+    // Setup terminal
+    enable_raw_mode().unwrap_or_else(|e| {
+        eprintln!("Error: failed to enable raw mode: {}", e);
+        std::process::exit(1);
+    });
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).unwrap();
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    // Create app state
+    let mut app = crate::tui::App::new();
+
+    // Main loop
+    loop {
+        terminal
+            .draw(|f| crate::tui::ui::render(f, &app))
+            .unwrap();
+
+        if let Some(event) =
+            crate::tui::event::poll_event(Duration::from_millis(250))
+        {
+            app.handle_event(event);
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+
+    // Restore terminal
+    disable_raw_mode().unwrap();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).unwrap();
+    terminal.show_cursor().unwrap();
 }
 
 // ===========================================================================

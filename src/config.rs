@@ -300,6 +300,41 @@ pub struct RepoConfig {
 
     #[serde(default = "default_event_subscription")]
     pub event_subscription: Vec<String>,
+
+    // V2: E2E test configuration for Verifier direct-use validation
+    #[serde(default)]
+    pub e2e_config: Option<E2eConfig>,
+
+    // V2: Reviewer secondary criteria (after JTBD resolution)
+    #[serde(default)]
+    pub reviewer_priorities: Vec<String>,
+
+    // V2: Shell command to launch the app for manual dogfooding
+    #[serde(default)]
+    pub dogfood_command: Option<String>,
+}
+
+/// E2E test configuration for Verifier direct-use validation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct E2eConfig {
+    /// Type of project: "web", "api", "cli", "library"
+    pub project_type: String,
+
+    /// Command to start the application for testing
+    #[serde(default)]
+    pub start_command: Option<String>,
+
+    /// Command to run e2e tests
+    #[serde(default)]
+    pub test_command: Option<String>,
+
+    /// Base URL for web/API projects
+    #[serde(default)]
+    pub base_url: Option<String>,
+
+    /// Additional instructions for the Verifier
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 impl Default for RepoConfig {
@@ -308,6 +343,9 @@ impl Default for RepoConfig {
             allowed_read_paths: default_allowed_read_paths(),
             excluded_read_paths: default_excluded_read_paths(),
             event_subscription: default_event_subscription(),
+            e2e_config: None,
+            reviewer_priorities: Vec::new(),
+            dogfood_command: None,
         }
     }
 }
