@@ -1600,6 +1600,8 @@ fn cmd_tui() {
     use std::io;
     use std::time::Duration;
 
+    crate::tui::startup::run_tui_startup_checks();
+
     // Setup terminal
     enable_raw_mode().unwrap_or_else(|e| {
         eprintln!("Error: failed to enable raw mode: {}", e);
