@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 
 use crate::agents::parser::AgentDefinition;
 
+/// Embedded gh wrapper script (compiled into the binary).
+const GH_WRAPPER_SCRIPT: &str = include_str!("../../scripts/gh");
+
 /// Spawns agent subprocesses with the correct environment and CLI flags.
 pub struct AgentSpawner {
     repo_root: PathBuf,
@@ -132,26 +135,34 @@ impl AgentSpawner {
         env
     }
 
-    /// Locate the gh wrapper script directory.
+    /// Get or create the gh wrapper directory.
     ///
-    /// Looks for `scripts/gh` relative to the binary location,
-    /// or falls back to the repo root's `scripts/` directory.
+    /// Extracts the embedded gh wrapper script to a stable temp directory
+    /// so it's always available regardless of where the binary is installed.
+    /// The wrapper is placed at `~/.githubclaw/bin/gh`.
     fn gh_wrapper_dir(&self) -> Option<PathBuf> {
-        // Check repo-local scripts dir first
-        let repo_scripts = self.repo_root.join("scripts");
-        if repo_scripts.join("gh").exists() {
-            return Some(repo_scripts);
-        }
-        // Check relative to the running binary
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                let bin_scripts = parent.join("scripts");
-                if bin_scripts.join("gh").exists() {
-                    return Some(bin_scripts);
-                }
+        let wrapper_dir = crate::config::global_config_dir().join("bin");
+        let wrapper_path = wrapper_dir.join("gh");
+
+        // Only write if missing or outdated
+        if !wrapper_path.exists() {
+            if std::fs::create_dir_all(&wrapper_dir).is_err() {
+                return None;
+            }
+            if std::fs::write(&wrapper_path, GH_WRAPPER_SCRIPT).is_err() {
+                return None;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &wrapper_path,
+                    std::fs::Permissions::from_mode(0o755),
+                );
             }
         }
-        None
+
+        Some(wrapper_dir)
     }
 
     /// Build the command-line arguments for launching the agent.
