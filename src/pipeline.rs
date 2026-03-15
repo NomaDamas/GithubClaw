@@ -1,4 +1,4 @@
-//! V2 Pipeline state machine for Issue Request lifecycle.
+//! Pipeline state machine for Issue Request lifecycle.
 //!
 //! Manages the full lifecycle: classification → approval → implementation → merge.
 //! Each issue progresses through discrete states, driven by GitHub HTML markers.

@@ -64,7 +64,7 @@ impl RateLimiter {
 
     /// Called when a worker agent subprocess exits with non-zero exit code.
     ///
-    /// V2: Triggered by subprocess exit code detection (not API response parsing).
+    /// Triggered by subprocess exit code detection rather than API response parsing.
     /// Escalates to `WorkerLimited` if currently `None`, or to
     /// `FullHibernate` if already `OrchestratorLimited`.
     pub fn report_worker_rate_limit(&self) {
@@ -84,7 +84,7 @@ impl RateLimiter {
 
     /// Called when the orchestrator subprocess exits with non-zero exit code.
     ///
-    /// V2: Triggered by Orchestrator Claude Code subprocess exit code detection.
+    /// Triggered by orchestrator subprocess exit code detection.
     /// Escalates to `OrchestratorLimited` if currently `None`, or to
     /// `FullHibernate` if already `WorkerLimited`.
     pub fn report_orchestrator_rate_limit(&self) {

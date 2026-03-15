@@ -13,7 +13,7 @@ use axum::{
     Router,
 };
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -22,7 +22,6 @@ use tracing::{debug, error, info, warn};
 use crate::agents::parser::load_agent_definition;
 use crate::agents::prompt_assembler::PromptAssembler;
 use crate::agents::spawner::AgentSpawner;
-use crate::hosted_proxy::{HostedProxyStore, RegisterRequest, RegisterSuccess};
 use crate::process_manager::{check_fork_pr_gate, ProcessManager};
 use crate::queue::DiskPersistedQueue;
 use crate::scheduler::ScheduledEventManager;
@@ -35,7 +34,6 @@ use crate::signature::verify_webhook_signature;
 /// All shared state for the running webhook server.
 pub struct ServerState {
     pub webhook_secret: String,
-    pub hosted_proxy_store: Mutex<HostedProxyStore>,
     pub registry: RwLock<HashMap<String, RegistryEntry>>,
     pub started_repos: RwLock<HashSet<String>>,
     pub queues: Mutex<HashMap<String, DiskPersistedQueue>>,
@@ -44,11 +42,10 @@ pub struct ServerState {
     pub scheduler: Mutex<ScheduledEventManager>,
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
-    // V1 orchestrator_backend and orchestrators fields removed in V2.
-    // Orchestrator is now a Claude Code subprocess — no in-process session.
-    /// V2: Routes GitHub events to their root issue for Orchestrator session routing.
+    // Orchestrators run as subprocesses; session state lives on disk.
+    /// Routes GitHub events to their root issue for orchestrator session routing.
     pub issue_router: crate::issue_router::IssueRouter,
-    /// V2: Session ID persistence for Claude Code --resume pattern.
+    /// Persists Claude Code session IDs for the `--resume` flow.
     pub session_store: crate::session_store::SessionStore,
 }
 
@@ -178,39 +175,33 @@ fn annotate_fork_status(mut payload: Value) -> Value {
 /// Return (or create) the disk-persisted queue for a repo.
 ///
 /// Must be called with the queues mutex already locked.
-fn get_or_create_queue<'a>(
+pub(crate) fn get_or_create_queue<'a>(
     queues: &'a mut HashMap<String, DiskPersistedQueue>,
     registry: &HashMap<String, RegistryEntry>,
     githubclaw_home: &Path,
     repo_full_name: &str,
 ) -> std::io::Result<&'a mut DiskPersistedQueue> {
-    if !queues.contains_key(repo_full_name) {
-        let queue_dir = if let Some(entry) = registry.get(repo_full_name) {
-            if !entry.local_path.is_empty() {
-                PathBuf::from(&entry.local_path)
-                    .join(".githubclaw")
-                    .join("queue")
+    let key = repo_full_name.to_string();
+    match queues.entry(key) {
+        Entry::Occupied(entry) => Ok(entry.into_mut()),
+        Entry::Vacant(entry) => {
+            let queue_dir = if let Some(registry_entry) = registry.get(repo_full_name) {
+                if !registry_entry.local_path.is_empty() {
+                    PathBuf::from(&registry_entry.local_path)
+                        .join(".githubclaw")
+                        .join("queue")
+                } else {
+                    fallback_queue_dir(githubclaw_home, repo_full_name)
+                }
             } else {
                 fallback_queue_dir(githubclaw_home, repo_full_name)
-            }
-        } else {
-            fallback_queue_dir(githubclaw_home, repo_full_name)
-        };
+            };
 
-        let q = DiskPersistedQueue::new(&queue_dir, crate::constants::DEFAULT_QUEUE_MAX_RETRY)?;
-        queues.insert(repo_full_name.to_string(), q);
+            let queue =
+                DiskPersistedQueue::new(&queue_dir, crate::constants::DEFAULT_QUEUE_MAX_RETRY)?;
+            Ok(entry.insert(queue))
+        }
     }
-    Ok(queues.get_mut(repo_full_name).unwrap())
-}
-
-/// Public wrapper around `get_or_create_queue` for use by the scheduler firing loop.
-pub fn get_or_create_queue_pub<'a>(
-    queues: &'a mut HashMap<String, DiskPersistedQueue>,
-    registry: &HashMap<String, RegistryEntry>,
-    githubclaw_home: &Path,
-    repo_full_name: &str,
-) -> std::io::Result<&'a mut DiskPersistedQueue> {
-    get_or_create_queue(queues, registry, githubclaw_home, repo_full_name)
 }
 
 async fn registry_snapshot(state: &Arc<ServerState>) -> HashMap<String, RegistryEntry> {
@@ -402,60 +393,6 @@ async fn health_handler(State(state): State<Arc<ServerState>>) -> Json<Value> {
     }))
 }
 
-async fn register_handler(
-    State(state): State<Arc<ServerState>>,
-    body: axum::body::Bytes,
-) -> (StatusCode, Json<Value>) {
-    let request = match serde_json::from_slice::<RegisterRequest>(&body) {
-        Ok(request) => request,
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
-                format!("Invalid JSON payload: {e}"),
-            );
-        }
-    };
-
-    let mut store = state.hosted_proxy_store.lock().await;
-    match store.register_with_now(request, chrono::Utc::now()) {
-        Ok(success) => success_response(success),
-        Err(err) => error_response(
-            StatusCode::from_u16(err.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            err.code,
-            err.message,
-        ),
-    }
-}
-
-fn success_response(success: RegisterSuccess) -> (StatusCode, Json<Value>) {
-    let status = if success.status == "claimed" {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    (
-        status,
-        Json(serde_json::to_value(success).expect("register success is serializable")),
-    )
-}
-
-fn error_response(
-    status: StatusCode,
-    code: &'static str,
-    message: impl Into<String>,
-) -> (StatusCode, Json<Value>) {
-    (
-        status,
-        Json(serde_json::json!({
-            "error": {
-                "code": code,
-                "message": message.into(),
-            }
-        })),
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
@@ -603,7 +540,6 @@ pub async fn bootstrap_repo(
 pub fn create_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/webhook", post(webhook_handler))
-        .route("/register", post(register_handler))
         .route("/health", get(health_handler))
         .with_state(state)
 }
@@ -622,9 +558,9 @@ pub struct DispatchAction {
 /// Execute a single dispatch action: validate agent, check fork gate, assemble
 /// prompt, build command, and spawn the agent subprocess.
 ///
-/// V2: This function is still used by the `githubclaw dispatch` CLI command
+/// This function is still used by the `githubclaw dispatch` CLI command
 /// for direct agent spawning. The server drain loop no longer calls it directly
-/// since the Orchestrator subprocess handles dispatch via CLI.
+/// because the orchestrator subprocess handles dispatch via CLI.
 #[allow(dead_code)]
 async fn execute_dispatch(
     state: &Arc<ServerState>,
@@ -931,7 +867,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             continue;
         }
 
-        // 2b. V2: Route event to root issue for correct Orchestrator session.
+        // 2b. Route the event to its root issue for the correct orchestrator session.
         let root_issue = state
             .issue_router
             .route_event(repo_name, &event.payload)
@@ -945,7 +881,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             );
         }
 
-        // 2c. V2: Build prompt for Orchestrator subprocess.
+        // 2c. Build the prompt for the orchestrator subprocess.
         // Detect markers and build ResumeMessage, or use raw event for new issues.
         let orchestrator_prompt = if let Some(comment_body) = event
             .payload
@@ -1053,7 +989,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             continue;
         }
 
-        // 5. V2: Spawn Orchestrator as Claude Code subprocess.
+        // 5. Spawn the orchestrator as a Claude Code subprocess.
         let issue_id = root_issue.unwrap_or(0);
 
         let registry = state.registry.read().await;
@@ -1219,7 +1155,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             }
         }
 
-        // 6. V2: Orchestrator subprocess spawned (fire-and-forget).
+        // 6. The orchestrator subprocess is fire-and-forget.
         //    The Orchestrator handles dispatch via `githubclaw dispatch` CLI.
         //    Dequeue the event — it's been handed off to the subprocess.
         {
@@ -1307,13 +1243,6 @@ mod tests {
         let scheduler_path = tmp.path().join(".githubclaw").join("scheduled.json");
         Arc::new(ServerState {
             webhook_secret: TEST_SECRET.to_string(),
-            hosted_proxy_store: Mutex::new(
-                HostedProxyStore::load(
-                    tmp.path().join("hosted_proxy_registrations.json"),
-                    TEST_SECRET,
-                )
-                .unwrap(),
-            ),
             registry: RwLock::new(registry),
             started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
@@ -1494,132 +1423,6 @@ mod tests {
         assert!(text.contains("Ignored"));
     }
 
-    #[tokio::test]
-    async fn test_register_claim_and_update_flow() {
-        let tmp = TempDir::new().unwrap();
-        let state = make_test_state(&tmp);
-        let claim_proof = {
-            let store = state.hosted_proxy_store.lock().await;
-            store.mint_claim_proof_for_test(123, chrono::Utc::now())
-        };
-        let app = create_router(state.clone());
-
-        let claim_payload = serde_json::to_vec(&serde_json::json!({
-            "installation_id": 123,
-            "tunnel_url": "https://EXAMPLE.com",
-            "claim_proof": claim_proof,
-        }))
-        .unwrap();
-
-        let claim_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/register")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(claim_payload))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(claim_response.status(), StatusCode::CREATED);
-        let claim_body: Value = serde_json::from_str(&body_string(claim_response).await).unwrap();
-        assert_eq!(claim_body["status"], "claimed");
-        assert_eq!(claim_body["tunnel_url"], "https://example.com");
-        let update_secret = claim_body["update_secret"].as_str().unwrap().to_string();
-
-        let update_payload = serde_json::to_vec(&serde_json::json!({
-            "installation_id": 123,
-            "tunnel_url": "https://www.example.com",
-            "update_secret": update_secret,
-        }))
-        .unwrap();
-
-        let update_response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/register")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(update_payload))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(update_response.status(), StatusCode::OK);
-        let update_body: Value = serde_json::from_str(&body_string(update_response).await).unwrap();
-        assert_eq!(update_body["status"], "updated");
-        assert_eq!(update_body["tunnel_url"], "https://www.example.com");
-        assert_eq!(update_body["rotated"], true);
-    }
-
-    #[tokio::test]
-    async fn test_register_rejects_invalid_shapes_and_unsafe_urls() {
-        let tmp = TempDir::new().unwrap();
-        let state = make_test_state(&tmp);
-        let claim_proof = {
-            let store = state.hosted_proxy_store.lock().await;
-            store.mint_claim_proof_for_test(222, chrono::Utc::now())
-        };
-        let unsafe_claim_proof = {
-            let store = state.hosted_proxy_store.lock().await;
-            store.mint_claim_proof_for_test(222, chrono::Utc::now())
-        };
-        let app = create_router(state);
-
-        let invalid_shape = serde_json::to_vec(&serde_json::json!({
-            "installation_id": 222,
-            "tunnel_url": "https://good.example.com",
-            "claim_proof": claim_proof,
-            "update_secret": "us_fake",
-        }))
-        .unwrap();
-
-        let invalid_shape_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/register")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(invalid_shape))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(invalid_shape_response.status(), StatusCode::BAD_REQUEST);
-        let invalid_shape_body: Value =
-            serde_json::from_str(&body_string(invalid_shape_response).await).unwrap();
-        assert_eq!(invalid_shape_body["error"]["code"], "invalid_request");
-
-        let unsafe_url = serde_json::to_vec(&serde_json::json!({
-            "installation_id": 222,
-            "tunnel_url": "https://127.0.0.1",
-            "claim_proof": unsafe_claim_proof,
-        }))
-        .unwrap();
-
-        let unsafe_response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/register")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(unsafe_url))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(unsafe_response.status(), StatusCode::BAD_REQUEST);
-        let unsafe_body: Value = serde_json::from_str(&body_string(unsafe_response).await).unwrap();
-        assert_eq!(unsafe_body["error"]["code"], "unsafe_tunnel_url");
-    }
-
     // ---------------------------------------------------------------
     // 6. annotate_fork_status adds flag for unapproved fork PR
     // ---------------------------------------------------------------
@@ -1751,6 +1554,56 @@ mod tests {
     fn test_load_registry_returns_empty_for_missing_file() {
         let registry = load_registry(Path::new("/nonexistent/registry.json"));
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn test_get_or_create_queue_uses_repo_local_path() {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let mut registry = HashMap::new();
+        registry.insert(
+            "owner/repo".to_string(),
+            RegistryEntry {
+                local_path: repo_root.to_string_lossy().to_string(),
+                socket_path: String::new(),
+            },
+        );
+        let mut queues = HashMap::new();
+
+        let queue = get_or_create_queue(&mut queues, &registry, tmp.path(), "owner/repo").unwrap();
+        queue
+            .enqueue(serde_json::json!({"ok": true}), "test")
+            .unwrap();
+
+        assert!(repo_root.join(".githubclaw").join("queue").exists());
+        assert_eq!(queues.get("owner/repo").unwrap().size(), 1);
+    }
+
+    #[test]
+    fn test_get_or_create_queue_uses_fallback_for_empty_local_path() {
+        let tmp = TempDir::new().unwrap();
+        let mut registry = HashMap::new();
+        registry.insert(
+            "owner/repo".to_string(),
+            RegistryEntry {
+                local_path: String::new(),
+                socket_path: String::new(),
+            },
+        );
+        let mut queues = HashMap::new();
+
+        let queue = get_or_create_queue(&mut queues, &registry, tmp.path(), "owner/repo").unwrap();
+        queue
+            .enqueue(serde_json::json!({"ok": true}), "test")
+            .unwrap();
+
+        assert!(tmp
+            .path()
+            .join("queues")
+            .join("owner_repo")
+            .join("queue")
+            .exists());
+        assert_eq!(queues.get("owner/repo").unwrap().size(), 1);
     }
 
     // ---------------------------------------------------------------

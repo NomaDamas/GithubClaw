@@ -120,7 +120,7 @@ pub struct GlobalConfig {
     #[serde(default = "default_event_subscription")]
     pub event_subscription: Vec<String>,
 
-    // V2: Separate concurrency limits
+    // Separate concurrency limits
     #[serde(default = "default_max_orchestrators")]
     pub max_concurrent_orchestrators: usize,
 
@@ -331,15 +331,15 @@ pub struct RepoConfig {
     #[serde(default = "default_event_subscription")]
     pub event_subscription: Vec<String>,
 
-    // V2: E2E test configuration for Verifier direct-use validation
+    // E2E test configuration for Verifier direct-use validation
     #[serde(default)]
     pub e2e_config: Option<E2eConfig>,
 
-    // V2: Reviewer secondary criteria (after JTBD resolution)
+    // Reviewer secondary criteria (after JTBD resolution)
     #[serde(default)]
     pub reviewer_priorities: Vec<String>,
 
-    // V2: Shell command to launch the app for manual dogfooding
+    // Shell command to launch the app for manual dogfooding
     #[serde(default)]
     pub dogfood_command: Option<String>,
 }

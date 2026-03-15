@@ -50,12 +50,12 @@ pub const SEARCH_RESULTS_LIMIT: u32 = 30;
 // Spawner
 pub const DEFAULT_AGENT_MAX_TURNS: u32 = 200;
 
-// V2: Pipeline loop limits
+// Pipeline loop limits
 pub const IMPLEMENTER_VERIFIER_MAX_LOOP: u32 = 10;
 pub const IMPLEMENTER_REVIEWER_MAX_LOOP: u32 = 10;
 pub const BUG_REPRODUCER_MAX_INFO_REQUESTS: u32 = 3;
 
-// V2: Agent types
+// Agent types
 pub const AGENT_ORCHESTRATOR: &str = "orchestrator";
 pub const AGENT_IMPLEMENTER: &str = "implementer";
 pub const AGENT_VERIFIER: &str = "verifier";
@@ -63,8 +63,8 @@ pub const AGENT_REVIEWER: &str = "reviewer";
 pub const AGENT_VISION_GAP_ANALYST: &str = "vision-gap-analyst";
 pub const AGENT_BUG_REPRODUCER: &str = "bug-reproducer";
 
-/// All valid V2 agent types.
-pub const V2_AGENT_TYPES: &[&str] = &[
+/// All valid agent types.
+pub const AGENT_TYPES: &[&str] = &[
     AGENT_ORCHESTRATOR,
     AGENT_IMPLEMENTER,
     AGENT_VERIFIER,

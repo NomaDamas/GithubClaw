@@ -98,7 +98,7 @@ pub fn check_fork_pr_gate(event_payload: &serde_json::Value, agent_type: &str) -
 /// Provides spawn, monitor, idle-timeout, concurrency throttle, graceful
 /// drain, and force kill capabilities.
 ///
-/// V2: Separate concurrency limits for orchestrators and workers.
+/// Separate concurrency limits for orchestrators and workers.
 pub struct ProcessManager {
     pub max_concurrent_agents: usize,
     pub max_concurrent_orchestrators: usize,
@@ -154,7 +154,7 @@ impl ProcessManager {
             .count()
     }
 
-    /// Whether there is at least one free concurrency slot (legacy, checks total).
+    /// Whether there is at least one free slot across all managed processes.
     pub async fn has_capacity(&self) -> bool {
         self.active_count().await < self.max_concurrent_agents
     }

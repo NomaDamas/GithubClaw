@@ -56,18 +56,6 @@ fn verify_signature(payload_body: &[u8], signature_header: &str, secret: &str) -
 - Set during GitHub App creation
 - Requests without valid `X-Hub-Signature-256` are rejected (403)
 
-## Hosted Proxy Registration Boundary
-
-Hosted proxy mode adds one more narrow ownership gate:
-
-- Initial `POST /register` claim requires a short-lived one-time `claim_proof` bound to exactly one `installation_id`
-- Successful claim returns an installation-scoped `update_secret`
-- Later tunnel URL updates require the current `update_secret`
-- Every successful update rotates `update_secret`
-- Tunnel URLs are normalized and restricted to conservative HTTPS origins with no path, query, fragment, userinfo, or loopback/private-network host targets
-
-The full request and error contract lives in `docs/HOSTED_PROXY.md`.
-
 ## Fork PR Gate
 
 **Mechanical enforcement** — not dependent on LLM judgment:

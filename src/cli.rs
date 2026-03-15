@@ -41,7 +41,7 @@ cat "${PROMPT_FILE}" | codex exec - \
 const DEFAULT_GITIGNORE: &str = "secrets/\nqueue/\nlogs/\nmemory.md\n";
 const DEFAULT_REPO_CONFIG_YAML: &str = "# GithubClaw per-repo configuration.\n# See https://github.com/GithubClaw/githubclaw for options.\n";
 
-// Agent definitions — 6 V2 agents embedded at compile time.
+// Agent definitions embedded at compile time.
 const DEFAULT_AGENT_ORCHESTRATOR: &str = include_str!("../defaults/agents/orchestrator.md");
 const DEFAULT_AGENT_IMPLEMENTER: &str = include_str!("../defaults/agents/implementer.md");
 const DEFAULT_AGENT_VERIFIER: &str = include_str!("../defaults/agents/verifier.md");
@@ -352,16 +352,6 @@ fn cmd_bootstrap() {
         let scheduler_path = global_dir.join("scheduled_events.json");
         let state = Arc::new(ServerState {
             webhook_secret: String::new(),
-            hosted_proxy_store: Mutex::new(
-                crate::hosted_proxy::HostedProxyStore::load(
-                    global_dir.join("hosted_proxy_registrations.json"),
-                    "bootstrap-only-secret",
-                )
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to initialize hosted proxy store: {e}");
-                    std::process::exit(1);
-                }),
-            ),
             registry: RwLock::new(registry),
             started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
@@ -1204,16 +1194,6 @@ fn cmd_serve(host: &str, port: u16) {
         // Create server state
         let state = Arc::new(ServerState {
             webhook_secret: webhook_secret.clone(),
-            hosted_proxy_store: Mutex::new(
-                crate::hosted_proxy::HostedProxyStore::load(
-                    global_dir.join("hosted_proxy_registrations.json"),
-                    webhook_secret,
-                )
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to initialize hosted proxy store: {e}");
-                    std::process::exit(1);
-                }),
-            ),
             registry: RwLock::new(registry.clone()),
             started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
@@ -1262,7 +1242,7 @@ fn cmd_serve(host: &str, port: u16) {
                             async move {
                                 let mut queues = st.queues.lock().await;
                                 let registry = st.registry.read().await;
-                                let queue = crate::server::get_or_create_queue_pub(
+                                let queue = crate::server::get_or_create_queue(
                                     &mut queues,
                                     &registry,
                                     &st.githubclaw_home,
@@ -1647,7 +1627,7 @@ fn health_check(port: u16, log_path: &Path) {
 }
 
 // ===========================================================================
-// V2: Helpers
+// Helpers
 // ===========================================================================
 
 /// Detect the GitHub owner/repo from the current git remote.
@@ -1665,18 +1645,18 @@ fn detect_github_remote(repo_root: &Path) -> Option<String> {
 }
 
 // ===========================================================================
-// cmd_dispatch — V2: Dispatch a worker agent for a specific issue
+// cmd_dispatch — Dispatch a worker agent for a specific issue
 // ===========================================================================
 
 fn cmd_dispatch(agent_type: &str, issue: u64, prompt: &str, repo: Option<&str>) {
-    use crate::constants::V2_AGENT_TYPES;
+    use crate::constants::AGENT_TYPES;
 
     // Validate agent type
-    if !V2_AGENT_TYPES.contains(&agent_type) {
+    if !AGENT_TYPES.contains(&agent_type) {
         eprintln!(
             "Error: unknown agent type '{}'. Valid types: {}",
             agent_type,
-            V2_AGENT_TYPES.join(", ")
+            AGENT_TYPES.join(", ")
         );
         std::process::exit(1);
     }
@@ -1714,7 +1694,7 @@ fn cmd_dispatch(agent_type: &str, issue: u64, prompt: &str, repo: Option<&str>) 
     extra_env.insert("GITHUBCLAW_REPO".into(), repo_name.clone());
 
     // Load agent definition: write to temp file, then parse
-    let agent_def_content = load_v2_agent_definition(agent_type, &repo_root);
+    let agent_def_content = load_agent_definition(agent_type, &repo_root);
     let tmp_dir = std::env::temp_dir().join("githubclaw-dispatch");
     fs::create_dir_all(&tmp_dir).unwrap_or_default();
     let agent_file = tmp_dir.join(format!("{}.md", agent_type));
@@ -1780,8 +1760,8 @@ fn cmd_dispatch(agent_type: &str, issue: u64, prompt: &str, repo: Option<&str>) 
     }
 }
 
-/// Load a V2 agent definition, preferring repo-local over embedded defaults.
-fn load_v2_agent_definition(agent_type: &str, repo_root: &Path) -> String {
+/// Load an agent definition, preferring repo-local over embedded defaults.
+fn load_agent_definition(agent_type: &str, repo_root: &Path) -> String {
     // Check repo-local agents directory first
     let local_path = repo_root
         .join(".githubclaw")
@@ -1810,7 +1790,7 @@ fn load_v2_agent_definition(agent_type: &str, repo_root: &Path) -> String {
 }
 
 // ===========================================================================
-// cmd_release — V2: Start release pipeline
+// cmd_release — Start release pipeline
 // ===========================================================================
 
 fn cmd_release(repo: Option<&str>) {
@@ -1919,7 +1899,7 @@ fn cmd_release(repo: Option<&str>) {
 }
 
 // ===========================================================================
-// cmd_tui — V2: Launch TUI dashboard (placeholder)
+// cmd_tui — Launch TUI dashboard
 // ===========================================================================
 
 fn cmd_tui() {

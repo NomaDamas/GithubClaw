@@ -35,13 +35,25 @@ impl SessionStore {
         Self { base_dir }
     }
 
+    fn repo_dir(&self, repo: &str) -> PathBuf {
+        self.base_dir.join(repo.replace('/', "_"))
+    }
+
     fn session_dir(&self, repo: &str, issue_id: u64) -> PathBuf {
-        let safe_repo = repo.replace('/', "_");
-        self.base_dir.join(safe_repo).join(issue_id.to_string())
+        self.repo_dir(repo).join(issue_id.to_string())
     }
 
     fn session_id_path(&self, repo: &str, issue_id: u64) -> PathBuf {
         self.session_dir(repo, issue_id).join("session_id")
+    }
+
+    fn read_session_id(path: &std::path::Path) -> Result<Option<String>> {
+        let session_id = std::fs::read_to_string(path)?.trim().to_string();
+        if session_id.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(session_id))
+        }
     }
 
     /// Store a Claude Code session ID for a given repo + issue.
@@ -69,11 +81,7 @@ impl SessionStore {
         if !path.exists() {
             return Ok(None);
         }
-        let id = std::fs::read_to_string(&path)?.trim().to_string();
-        if id.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(id))
+        Self::read_session_id(&path)
     }
 
     /// Delete a session ID (e.g., when an issue is closed/completed).
@@ -90,8 +98,7 @@ impl SessionStore {
     ///
     /// Returns a vec of (issue_id, session_id) pairs sorted by issue_id.
     pub fn list(&self, repo: &str) -> Result<Vec<(u64, String)>> {
-        let safe_repo = repo.replace('/', "_");
-        let repo_dir = self.base_dir.join(safe_repo);
+        let repo_dir = self.repo_dir(repo);
 
         if !repo_dir.exists() {
             return Ok(Vec::new());
@@ -107,8 +114,7 @@ impl SessionStore {
                 };
                 let sid_path = entry.path().join("session_id");
                 if sid_path.exists() {
-                    let sid = std::fs::read_to_string(&sid_path)?.trim().to_string();
-                    if !sid.is_empty() {
+                    if let Some(sid) = Self::read_session_id(&sid_path)? {
                         sessions.push((issue_id, sid));
                     }
                 }

@@ -104,10 +104,10 @@ impl AgentSpawner {
             self.repo_root.to_string_lossy().into_owned(),
         );
 
-        // V2: Root issue tracking for ref #N injection
+        // Root issue tracking for ref #N injection
         // GITHUBCLAW_ROOT_ISSUE is injected by the caller via extra_env
 
-        // V2: gh wrapper PATH injection
+        // gh wrapper PATH injection
         // Prepend the scripts/ directory (containing gh renamed to gh)
         // to PATH so all gh CLI calls go through our wrapper.
         if let Some(wrapper_dir) = self.gh_wrapper_dir() {

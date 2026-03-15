@@ -30,13 +30,6 @@ POST /webhook
   - Discards events from repos not in registry.json
   - Checks fork PR gate before queuing
   - Persists to disk-backed serial queue
-
-POST /register
-  - Claims or updates the hosted proxy tunnel target for one installation_id
-  - Requires exactly one of claim_proof or update_secret
-  - Normalizes and validates conservative HTTPS tunnel origins
-  - Persists registration state and rotates update_secret on every successful update
-  - Full contract documented in docs/HOSTED_PROXY.md
 ```
 
 No internal HTTP endpoints needed — scheduled events use tokio timers in-process.
