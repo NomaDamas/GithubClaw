@@ -22,12 +22,10 @@ impl InteractiveBackend {
     ///
     /// Order of precedence:
     /// 1. `.githubclaw/agents/orchestrator.md`
-    /// 2. Majority backend from `.githubclaw/agents/*.md`
-    /// 3. `defaults/agents/orchestrator.md`
-    /// 4. `codex`
+    /// 2. `defaults/agents/orchestrator.md`
+    /// 3. `codex`
     pub fn for_repo(repo_root: &Path) -> Self {
         backend_from_agent_file(&repo_root.join(".githubclaw/agents/orchestrator.md"))
-            .or_else(|| backend_from_agent_dir(&repo_root.join(".githubclaw/agents")))
             .or_else(|| backend_from_agent_file(&repo_root.join("defaults/agents/orchestrator.md")))
             .unwrap_or(Self::Codex)
     }
@@ -214,34 +212,6 @@ fn backend_from_agent_file(path: &Path) -> Option<InteractiveBackend> {
     })
 }
 
-fn backend_from_agent_dir(path: &Path) -> Option<InteractiveBackend> {
-    let entries = std::fs::read_dir(path).ok()?;
-    let mut codex = 0usize;
-    let mut claude = 0usize;
-
-    for entry in entries.filter_map(|entry| entry.ok()) {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-            continue;
-        }
-
-        if let Some(backend) = backend_from_agent_file(&path) {
-            match backend {
-                InteractiveBackend::ClaudeCode => claude += 1,
-                InteractiveBackend::Codex => codex += 1,
-            }
-        }
-    }
-
-    if claude == 0 && codex == 0 {
-        None
-    } else if claude > codex {
-        Some(InteractiveBackend::ClaudeCode)
-    } else {
-        Some(InteractiveBackend::Codex)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn repo_agent_backend_majority_beats_default_orchestrator() {
+    fn default_orchestrator_backend_is_used_when_repo_has_no_local_orchestrator() {
         let temp = TempDir::new().unwrap();
         let repo_root = temp.path();
         let agent_dir = repo_root.join(".githubclaw/agents");
@@ -304,7 +274,7 @@ mod tests {
 
         assert_eq!(
             InteractiveBackend::for_repo(repo_root),
-            InteractiveBackend::Codex
+            InteractiveBackend::ClaudeCode
         );
     }
 
