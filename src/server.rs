@@ -23,7 +23,6 @@ use crate::agents::parser::load_agent_definition;
 use crate::agents::prompt_assembler::PromptAssembler;
 use crate::agents::spawner::AgentSpawner;
 use crate::hosted_proxy::{HostedProxyStore, RegisterRequest, RegisterSuccess};
-use crate::orchestrator::session::OrchestratorSession;
 use crate::process_manager::{check_fork_pr_gate, ProcessManager};
 use crate::queue::DiskPersistedQueue;
 use crate::scheduler::ScheduledEventManager;
@@ -45,10 +44,8 @@ pub struct ServerState {
     pub scheduler: Mutex<ScheduledEventManager>,
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
-    /// Which CLI backend to use for the orchestrator (codex or claude-code).
-    pub orchestrator_backend: crate::orchestrator::session::OrchestratorBackend,
-    /// Per-repo orchestrator sessions (created on demand in the drain loop).
-    pub orchestrators: Mutex<HashMap<String, OrchestratorSession>>,
+    // V1 orchestrator_backend and orchestrators fields removed in V2.
+    // Orchestrator is now a Claude Code subprocess — no in-process session.
     /// V2: Routes GitHub events to their root issue for Orchestrator session routing.
     pub issue_router: crate::issue_router::IssueRouter,
     /// V2: Session ID persistence for Claude Code --resume pattern.
@@ -1058,10 +1055,6 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 
         // 5. V2: Spawn Orchestrator as Claude Code subprocess.
         let issue_id = root_issue.unwrap_or(0);
-        let session_id = state
-            .session_store
-            .load(repo_name, issue_id)
-            .unwrap_or(None);
 
         let registry = state.registry.read().await;
         let repo_dir = match registry.get(repo_name) {
@@ -1074,18 +1067,29 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         };
         drop(registry);
 
+        // Write prompt to temp file to avoid CLI arg length limits
+        let prompt_tmp_dir = std::env::temp_dir().join("githubclaw-orch-prompts");
+        let _ = std::fs::create_dir_all(&prompt_tmp_dir);
+        let prompt_file = prompt_tmp_dir.join(format!("{}-{}.txt", repo_name.replace('/', "_"), issue_id));
+        if let Err(e) = std::fs::write(&prompt_file, &orchestrator_prompt) {
+            error!(repo = %repo_name, "Failed to write orchestrator prompt file: {}", e);
+            nack_head_event(state, repo_name, &event.filename).await;
+            continue;
+        }
+
         // Build orchestrator command
+        // Use a deterministic session name so --resume works across invocations
+        let session_name = format!("githubclaw-{}-{}", repo_name.replace('/', "-"), issue_id);
         let mut cmd_args = vec![
             "claude".to_string(),
             "-p".to_string(),
             "--max-turns".to_string(),
             "30".to_string(),
+            "--resume".to_string(),
+            session_name.clone(),
         ];
-        if let Some(ref sid) = session_id {
-            cmd_args.push("--resume".to_string());
-            cmd_args.push(sid.clone());
-        }
-        cmd_args.push(orchestrator_prompt.clone());
+        cmd_args.push("--prompt-file".to_string());
+        cmd_args.push(prompt_file.to_string_lossy().to_string());
 
         // Build environment
         let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -1122,7 +1126,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         info!(
             repo = %repo_name,
             issue = issue_id,
-            session = ?session_id,
+            session = %session_name,
             "Spawning Orchestrator subprocess"
         );
 
@@ -1132,7 +1136,6 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         let repo_dir_clone = repo_dir.clone();
         let process_manager = Arc::clone(&state.process_manager);
         let rate_limiter = Arc::clone(&state.rate_limiter);
-        let _session_store_base = state.session_store.get_session_dir(repo_name, issue_id);
         let repo_name_clone = repo_name.to_string();
 
         match tokio::process::Command::new(&program)
@@ -1322,8 +1325,6 @@ mod tests {
             scheduler: Mutex::new(ScheduledEventManager::new(scheduler_path)),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            orchestrator_backend: crate::orchestrator::session::OrchestratorBackend::Codex,
-            orchestrators: Mutex::new(HashMap::new()),
             issue_router: crate::issue_router::IssueRouter::new(
                 tmp.path().join("sessions"),
             ),

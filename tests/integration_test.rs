@@ -59,8 +59,6 @@ async fn test_webhook_to_queue_roundtrip() {
         )),
         rate_limiter: Arc::new(RateLimiter::default()),
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        orchestrator_backend: githubclaw::orchestrator::session::OrchestratorBackend::Codex,
-        orchestrators: Mutex::new(HashMap::new()),
         issue_router: githubclaw::issue_router::IssueRouter::new(
             tmp.path().join("sessions"),
         ),

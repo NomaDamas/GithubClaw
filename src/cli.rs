@@ -359,8 +359,6 @@ fn cmd_bootstrap() {
             scheduler: Mutex::new(ScheduledEventManager::new(&scheduler_path)),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            orchestrator_backend: crate::orchestrator::session::OrchestratorBackend::Codex,
-            orchestrators: Mutex::new(HashMap::new()),
             issue_router: crate::issue_router::IssueRouter::new(
                 global_dir.join("sessions"),
             ),
@@ -914,8 +912,6 @@ fn cmd_serve(host: &str, port: u16) {
             scheduler: Mutex::new(scheduler),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            orchestrator_backend: crate::orchestrator::session::OrchestratorBackend::Codex,
-            orchestrators: Mutex::new(HashMap::new()),
             issue_router: crate::issue_router::IssueRouter::new(
                 global_dir.join("sessions"),
             ),
