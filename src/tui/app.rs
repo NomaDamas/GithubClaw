@@ -18,6 +18,10 @@ pub struct App {
     pub interactive_session_active: bool,
     /// Issue number pending interactive session launch (consumed by TUI main loop).
     pub pending_interactive_issue: Option<u64>,
+    /// Active PTY session for interactive Claude Code / Codex.
+    pub pty_session: Option<super::pty::PtySession>,
+    /// Accumulated PTY output text for rendering.
+    pub pty_output: String,
 
     // Monitoring tab state
     pub agent_sessions: Vec<AgentSessionItem>,
@@ -40,6 +44,8 @@ impl App {
             selected_issue_index: 0,
             interactive_session_active: false,
             pending_interactive_issue: None,
+            pty_session: None,
+            pty_output: String::new(),
             agent_sessions: Vec::new(),
             selected_agent_index: 0,
             agent_timeline: Vec::new(),
@@ -93,6 +99,23 @@ impl App {
             }
             AppEvent::Tick => {
                 self.refresh_from_disk();
+                // Poll PTY output if active
+                if let Some(ref pty) = self.pty_session {
+                    let new_output = pty.read_output();
+                    if !new_output.is_empty() {
+                        self.pty_output
+                            .push_str(&String::from_utf8_lossy(&new_output));
+                        // Cap at 64KB
+                        if self.pty_output.len() > 64 * 1024 {
+                            let drain_to = self.pty_output.len() - 32 * 1024;
+                            self.pty_output.drain(..drain_to);
+                        }
+                    }
+                    if pty.has_exited() {
+                        self.pty_session = None;
+                        self.interactive_session_active = false;
+                    }
+                }
             }
             _ => {}
         }
@@ -129,8 +152,35 @@ impl App {
             // In interactive session, Escape exits back to list
             if code == KeyCode::Esc {
                 self.interactive_session_active = false;
+                self.pty_session = None;
+                self.pty_output.clear();
+                return;
             }
-            // Other keys would be forwarded to the PTY session
+            // Forward keys to PTY session
+            if let Some(ref pty) = self.pty_session {
+                let bytes: Vec<u8> = match code {
+                    KeyCode::Char(c) => {
+                        if modifiers.contains(KeyModifiers::CONTROL) {
+                            // Ctrl+C = 0x03, Ctrl+D = 0x04, etc.
+                            vec![(c as u8).wrapping_sub(b'`')]
+                        } else {
+                            let mut buf = [0u8; 4];
+                            c.encode_utf8(&mut buf).as_bytes().to_vec()
+                        }
+                    }
+                    KeyCode::Enter => vec![b'\n'],
+                    KeyCode::Backspace => vec![0x7f],
+                    KeyCode::Tab => vec![b'\t'],
+                    KeyCode::Up => vec![0x1b, b'[', b'A'],
+                    KeyCode::Down => vec![0x1b, b'[', b'B'],
+                    KeyCode::Right => vec![0x1b, b'[', b'C'],
+                    KeyCode::Left => vec![0x1b, b'[', b'D'],
+                    _ => vec![],
+                };
+                if !bytes.is_empty() {
+                    let _ = pty.send_input(&bytes);
+                }
+            }
             return;
         }
 
@@ -151,11 +201,27 @@ impl App {
             }
             KeyCode::Enter => {
                 if !self.issue_requests.is_empty() {
-                    // Store the selected issue for the caller to spawn Claude Code
-                    self.interactive_session_active = true;
-                    self.pending_interactive_issue = Some(
-                        self.issue_requests[self.selected_issue_index].issue_number,
-                    );
+                    let issue = &self.issue_requests[self.selected_issue_index];
+                    let session_name = format!("githubclaw-issue-{}", issue.issue_number);
+                    let working_dir = std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| ".".to_string());
+
+                    match super::pty::PtySession::spawn_claude(
+                        &session_name,
+                        &working_dir,
+                        80,
+                        24,
+                    ) {
+                        Ok(pty) => {
+                            self.pty_session = Some(pty);
+                            self.pty_output.clear();
+                            self.interactive_session_active = true;
+                        }
+                        Err(e) => {
+                            self.pty_output = format!("Failed to spawn Claude Code: {}", e);
+                        }
+                    }
                 }
             }
             KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {

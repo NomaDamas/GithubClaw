@@ -23,7 +23,6 @@ use crate::agents::parser::load_agent_definition;
 use crate::agents::prompt_assembler::PromptAssembler;
 use crate::agents::spawner::AgentSpawner;
 use crate::hosted_proxy::{HostedProxyStore, RegisterRequest, RegisterSuccess};
-use crate::orchestrator::schema::Action;
 use crate::orchestrator::session::OrchestratorSession;
 use crate::process_manager::{check_fork_pr_gate, ProcessManager};
 use crate::queue::DiskPersistedQueue;
@@ -625,6 +624,11 @@ pub struct DispatchAction {
 
 /// Execute a single dispatch action: validate agent, check fork gate, assemble
 /// prompt, build command, and spawn the agent subprocess.
+///
+/// V2: This function is still used by the `githubclaw dispatch` CLI command
+/// for direct agent spawning. The server drain loop no longer calls it directly
+/// since the Orchestrator subprocess handles dispatch via CLI.
+#[allow(dead_code)]
 async fn execute_dispatch(
     state: &Arc<ServerState>,
     dispatch: &DispatchAction,
@@ -944,46 +948,92 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             );
         }
 
-        // 2c. V2: Detect markers in issue_comment events for pipeline state transitions.
-        if let Some(comment_body) = event
+        // 2c. V2: Build prompt for Orchestrator subprocess.
+        // Detect markers and build ResumeMessage, or use raw event for new issues.
+        let orchestrator_prompt = if let Some(comment_body) = event
             .payload
             .pointer("/comment/body")
             .and_then(|v| v.as_str())
         {
             let markers = crate::markers::parse_markers(comment_body);
             let summary = crate::markers::extract_summary(comment_body);
-            for marker in &markers {
+            if let (Some(marker), Some(root)) = (markers.first(), root_issue) {
                 tracing::info!(
                     repo = %repo_name,
-                    root_issue = ?root_issue,
+                    root_issue = root,
                     marker = marker.marker_type.as_str(),
-                    "V2 marker detected: {:?}",
-                    marker.marker_type
+                    "Marker detected, building resume message"
                 );
-                // V2 TODO: When Orchestrator is fully Claude Code subprocess,
-                // build ResumeMessage here and resume the Orchestrator session.
-                // For now, markers are logged and the V1 orchestrator handles them.
+                let agent_type = event
+                    .payload
+                    .pointer("/comment/user/login")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let comment_url = event
+                    .payload
+                    .pointer("/comment/html_url")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let resume_msg = crate::resume_message::ResumeMessage::from_marker(
+                    root,
+                    marker,
+                    summary,
+                    agent_type,
+                    comment_url,
+                );
+                resume_msg.to_prompt()
+            } else {
+                // Comment without markers — might be human direction or external
+                let event_type = event
+                    .payload
+                    .get("_githubclaw_event_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 if let Some(root) = root_issue {
-                    let agent_type = event
-                        .payload
-                        .pointer("/comment/user/login")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let comment_url = event
-                        .payload
-                        .pointer("/comment/html_url")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let _resume_msg = crate::resume_message::ResumeMessage::from_marker(
+                    let resume_msg = crate::resume_message::ResumeMessage::from_human_comment(
                         root,
-                        marker,
-                        summary.clone(),
-                        agent_type,
-                        comment_url,
+                        comment_body,
+                        event.payload.pointer("/comment/html_url")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                     );
+                    resume_msg.to_prompt()
+                } else {
+                    format!(
+                        "[GithubClaw Event] type={}\n\n{}",
+                        event_type,
+                        serde_json::to_string_pretty(&event.payload).unwrap_or_default()
+                    )
                 }
             }
-        }
+        } else {
+            // Non-comment event (issues.opened, pull_request.*, check_run.*, etc.)
+            let event_type = event
+                .payload
+                .get("_githubclaw_event_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            if let Some(root) = root_issue {
+                let summary = event
+                    .payload
+                    .pointer("/issue/title")
+                    .or_else(|| event.payload.pointer("/pull_request/title"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let resume_msg = crate::resume_message::ResumeMessage::from_issue_event(
+                    root,
+                    event_type,
+                    summary,
+                );
+                resume_msg.to_prompt()
+            } else {
+                format!(
+                    "[GithubClaw Event] type={}\n\n{}",
+                    event_type,
+                    serde_json::to_string_pretty(&event.payload).unwrap_or_default()
+                )
+            }
+        };
 
         // 3. Check rate limiter before sending to orchestrator.
         if state.rate_limiter.is_orchestrator_paused() {
@@ -992,189 +1042,194 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             continue;
         }
 
-        // 4. Send event to orchestrator (in-process).
-        let event_json = serde_json::to_string(&event.payload).unwrap_or_default();
-
-        // Get or create the orchestrator session for this repo.
-        let response_text = {
-            let mut orchestrators = state.orchestrators.lock().await;
-            let registry = state.registry.read().await;
-            let session = orchestrators
-                .entry(repo_name.to_string())
-                .or_insert_with(|| {
-                    let entry = registry.get(repo_name).unwrap();
-                    OrchestratorSession::new(
-                        repo_name,
-                        &entry.local_path,
-                        state.orchestrator_backend.clone(),
-                        None,
-                        None,
-                    )
-                });
-            match session.process_event(&event_json).await {
-                Ok(text) => text,
-                Err(e) => {
-                    warn!(
-                        repo = %repo_name,
-                        seq = event.sequence,
-                        "Orchestrator failed to process event: {}. Will nack and retry.",
-                        e,
-                    );
-                    state.rate_limiter.report_orchestrator_rate_limit();
-                    // Drop the lock before sleeping.
-                    drop(orchestrators);
-                    nack_head_event(state, repo_name, &event.filename).await;
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    continue;
-                }
-            }
-        };
-
-        // 5. Parse the ActionList response.
-        let action_list = OrchestratorSession::extract_action_list(&response_text);
-        if let Err(e) = action_list.validate() {
-            warn!(
+        // 4. Check orchestrator capacity.
+        if !state
+            .process_manager
+            .has_capacity_for(crate::process_manager::ProcessKind::Orchestrator)
+            .await
+        {
+            tracing::info!(
                 repo = %repo_name,
-                seq = event.sequence,
-                "Invalid ActionList from orchestrator: {}",
-                e,
+                "Orchestrator capacity full, waiting..."
             );
-            nack_head_event(state, repo_name, &event.filename).await;
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             continue;
         }
 
-        // 6. Execute each action.
-        let mut all_ok = true;
-        let mut capacity_wait = false;
-        for action in &action_list.actions {
-            match action {
-                Action::Dispatch {
-                    agent_type,
-                    issue_ref,
-                    task_context,
-                } => {
-                    let dispatch = DispatchAction {
-                        agent_type: agent_type.clone(),
-                        issue_ref: issue_ref.clone(),
-                        task_context: task_context.clone(),
-                    };
-                    match execute_dispatch(state, &dispatch, &event.payload, repo_name).await {
-                        Ok(()) => {
-                            // Record in dispatch_log for orchestrator context
-                            let timestamp = chrono::Utc::now().format("%H:%M").to_string();
-                            let mut orchestrators = state.orchestrators.lock().await;
-                            if let Some(session) = orchestrators.get_mut(repo_name) {
-                                session.dispatch_log.push((
-                                    timestamp,
-                                    issue_ref.clone(),
-                                    agent_type.clone(),
-                                ));
+        // 5. V2: Spawn Orchestrator as Claude Code subprocess.
+        let issue_id = root_issue.unwrap_or(0);
+        let session_id = state
+            .session_store
+            .load(repo_name, issue_id)
+            .unwrap_or(None);
+
+        let registry = state.registry.read().await;
+        let repo_dir = match registry.get(repo_name) {
+            Some(entry) => entry.local_path.clone(),
+            None => {
+                error!(repo = %repo_name, "Repo not in registry");
+                nack_head_event(state, repo_name, &event.filename).await;
+                continue;
+            }
+        };
+        drop(registry);
+
+        // Build orchestrator command
+        let mut cmd_args = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            "--max-turns".to_string(),
+            "30".to_string(),
+        ];
+        if let Some(ref sid) = session_id {
+            cmd_args.push("--resume".to_string());
+            cmd_args.push(sid.clone());
+        }
+        cmd_args.push(orchestrator_prompt.clone());
+
+        // Build environment
+        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        if issue_id > 0 {
+            env.insert("GITHUBCLAW_ROOT_ISSUE".to_string(), issue_id.to_string());
+        }
+        env.insert("GITHUBCLAW_REPO".to_string(), repo_name.to_string());
+
+        // Inject gh wrapper PATH
+        let spawner = crate::agents::spawner::AgentSpawner::new(
+            &repo_dir,
+            crate::constants::DEFAULT_AGENT_MAX_TURNS,
+        );
+        // Load orchestrator agent def to get full env
+        let orch_def_content = std::fs::read_to_string(
+            std::path::Path::new(&repo_dir)
+                .join(".githubclaw/agents/orchestrator.md"),
+        )
+        .unwrap_or_else(|_| {
+            include_str!("../defaults/agents/orchestrator.md").to_string()
+        });
+        let tmp_agent_dir = std::env::temp_dir().join("githubclaw-orch");
+        let _ = std::fs::create_dir_all(&tmp_agent_dir);
+        let tmp_agent_file = tmp_agent_dir.join("orchestrator.md");
+        let _ = std::fs::write(&tmp_agent_file, &orch_def_content);
+        if let Ok(orch_def) = crate::agents::parser::parse_agent_file(&tmp_agent_file) {
+            // Write orchestrator prompt to temp file
+            let prompt_path = tmp_agent_dir.join("orch_prompt.md");
+            let _ = std::fs::write(&prompt_path, &orchestrator_prompt);
+            let full_env = spawner.build_env(&orch_def, &prompt_path, &orchestrator_prompt, Some(&env));
+            env = full_env;
+        }
+
+        info!(
+            repo = %repo_name,
+            issue = issue_id,
+            session = ?session_id,
+            "Spawning Orchestrator subprocess"
+        );
+
+        // Spawn orchestrator
+        let program = cmd_args[0].clone();
+        let args = cmd_args[1..].to_vec();
+        let repo_dir_clone = repo_dir.clone();
+        let process_manager = Arc::clone(&state.process_manager);
+        let rate_limiter = Arc::clone(&state.rate_limiter);
+        let _session_store_base = state.session_store.get_session_dir(repo_name, issue_id);
+        let repo_name_clone = repo_name.to_string();
+
+        match tokio::process::Command::new(&program)
+            .args(&args)
+            .envs(&env)
+            .current_dir(&repo_dir_clone)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let pid = child.id().unwrap_or(0);
+
+                // Register with process manager
+                state
+                    .process_manager
+                    .register(
+                        pid,
+                        crate::process_manager::ProcessKind::Orchestrator,
+                        repo_name,
+                        &format!("orchestrator-issue-{}", issue_id),
+                        crate::constants::DEFAULT_PROCESS_TIMEOUT_SECONDS,
+                    )
+                    .await;
+
+                // Monitor in background
+                tokio::spawn(async move {
+                    match child.wait().await {
+                        Ok(status) => {
+                            let exit_code = status.code().unwrap_or(-1);
+                            process_manager.report_exit(pid, exit_code).await;
+                            if exit_code != 0 {
+                                tracing::warn!(
+                                    repo = %repo_name_clone,
+                                    pid = pid,
+                                    exit_code = exit_code,
+                                    "Orchestrator exited with non-zero code"
+                                );
+                                rate_limiter.report_orchestrator_rate_limit();
+                            } else {
+                                tracing::info!(
+                                    repo = %repo_name_clone,
+                                    pid = pid,
+                                    "Orchestrator completed successfully"
+                                );
+                            }
+
+                            // Try to capture session ID from stdout for --resume
+                            if let Some(stdout) = child.stdout {
+                                use tokio::io::AsyncReadExt;
+                                let mut buf = String::new();
+                                let mut reader = tokio::io::BufReader::new(stdout);
+                                let _ = reader.read_to_string(&mut buf).await;
+                                // Session ID is typically in the output
+                                // For now, the session persistence is handled by
+                                // Claude Code's built-in session management
                             }
                         }
                         Err(e) => {
-                            if e.starts_with("CAPACITY_FULL:") {
-                                // Don't nack — just wait and retry later.
-                                info!(
-                                    repo = %repo_name,
-                                    agent_type = %agent_type,
-                                    "Concurrency full, will retry after slot frees up",
-                                );
-                                capacity_wait = true;
-                                break;
-                            }
-                            error!(
-                                repo = %repo_name,
-                                agent_type = %agent_type,
-                                "Dispatch failed: {}",
-                                e,
+                            tracing::error!(
+                                repo = %repo_name_clone,
+                                pid = pid,
+                                "Failed to wait on orchestrator: {}",
+                                e
                             );
-                            all_ok = false;
+                            process_manager.report_exit(pid, 1).await;
+                            rate_limiter.report_orchestrator_rate_limit();
                         }
                     }
-                }
-                Action::ScheduleEvent {
-                    event_id: _,
-                    trigger_at,
-                    repo,
-                    payload,
-                    context,
-                } => match chrono::DateTime::parse_from_rfc3339(trigger_at) {
-                    Ok(dt) => {
-                        let mut scheduler = state.scheduler.lock().await;
-                        let id = scheduler.create_event(
-                            repo,
-                            dt.with_timezone(&chrono::Utc),
-                            payload.clone(),
-                            true,
-                            None,
-                            context,
-                        );
-                        info!(
-                            repo = %repo_name,
-                            event_id = %id,
-                            trigger_at = %trigger_at,
-                            "Scheduled event created",
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            repo = %repo_name,
-                            "Invalid trigger_at '{}': {}",
-                            trigger_at,
-                            e,
-                        );
-                        all_ok = false;
-                    }
-                },
-                Action::CancelEvent { event_id } => {
-                    let mut scheduler = state.scheduler.lock().await;
-                    let cancelled = scheduler.cancel_event(event_id);
-                    if cancelled {
-                        info!(
-                            repo = %repo_name,
-                            event_id = %event_id,
-                            "Scheduled event cancelled",
-                        );
-                    } else {
-                        warn!(
-                            repo = %repo_name,
-                            event_id = %event_id,
-                            "Cancel requested but event not found",
-                        );
-                    }
-                }
-                Action::NoAction { reasoning } => {
-                    info!(
-                        repo = %repo_name,
-                        seq = event.sequence,
-                        "No action: {}",
-                        reasoning,
-                    );
-                }
+                });
+            }
+            Err(e) => {
+                error!(
+                    repo = %repo_name,
+                    "Failed to spawn orchestrator: {}",
+                    e,
+                );
+                state.rate_limiter.report_orchestrator_rate_limit();
+                nack_head_event(state, repo_name, &event.filename).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                continue;
             }
         }
 
-        // 7. Handle result.
-        if capacity_wait {
-            // Concurrency full — don't dequeue, don't nack. Just sleep and
-            // the event stays at the head of the queue for the next loop.
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-            continue;
-        }
-
-        if all_ok {
+        // 6. V2: Orchestrator subprocess spawned (fire-and-forget).
+        //    The Orchestrator handles dispatch via `githubclaw dispatch` CLI.
+        //    Dequeue the event — it's been handed off to the subprocess.
+        {
             let mut queues = state.queues.lock().await;
             let registry = registry_snapshot(state).await;
             if let Ok(q) =
                 get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
             {
                 if let Err(e) = q.dequeue() {
-                    error!(repo = %repo_name, "Failed to dequeue after success: {}", e);
+                    error!(repo = %repo_name, "Failed to dequeue after orchestrator spawn: {}", e);
                 }
             }
-        } else {
-            nack_head_event(state, repo_name, &event.filename).await;
         }
     }
 }

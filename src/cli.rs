@@ -1635,48 +1635,22 @@ fn cmd_tui() {
     // Create app state
     let mut app = crate::tui::App::new();
 
-    // Main loop
+    // Main loop — PTY sessions run inside the TUI (no suspend/resume)
     loop {
         terminal
             .draw(|f| crate::tui::ui::render(f, &app))
             .unwrap();
 
+        // Poll with shorter timeout when PTY is active (for responsive output)
+        let poll_ms = if app.interactive_session_active {
+            50
+        } else {
+            250
+        };
         if let Some(event) =
-            crate::tui::event::poll_event(Duration::from_millis(250))
+            crate::tui::event::poll_event(Duration::from_millis(poll_ms))
         {
             app.handle_event(event);
-        }
-
-        // Handle pending interactive session: suspend TUI, launch Claude Code
-        if let Some(issue_num) = app.pending_interactive_issue.take() {
-            // Suspend TUI
-            disable_raw_mode().unwrap();
-            execute!(terminal.backend_mut(), LeaveAlternateScreen).unwrap();
-
-            println!(
-                "\nLaunching interactive session for issue #{} ...\n",
-                issue_num
-            );
-
-            // Spawn Claude Code interactively (not --print mode)
-            let status = Command::new("claude")
-                .args(["--resume", &format!("githubclaw-issue-{}", issue_num)])
-                .status();
-
-            match status {
-                Ok(s) => {
-                    if !s.success() {
-                        eprintln!("Claude Code exited with code {:?}", s.code());
-                    }
-                }
-                Err(e) => eprintln!("Failed to launch Claude Code: {}", e),
-            }
-
-            // Resume TUI
-            enable_raw_mode().unwrap();
-            execute!(io::stdout(), EnterAlternateScreen).unwrap();
-            terminal = Terminal::new(CrosstermBackend::new(io::stdout())).unwrap();
-            app.interactive_session_active = false;
         }
 
         if app.should_quit {

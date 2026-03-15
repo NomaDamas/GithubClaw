@@ -108,18 +108,39 @@ fn render_issue_request_tab(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, chunks[0]);
 
     // Right: Interactive session area
-    let session_content = if app.interactive_session_active {
-        "Interactive session active.\nClaude Code / Codex session running.\n\nPress Esc to return to issue list."
-    } else if app.issue_requests.is_empty() {
-        "No issues awaiting interactive session.\n\nBugs are auto-processed.\nFeature/Refactoring issues will appear here\nafter Vision-gap Analyst completes analysis."
+    let session_title = if app.interactive_session_active {
+        " Interactive Session (Esc to exit) "
     } else {
-        "Select an issue and press Enter to start\nan interactive session with the Orchestrator.\n\nCtrl+A: Approve  Ctrl+R: Reject"
+        " Interactive Session "
+    };
+
+    let session_content = if app.interactive_session_active {
+        if app.pty_output.is_empty() {
+            "Starting Claude Code session...".to_string()
+        } else {
+            // Show last N lines that fit the panel
+            let available_height = chunks[1].height.saturating_sub(2) as usize;
+            let lines: Vec<&str> = app.pty_output.lines().collect();
+            let start = lines.len().saturating_sub(available_height);
+            lines[start..].join("\n")
+        }
+    } else if app.issue_requests.is_empty() {
+        "No issues awaiting interactive session.\n\n\
+         Bugs are auto-processed.\n\
+         Feature/Refactoring issues will appear here\n\
+         after Vision-gap Analyst completes analysis."
+            .to_string()
+    } else {
+        "Select an issue and press Enter to start\n\
+         an interactive session with the Orchestrator.\n\n\
+         Ctrl+A: Approve  Ctrl+R: Reject"
+            .to_string()
     };
 
     let session = Paragraph::new(session_content).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Interactive Session "),
+            .title(session_title),
     );
     f.render_widget(session, chunks[1]);
 }

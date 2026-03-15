@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod event;
+pub mod pty;
 pub mod tabs;
 pub mod ui;
 
