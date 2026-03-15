@@ -40,31 +40,14 @@ cat "${PROMPT_FILE}" | codex exec - \
 const DEFAULT_GITIGNORE: &str = "secrets/\nqueue/\nlogs/\nmemory.md\n";
 const DEFAULT_REPO_CONFIG_YAML: &str = "# GithubClaw per-repo configuration.\n# See https://github.com/GithubClaw/githubclaw for options.\n";
 
-// Agent definitions — embedded from defaults/agents/*.md at compile time.
-const DEFAULT_AGENT_CS: &str = include_str!("../defaults/agents/cs.md");
-const DEFAULT_AGENT_BUG_TRACKER: &str = include_str!("../defaults/agents/bug_tracker.md");
-const DEFAULT_AGENT_LIBRARIAN: &str = include_str!("../defaults/agents/librarian.md");
-const DEFAULT_AGENT_PROJECT_MANAGER: &str = include_str!("../defaults/agents/project_manager.md");
-const DEFAULT_AGENT_CODER: &str = include_str!("../defaults/agents/coder.md");
-const DEFAULT_AGENT_QA: &str = include_str!("../defaults/agents/qa.md");
+// Agent definitions — 6 V2 agents embedded at compile time.
+const DEFAULT_AGENT_ORCHESTRATOR: &str = include_str!("../defaults/agents/orchestrator.md");
+const DEFAULT_AGENT_IMPLEMENTER: &str = include_str!("../defaults/agents/implementer.md");
+const DEFAULT_AGENT_VERIFIER: &str = include_str!("../defaults/agents/verifier.md");
 const DEFAULT_AGENT_REVIEWER: &str = include_str!("../defaults/agents/reviewer.md");
-const DEFAULT_AGENT_CONTENTS_MARKETER: &str =
-    include_str!("../defaults/agents/contents_marketer.md");
-const DEFAULT_AGENT_VISIONARY: &str = include_str!("../defaults/agents/visionary.md");
-const DEFAULT_AGENT_SECURITY_REVIEWER: &str =
-    include_str!("../defaults/agents/security_reviewer.md");
-
-// V2 agent definitions
-const DEFAULT_V2_AGENT_ORCHESTRATOR: &str =
-    include_str!("../defaults/agents_v2/orchestrator.md");
-const DEFAULT_V2_AGENT_IMPLEMENTER: &str =
-    include_str!("../defaults/agents_v2/implementer.md");
-const DEFAULT_V2_AGENT_VERIFIER: &str = include_str!("../defaults/agents_v2/verifier.md");
-const DEFAULT_V2_AGENT_REVIEWER: &str = include_str!("../defaults/agents_v2/reviewer.md");
-const DEFAULT_V2_AGENT_VISION_GAP_ANALYST: &str =
-    include_str!("../defaults/agents_v2/vision_gap_analyst.md");
-const DEFAULT_V2_AGENT_BUG_REPRODUCER: &str =
-    include_str!("../defaults/agents_v2/bug_reproducer.md");
+const DEFAULT_AGENT_VISION_GAP_ANALYST: &str =
+    include_str!("../defaults/agents/vision_gap_analyst.md");
+const DEFAULT_AGENT_BUG_REPRODUCER: &str = include_str!("../defaults/agents/bug_reproducer.md");
 
 // ---------------------------------------------------------------------------
 // Launchd / systemd constants
@@ -211,25 +194,18 @@ fn cmd_init() {
         (claw_dir.join("spawn_codex.sh"), DEFAULT_SPAWN_CODEX_SH),
         (claw_dir.join(".gitignore"), DEFAULT_GITIGNORE),
         (claw_dir.join("config.yaml"), DEFAULT_REPO_CONFIG_YAML),
-        // Agent definition files (all 10 agents)
-        (agents_dir.join("cs.md"), DEFAULT_AGENT_CS),
-        (agents_dir.join("bug_tracker.md"), DEFAULT_AGENT_BUG_TRACKER),
-        (agents_dir.join("librarian.md"), DEFAULT_AGENT_LIBRARIAN),
-        (
-            agents_dir.join("project_manager.md"),
-            DEFAULT_AGENT_PROJECT_MANAGER,
-        ),
-        (agents_dir.join("coder.md"), DEFAULT_AGENT_CODER),
-        (agents_dir.join("qa.md"), DEFAULT_AGENT_QA),
+        // Agent definition files (6 V2 agents)
+        (agents_dir.join("orchestrator.md"), DEFAULT_AGENT_ORCHESTRATOR),
+        (agents_dir.join("implementer.md"), DEFAULT_AGENT_IMPLEMENTER),
+        (agents_dir.join("verifier.md"), DEFAULT_AGENT_VERIFIER),
         (agents_dir.join("reviewer.md"), DEFAULT_AGENT_REVIEWER),
         (
-            agents_dir.join("contents_marketer.md"),
-            DEFAULT_AGENT_CONTENTS_MARKETER,
+            agents_dir.join("vision_gap_analyst.md"),
+            DEFAULT_AGENT_VISION_GAP_ANALYST,
         ),
-        (agents_dir.join("visionary.md"), DEFAULT_AGENT_VISIONARY),
         (
-            agents_dir.join("security_reviewer.md"),
-            DEFAULT_AGENT_SECURITY_REVIEWER,
+            agents_dir.join("bug_reproducer.md"),
+            DEFAULT_AGENT_BUG_REPRODUCER,
         ),
     ];
 
@@ -1497,12 +1473,12 @@ fn load_v2_agent_definition(agent_type: &str, repo_root: &Path) -> String {
 
     // Fall back to embedded defaults
     match agent_type {
-        "orchestrator" => DEFAULT_V2_AGENT_ORCHESTRATOR.to_string(),
-        "implementer" => DEFAULT_V2_AGENT_IMPLEMENTER.to_string(),
-        "verifier" => DEFAULT_V2_AGENT_VERIFIER.to_string(),
-        "reviewer" => DEFAULT_V2_AGENT_REVIEWER.to_string(),
-        "vision-gap-analyst" => DEFAULT_V2_AGENT_VISION_GAP_ANALYST.to_string(),
-        "bug-reproducer" => DEFAULT_V2_AGENT_BUG_REPRODUCER.to_string(),
+        "orchestrator" => DEFAULT_AGENT_ORCHESTRATOR.to_string(),
+        "implementer" => DEFAULT_AGENT_IMPLEMENTER.to_string(),
+        "verifier" => DEFAULT_AGENT_VERIFIER.to_string(),
+        "reviewer" => DEFAULT_AGENT_REVIEWER.to_string(),
+        "vision-gap-analyst" => DEFAULT_AGENT_VISION_GAP_ANALYST.to_string(),
+        "bug-reproducer" => DEFAULT_AGENT_BUG_REPRODUCER.to_string(),
         _ => {
             eprintln!("Error: no embedded definition for agent type '{}'", agent_type);
             std::process::exit(1);
