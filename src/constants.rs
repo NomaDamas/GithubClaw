@@ -1,5 +1,7 @@
 // Server
 pub const DEFAULT_MAX_CONCURRENT_AGENTS: usize = 8;
+pub const DEFAULT_MAX_CONCURRENT_ORCHESTRATORS: usize = 4;
+pub const DEFAULT_MAX_CONCURRENT_WORKERS: usize = 8;
 pub const GRACEFUL_DRAIN_TIMEOUT_SECONDS: f64 = 120.0;
 
 // Process manager

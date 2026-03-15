@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::constants::{
     DEFAULT_CONFIG_DRAIN_TIMEOUT_SECONDS, DEFAULT_CONFIG_MAX_CONCURRENT_AGENTS,
     DEFAULT_CONFIG_MAX_RETRY, DEFAULT_GLOBAL_TIMEOUT_SECONDS,
+    DEFAULT_MAX_CONCURRENT_ORCHESTRATORS, DEFAULT_MAX_CONCURRENT_WORKERS,
     DEFAULT_ORCHESTRATOR_IDLE_TIMEOUT_SECONDS, DEFAULT_RECOVERY_PROBE_INTERVAL_SECONDS,
     DEFAULT_SERVER_PORT,
 };
@@ -119,6 +120,20 @@ pub struct GlobalConfig {
 
     #[serde(default = "default_event_subscription")]
     pub event_subscription: Vec<String>,
+
+    // V2: Separate concurrency limits
+    #[serde(default = "default_max_orchestrators")]
+    pub max_concurrent_orchestrators: usize,
+
+    #[serde(default = "default_max_workers")]
+    pub max_concurrent_workers: usize,
+}
+
+fn default_max_orchestrators() -> usize {
+    DEFAULT_MAX_CONCURRENT_ORCHESTRATORS
+}
+fn default_max_workers() -> usize {
+    DEFAULT_MAX_CONCURRENT_WORKERS
 }
 
 impl Default for GlobalConfig {
@@ -133,6 +148,8 @@ impl Default for GlobalConfig {
             recovery_probe_interval: DEFAULT_RECOVERY_PROBE_INTERVAL_SECONDS,
             max_retry: DEFAULT_CONFIG_MAX_RETRY,
             event_subscription: default_event_subscription(),
+            max_concurrent_orchestrators: DEFAULT_MAX_CONCURRENT_ORCHESTRATORS,
+            max_concurrent_workers: DEFAULT_MAX_CONCURRENT_WORKERS,
         }
     }
 }
@@ -198,6 +215,20 @@ impl GlobalConfig {
                 .unwrap_or(defaults.max_retry),
             event_subscription: get_flat_string_list(&raw, "event_subscription")
                 .unwrap_or_else(default_event_subscription),
+            max_concurrent_orchestrators: get_flat_or_nested_u64(
+                &raw,
+                "max_concurrent_orchestrators",
+                &["process", "max_concurrent_orchestrators"],
+            )
+            .map(|v| v as usize)
+            .unwrap_or(defaults.max_concurrent_orchestrators),
+            max_concurrent_workers: get_flat_or_nested_u64(
+                &raw,
+                "max_concurrent_workers",
+                &["process", "max_concurrent_workers"],
+            )
+            .map(|v| v as usize)
+            .unwrap_or(defaults.max_concurrent_workers),
         };
 
         config.validate();

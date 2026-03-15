@@ -97,8 +97,12 @@ pub fn check_fork_pr_gate(event_payload: &serde_json::Value, agent_type: &str) -
 ///
 /// Provides spawn, monitor, idle-timeout, concurrency throttle, graceful
 /// drain, and force kill capabilities.
+///
+/// V2: Separate concurrency limits for orchestrators and workers.
 pub struct ProcessManager {
     pub max_concurrent_agents: usize,
+    pub max_concurrent_orchestrators: usize,
+    pub max_concurrent_workers: usize,
     processes: Arc<Mutex<HashMap<u32, ManagedProcess>>>,
 }
 
@@ -107,6 +111,18 @@ impl ProcessManager {
     pub fn new(max_concurrent_agents: usize) -> Self {
         Self {
             max_concurrent_agents,
+            max_concurrent_orchestrators: 4,
+            max_concurrent_workers: max_concurrent_agents,
+            processes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Create a new `ProcessManager` with separate limits.
+    pub fn with_limits(max_orchestrators: usize, max_workers: usize) -> Self {
+        Self {
+            max_concurrent_agents: max_orchestrators + max_workers,
+            max_concurrent_orchestrators: max_orchestrators,
+            max_concurrent_workers: max_workers,
             processes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -120,9 +136,39 @@ impl ProcessManager {
             .count()
     }
 
-    /// Whether there is at least one free concurrency slot.
+    /// Number of running orchestrators.
+    pub async fn active_orchestrator_count(&self) -> usize {
+        let procs = self.processes.lock().await;
+        procs
+            .values()
+            .filter(|p| p.state == ProcessState::Running && p.kind == ProcessKind::Orchestrator)
+            .count()
+    }
+
+    /// Number of running workers.
+    pub async fn active_worker_count(&self) -> usize {
+        let procs = self.processes.lock().await;
+        procs
+            .values()
+            .filter(|p| p.state == ProcessState::Running && p.kind == ProcessKind::Worker)
+            .count()
+    }
+
+    /// Whether there is at least one free concurrency slot (legacy, checks total).
     pub async fn has_capacity(&self) -> bool {
         self.active_count().await < self.max_concurrent_agents
+    }
+
+    /// Whether there is a free slot for a specific process kind.
+    pub async fn has_capacity_for(&self, kind: ProcessKind) -> bool {
+        match kind {
+            ProcessKind::Orchestrator => {
+                self.active_orchestrator_count().await < self.max_concurrent_orchestrators
+            }
+            ProcessKind::Worker => {
+                self.active_worker_count().await < self.max_concurrent_workers
+            }
+        }
     }
 
     /// Return a snapshot of all process PIDs and their states.

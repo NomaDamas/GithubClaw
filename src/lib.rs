@@ -4,6 +4,7 @@ pub mod config;
 pub mod constants;
 pub mod errors;
 pub mod hosted_proxy;
+pub mod issue_router;
 pub mod markers;
 pub mod orchestrator;
 pub mod pipeline;
