@@ -9,6 +9,7 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
@@ -36,15 +37,19 @@ impl MarkerType {
             Self::Stuck => "stuck",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for MarkerType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "approved" => Some(Self::Approved),
-            "reproduced" => Some(Self::Reproduced),
-            "reviewed" => Some(Self::Reviewed),
-            "verified" => Some(Self::Verified),
-            "stuck" => Some(Self::Stuck),
-            _ => None,
+            "approved" => Ok(Self::Approved),
+            "reproduced" => Ok(Self::Reproduced),
+            "reviewed" => Ok(Self::Reviewed),
+            "verified" => Ok(Self::Verified),
+            "stuck" => Ok(Self::Stuck),
+            _ => Err(()),
         }
     }
 }
@@ -64,24 +69,16 @@ pub struct ParsedMarker {
 // Regex patterns (compiled once)
 // ---------------------------------------------------------------------------
 
-static MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<!--\s*githubclaw:(\w+)((?:\s+\w+=\S+)*)\s*-->").unwrap()
-});
+static MARKER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<!--\s*githubclaw:(\w+)((?:\s+\w+=\S+)*)\s*-->").unwrap());
 
-static ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(\w+)=(\S+)").unwrap()
-});
+static ATTR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\w+)=(\S+)").unwrap());
 
 static SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?s)<!--\s*githubclaw:summary\s*-->(.*?)<!--\s*/githubclaw:summary\s*-->"
-    )
-    .unwrap()
+    Regex::new(r"(?s)<!--\s*githubclaw:summary\s*-->(.*?)<!--\s*/githubclaw:summary\s*-->").unwrap()
 });
 
-static REF_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"ref\s+#(\d+)").unwrap()
-});
+static REF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"ref\s+#(\d+)").unwrap());
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -97,7 +94,7 @@ pub fn parse_markers(comment_body: &str) -> Vec<ParsedMarker> {
         let marker_str = &cap[1];
         let attrs_str = cap.get(2).map(|m| m.as_str()).unwrap_or("");
 
-        if let Some(marker_type) = MarkerType::from_str(marker_str) {
+        if let Ok(marker_type) = marker_str.parse::<MarkerType>() {
             let mut attributes = HashMap::new();
             for attr_cap in ATTR_RE.captures_iter(attrs_str) {
                 attributes.insert(attr_cap[1].to_string(), attr_cap[2].to_string());
@@ -313,7 +310,7 @@ mod tests {
             MarkerType::Stuck,
         ];
         for mt in types {
-            assert_eq!(MarkerType::from_str(mt.as_str()), Some(mt));
+            assert_eq!(mt.as_str().parse::<MarkerType>().ok(), Some(mt));
         }
     }
 

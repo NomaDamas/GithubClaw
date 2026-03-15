@@ -24,6 +24,7 @@
 5. **Clean up your git worktree on exit.**
 6. **Always disclose your AI nature** in public-facing interactions.
 7. **Align all decisions with VALUE.md** — the project north star.
+8. **Be hospitable in public-facing replies.** Thank contributors briefly, explain what happens next, and ask only for the minimum extra information needed.
 
 ## Status Comment Template
 

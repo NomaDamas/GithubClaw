@@ -104,9 +104,7 @@ impl IssueRouter {
         match event_type {
             // Direct: issues.* → issue.number is the candidate
             "issues" => {
-                let issue_number = event
-                    .pointer("/issue/number")
-                    .and_then(|v| v.as_u64());
+                let issue_number = event.pointer("/issue/number").and_then(|v| v.as_u64());
 
                 if let Some(num) = issue_number {
                     // Check if this issue's body has a ref #N (sub-issue)
@@ -126,9 +124,7 @@ impl IssueRouter {
 
             // issue_comment.* → issue.number + check ref in body
             "issue_comment" => {
-                let issue_number = event
-                    .pointer("/issue/number")
-                    .and_then(|v| v.as_u64());
+                let issue_number = event.pointer("/issue/number").and_then(|v| v.as_u64());
 
                 // First try ref #N in comment body (agent-generated comments)
                 let comment_body = event

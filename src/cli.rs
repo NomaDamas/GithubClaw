@@ -195,7 +195,10 @@ fn cmd_init() {
         (claw_dir.join(".gitignore"), DEFAULT_GITIGNORE),
         (claw_dir.join("config.yaml"), DEFAULT_REPO_CONFIG_YAML),
         // Agent definition files (6 V2 agents)
-        (agents_dir.join("orchestrator.md"), DEFAULT_AGENT_ORCHESTRATOR),
+        (
+            agents_dir.join("orchestrator.md"),
+            DEFAULT_AGENT_ORCHESTRATOR,
+        ),
         (agents_dir.join("implementer.md"), DEFAULT_AGENT_IMPLEMENTER),
         (agents_dir.join("verifier.md"), DEFAULT_AGENT_VERIFIER),
         (agents_dir.join("reviewer.md"), DEFAULT_AGENT_REVIEWER),
@@ -359,9 +362,7 @@ fn cmd_bootstrap() {
             scheduler: Mutex::new(ScheduledEventManager::new(&scheduler_path)),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            issue_router: crate::issue_router::IssueRouter::new(
-                global_dir.join("sessions"),
-            ),
+            issue_router: crate::issue_router::IssueRouter::new(global_dir.join("sessions")),
             session_store: crate::session_store::SessionStore::new(),
         });
 
@@ -912,9 +913,7 @@ fn cmd_serve(host: &str, port: u16) {
             scheduler: Mutex::new(scheduler),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            issue_router: crate::issue_router::IssueRouter::new(
-                global_dir.join("sessions"),
-            ),
+            issue_router: crate::issue_router::IssueRouter::new(global_dir.join("sessions")),
             session_store: crate::session_store::SessionStore::new(),
         });
 
@@ -1489,7 +1488,10 @@ fn load_v2_agent_definition(agent_type: &str, repo_root: &Path) -> String {
         "vision-gap-analyst" => DEFAULT_AGENT_VISION_GAP_ANALYST.to_string(),
         "bug-reproducer" => DEFAULT_AGENT_BUG_REPRODUCER.to_string(),
         _ => {
-            eprintln!("Error: no embedded definition for agent type '{}'", agent_type);
+            eprintln!(
+                "Error: no embedded definition for agent type '{}'",
+                agent_type
+            );
             std::process::exit(1);
         }
     }
@@ -1633,9 +1635,7 @@ fn cmd_tui() {
 
     // Main loop — PTY sessions run inside the TUI (no suspend/resume)
     loop {
-        terminal
-            .draw(|f| crate::tui::ui::render(f, &app))
-            .unwrap();
+        terminal.draw(|f| crate::tui::ui::render(f, &app)).unwrap();
 
         // Poll with shorter timeout when PTY is active (for responsive output)
         let poll_ms = if app.interactive_session_active {
@@ -1643,9 +1643,7 @@ fn cmd_tui() {
         } else {
             250
         };
-        if let Some(event) =
-            crate::tui::event::poll_event(Duration::from_millis(poll_ms))
-        {
+        if let Some(event) = crate::tui::event::poll_event(Duration::from_millis(poll_ms)) {
             app.handle_event(event);
         }
 

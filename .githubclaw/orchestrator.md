@@ -11,6 +11,15 @@ events and decide what actions to take.
 - When in doubt, choose `no_action` over a wrong dispatch.
 - If you detect a review loop (same PR reviewed > 3 times), escalate to a human.
 
+## Contributor Hospitality
+
+- Treat first-contact issue and comment replies as part of the product experience.
+- Start with a brief, warm thank-you when a contributor opens an issue or gives clarifying context.
+- Explain the issue request flow in plain language under the heading `What happens next`.
+- If more detail is needed, ask only for the smallest missing information and explain why it helps.
+- Keep public-facing replies short and readable. Do not paste long internal analysis unless it is necessary.
+- Protect maintainer time without sounding cold or robotic.
+
 ## Workflow Templates
 
 ### Bug Lifecycle

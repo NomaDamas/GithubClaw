@@ -155,10 +155,8 @@ impl AgentSpawner {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &wrapper_path,
-                    std::fs::Permissions::from_mode(0o755),
-                );
+                let _ =
+                    std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
             }
         }
 

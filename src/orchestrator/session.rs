@@ -493,9 +493,7 @@ impl OrchestratorSession {
     }
 
     /// Load prior dispatch log from persisted state.
-    pub fn load_persisted_dispatch_log(
-        persistence_dir: &Path,
-    ) -> Vec<(String, String, String)> {
+    pub fn load_persisted_dispatch_log(persistence_dir: &Path) -> Vec<(String, String, String)> {
         let state_path = persistence_dir.join("session_state.json");
         let data = match std::fs::read_to_string(&state_path) {
             Ok(d) => d,

@@ -6,8 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::constants::{
-    BUG_REPRODUCER_MAX_INFO_REQUESTS, IMPLEMENTER_REVIEWER_MAX_LOOP,
-    IMPLEMENTER_VERIFIER_MAX_LOOP,
+    BUG_REPRODUCER_MAX_INFO_REQUESTS, IMPLEMENTER_REVIEWER_MAX_LOOP, IMPLEMENTER_VERIFIER_MAX_LOOP,
 };
 use crate::markers::MarkerType;
 
@@ -91,11 +90,18 @@ impl PipelineTracker {
     }
 
     /// Process a marker event and return the next action to take.
-    pub fn on_marker(&mut self, marker: &MarkerType, attrs: &std::collections::HashMap<String, String>) -> PipelineAction {
+    pub fn on_marker(
+        &mut self,
+        marker: &MarkerType,
+        attrs: &std::collections::HashMap<String, String>,
+    ) -> PipelineAction {
         match (&self.state, marker) {
             // Bug: reproduced=true → auto-approve
             (PipelineState::Reproducing, MarkerType::Reproduced) => {
-                let reproduced = attrs.get("reproduced").map(|v| v == "true").unwrap_or(false);
+                let reproduced = attrs
+                    .get("reproduced")
+                    .map(|v| v == "true")
+                    .unwrap_or(false);
                 if reproduced {
                     self.state = PipelineState::Approved;
                     PipelineAction::PostMarker(MarkerType::Approved)
@@ -111,23 +117,23 @@ impl PipelineTracker {
                         };
                         PipelineAction::CloseIssue("Could not reproduce after 3 attempts.".into())
                     } else {
-                        self.state = PipelineState::AwaitingInfo { attempts: new_attempts };
+                        self.state = PipelineState::AwaitingInfo {
+                            attempts: new_attempts,
+                        };
                         PipelineAction::RequestInfo
                     }
                 }
             }
 
             // Approved → start implementation (decompose first)
-            (PipelineState::Approved, MarkerType::Approved) |
-            (PipelineState::AwaitingInteractiveSession, MarkerType::Approved) => {
+            (PipelineState::Approved, MarkerType::Approved)
+            | (PipelineState::AwaitingInteractiveSession, MarkerType::Approved) => {
                 self.state = PipelineState::Decomposing;
                 PipelineAction::Decompose
             }
 
             // After decomposition, start first sub-issue: write tests
-            (PipelineState::Decomposing, _) => {
-                self.advance_to_next_sub_issue()
-            }
+            (PipelineState::Decomposing, _) => self.advance_to_next_sub_issue(),
 
             // Reviewed → next sub-issue or e2e
             (PipelineState::Reviewing { .. }, MarkerType::Reviewed) => {
@@ -161,7 +167,10 @@ impl PipelineTracker {
                 let att = *attempt;
                 if tests_passed {
                     // Move to review
-                    self.state = PipelineState::Reviewing { sub_issue: sub, attempt: 1 };
+                    self.state = PipelineState::Reviewing {
+                        sub_issue: sub,
+                        attempt: 1,
+                    };
                     PipelineAction::DispatchReviewer(sub)
                 } else if att >= IMPLEMENTER_VERIFIER_MAX_LOOP {
                     self.state = PipelineState::Stuck {
@@ -172,7 +181,10 @@ impl PipelineTracker {
                         IMPLEMENTER_VERIFIER_MAX_LOOP, sub
                     ))
                 } else {
-                    self.state = PipelineState::Implementing { sub_issue: sub, attempt: att + 1 };
+                    self.state = PipelineState::Implementing {
+                        sub_issue: sub,
+                        attempt: att + 1,
+                    };
                     PipelineAction::DispatchImplementer(sub)
                 }
             }
@@ -192,7 +204,10 @@ impl PipelineTracker {
                     self.advance_to_next_sub_issue()
                 } else if att >= IMPLEMENTER_REVIEWER_MAX_LOOP {
                     self.state = PipelineState::Stuck {
-                        reason: format!("Review loop exceeded {} rounds for sub-issue #{}", att, sub),
+                        reason: format!(
+                            "Review loop exceeded {} rounds for sub-issue #{}",
+                            att, sub
+                        ),
                     };
                     PipelineAction::PostStuck(format!(
                         "Reviewer-Implementer loop exceeded {} iterations for sub-issue #{}",
@@ -200,7 +215,10 @@ impl PipelineTracker {
                     ))
                 } else {
                     // Back to implementer for fixes
-                    self.state = PipelineState::Implementing { sub_issue: sub, attempt: att + 1 };
+                    self.state = PipelineState::Implementing {
+                        sub_issue: sub,
+                        attempt: att + 1,
+                    };
                     PipelineAction::DispatchImplementer(sub)
                 }
             }
@@ -239,7 +257,10 @@ impl PipelineTracker {
     pub fn on_human_direction(&mut self) -> PipelineAction {
         // Reset to implementing the current sub-issue with counter reset
         if let Some(&sub) = self.sub_issues.get(self.current_sub_issue_index) {
-            self.state = PipelineState::Implementing { sub_issue: sub, attempt: 1 };
+            self.state = PipelineState::Implementing {
+                sub_issue: sub,
+                attempt: 1,
+            };
             PipelineAction::DispatchImplementer(sub)
         } else {
             PipelineAction::None
@@ -362,7 +383,10 @@ mod tests {
         attrs.insert("reproduced".into(), "false".into());
         let action = t.on_marker(&MarkerType::Reproduced, &attrs);
 
-        assert!(matches!(t.state, PipelineState::AwaitingInfo { attempts: 1 }));
+        assert!(matches!(
+            t.state,
+            PipelineState::AwaitingInfo { attempts: 1 }
+        ));
         assert_eq!(action, PipelineAction::RequestInfo);
     }
 
@@ -396,13 +420,22 @@ mod tests {
         // Advance from decomposing to first sub-issue
         let action = t.advance_to_next_sub_issue();
         assert_eq!(action, PipelineAction::DispatchVerifierTests(100));
-        assert!(matches!(t.state, PipelineState::WritingTests { sub_issue: 100 }));
+        assert!(matches!(
+            t.state,
+            PipelineState::WritingTests { sub_issue: 100 }
+        ));
 
         // Tests written, now implementing
-        t.state = PipelineState::Implementing { sub_issue: 100, attempt: 1 };
+        t.state = PipelineState::Implementing {
+            sub_issue: 100,
+            attempt: 1,
+        };
         let action = t.on_implementer_done(true);
         assert_eq!(action, PipelineAction::DispatchReviewer(100));
-        assert!(matches!(t.state, PipelineState::Reviewing { sub_issue: 100, .. }));
+        assert!(matches!(
+            t.state,
+            PipelineState::Reviewing { sub_issue: 100, .. }
+        ));
 
         // Review passed → next sub-issue
         let action = t.on_review_done(true);
@@ -415,7 +448,10 @@ mod tests {
         let mut t = PipelineTracker::new(1);
         t.set_sub_issues(vec![100]);
         t.current_sub_issue_index = 0;
-        t.state = PipelineState::Reviewing { sub_issue: 100, attempt: 1 };
+        t.state = PipelineState::Reviewing {
+            sub_issue: 100,
+            attempt: 1,
+        };
 
         let action = t.on_review_done(true);
         assert_eq!(t.state, PipelineState::VerifyingE2e);
@@ -462,7 +498,10 @@ mod tests {
     #[test]
     fn stuck_marker_transitions() {
         let mut t = PipelineTracker::new(1);
-        t.state = PipelineState::Implementing { sub_issue: 100, attempt: 5 };
+        t.state = PipelineState::Implementing {
+            sub_issue: 100,
+            attempt: 5,
+        };
         let action = t.on_marker(&MarkerType::Stuck, &HashMap::new());
         assert!(matches!(t.state, PipelineState::Stuck { .. }));
         assert_eq!(action, PipelineAction::WaitForHuman);
@@ -474,10 +513,18 @@ mod tests {
         let mut t = PipelineTracker::new(1);
         t.set_sub_issues(vec![100, 101]);
         t.current_sub_issue_index = 0;
-        t.state = PipelineState::Stuck { reason: "test".into() };
+        t.state = PipelineState::Stuck {
+            reason: "test".into(),
+        };
 
         let action = t.on_human_direction();
-        assert!(matches!(t.state, PipelineState::Implementing { sub_issue: 100, attempt: 1 }));
+        assert!(matches!(
+            t.state,
+            PipelineState::Implementing {
+                sub_issue: 100,
+                attempt: 1
+            }
+        ));
         assert_eq!(action, PipelineAction::DispatchImplementer(100));
     }
 
@@ -521,10 +568,19 @@ mod tests {
     fn review_fail_loops_to_implementer() {
         let mut t = PipelineTracker::new(1);
         t.set_sub_issues(vec![100]);
-        t.state = PipelineState::Reviewing { sub_issue: 100, attempt: 3 };
+        t.state = PipelineState::Reviewing {
+            sub_issue: 100,
+            attempt: 3,
+        };
 
         let action = t.on_review_done(false);
-        assert!(matches!(t.state, PipelineState::Implementing { sub_issue: 100, attempt: 4 }));
+        assert!(matches!(
+            t.state,
+            PipelineState::Implementing {
+                sub_issue: 100,
+                attempt: 4
+            }
+        ));
         assert_eq!(action, PipelineAction::DispatchImplementer(100));
     }
 }

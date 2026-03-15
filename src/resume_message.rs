@@ -91,13 +91,9 @@ impl ResumeMessage {
     }
 
     /// Build a resume message from a human comment (e.g., stuck recovery).
-    pub fn from_human_comment(
-        issue: u64,
-        comment_body: &str,
-        comment_url: Option<String>,
-    ) -> Self {
-        let summary = markers::extract_summary(comment_body)
-            .unwrap_or_else(|| comment_body.to_string());
+    pub fn from_human_comment(issue: u64, comment_body: &str, comment_url: Option<String>) -> Self {
+        let summary =
+            markers::extract_summary(comment_body).unwrap_or_else(|| comment_body.to_string());
         Self {
             event_type: ResumeEventType::HumanComment,
             marker: None,
@@ -222,7 +218,8 @@ mod tests {
             marker_type: MarkerType::Reproduced,
             attributes: attrs,
         };
-        let msg = ResumeMessage::from_marker(42, &marker, None, Some("bug-reproducer".into()), None);
+        let msg =
+            ResumeMessage::from_marker(42, &marker, None, Some("bug-reproducer".into()), None);
         assert_eq!(msg.marker_attributes["reproduced"], "true");
     }
 

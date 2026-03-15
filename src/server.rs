@@ -990,7 +990,9 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                     let resume_msg = crate::resume_message::ResumeMessage::from_human_comment(
                         root,
                         comment_body,
-                        event.payload.pointer("/comment/html_url")
+                        event
+                            .payload
+                            .pointer("/comment/html_url")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
                     );
@@ -1018,9 +1020,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
                 let resume_msg = crate::resume_message::ResumeMessage::from_issue_event(
-                    root,
-                    event_type,
-                    summary,
+                    root, event_type, summary,
                 );
                 resume_msg.to_prompt()
             } else {
@@ -1070,7 +1070,8 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         // Write prompt to temp file to avoid CLI arg length limits
         let prompt_tmp_dir = std::env::temp_dir().join("githubclaw-orch-prompts");
         let _ = std::fs::create_dir_all(&prompt_tmp_dir);
-        let prompt_file = prompt_tmp_dir.join(format!("{}-{}.txt", repo_name.replace('/', "_"), issue_id));
+        let prompt_file =
+            prompt_tmp_dir.join(format!("{}-{}.txt", repo_name.replace('/', "_"), issue_id));
         if let Err(e) = std::fs::write(&prompt_file, &orchestrator_prompt) {
             error!(repo = %repo_name, "Failed to write orchestrator prompt file: {}", e);
             nack_head_event(state, repo_name, &event.filename).await;
@@ -1105,12 +1106,9 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         );
         // Load orchestrator agent def to get full env
         let orch_def_content = std::fs::read_to_string(
-            std::path::Path::new(&repo_dir)
-                .join(".githubclaw/agents/orchestrator.md"),
+            std::path::Path::new(&repo_dir).join(".githubclaw/agents/orchestrator.md"),
         )
-        .unwrap_or_else(|_| {
-            include_str!("../defaults/agents/orchestrator.md").to_string()
-        });
+        .unwrap_or_else(|_| include_str!("../defaults/agents/orchestrator.md").to_string());
         let tmp_agent_dir = std::env::temp_dir().join("githubclaw-orch");
         let _ = std::fs::create_dir_all(&tmp_agent_dir);
         let tmp_agent_file = tmp_agent_dir.join("orchestrator.md");
@@ -1119,7 +1117,8 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             // Write orchestrator prompt to temp file
             let prompt_path = tmp_agent_dir.join("orch_prompt.md");
             let _ = std::fs::write(&prompt_path, &orchestrator_prompt);
-            let full_env = spawner.build_env(&orch_def, &prompt_path, &orchestrator_prompt, Some(&env));
+            let full_env =
+                spawner.build_env(&orch_def, &prompt_path, &orchestrator_prompt, Some(&env));
             env = full_env;
         }
 
@@ -1325,9 +1324,7 @@ mod tests {
             scheduler: Mutex::new(ScheduledEventManager::new(scheduler_path)),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            issue_router: crate::issue_router::IssueRouter::new(
-                tmp.path().join("sessions"),
-            ),
+            issue_router: crate::issue_router::IssueRouter::new(tmp.path().join("sessions")),
             session_store: crate::session_store::SessionStore::with_base_dir(
                 tmp.path().join("sessions"),
             ),

@@ -59,9 +59,7 @@ async fn test_webhook_to_queue_roundtrip() {
         )),
         rate_limiter: Arc::new(RateLimiter::default()),
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        issue_router: githubclaw::issue_router::IssueRouter::new(
-            tmp.path().join("sessions"),
-        ),
+        issue_router: githubclaw::issue_router::IssueRouter::new(tmp.path().join("sessions")),
         session_store: githubclaw::session_store::SessionStore::with_base_dir(
             tmp.path().join("sessions"),
         ),
@@ -206,6 +204,23 @@ You are the Coder agent.
     // Cleanup
     assembler.cleanup_all();
     assert!(!prompt_file.exists());
+}
+
+/// Test: Default orchestrator prompts encode contributor hospitality guidance
+#[test]
+fn test_default_orchestrator_prompts_include_contributor_hospitality() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let system_prompt = std::fs::read_to_string(root.join("defaults/orchestrator.md")).unwrap();
+    let agent_prompt =
+        std::fs::read_to_string(root.join("defaults/agents/orchestrator.md")).unwrap();
+
+    assert!(system_prompt.contains("Contributor Hospitality"));
+    assert!(system_prompt.contains("thank"));
+    assert!(system_prompt.contains("What happens next"));
+
+    assert!(agent_prompt.contains("Contributor Hospitality"));
+    assert!(agent_prompt.contains("warm"));
+    assert!(agent_prompt.contains("additional information"));
 }
 
 /// Test: Fork PR gate end-to-end

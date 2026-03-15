@@ -1,6 +1,8 @@
 //! Terminal event handling for the TUI.
 
-use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{
+    self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
+};
 use std::time::Duration;
 
 /// Application events.

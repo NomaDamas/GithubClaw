@@ -165,9 +165,7 @@ impl ProcessManager {
             ProcessKind::Orchestrator => {
                 self.active_orchestrator_count().await < self.max_concurrent_orchestrators
             }
-            ProcessKind::Worker => {
-                self.active_worker_count().await < self.max_concurrent_workers
-            }
+            ProcessKind::Worker => self.active_worker_count().await < self.max_concurrent_workers,
         }
     }
 

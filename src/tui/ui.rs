@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
 use ratatui::Frame;
 
 use super::app::App;
+use super::summary::{CardActionState, CardTone, SummaryCard};
 use super::tabs::{AgentStatus, Tab};
 
 /// Render the entire TUI frame.
@@ -15,7 +16,7 @@ pub fn render(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Tab bar
-            Constraint::Min(0),   // Content
+            Constraint::Min(0),    // Content
             Constraint::Length(1), // Status bar
         ])
         .split(f.area());
@@ -47,11 +48,7 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let tabs = Tabs::new(titles)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" GithubClaw "),
-        )
+        .block(Block::default().borders(Borders::ALL).title(" GithubClaw "))
         .highlight_style(Style::default().fg(Color::Yellow))
         .select(match app.active_tab {
             Tab::IssueRequest => 0,
@@ -74,11 +71,7 @@ fn render_issue_request_tab(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, issue)| {
-            let marker = if issue.vision_report_ready {
-                "+"
-            } else {
-                " "
-            };
+            let marker = if issue.vision_report_ready { "+" } else { " " };
             let style = if i == app.selected_issue_index {
                 Style::default()
                     .fg(Color::Yellow)
@@ -87,10 +80,7 @@ fn render_issue_request_tab(f: &mut Frame, app: &App, area: Rect) {
                 Style::default()
             };
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!(" {} #{:<5} ", marker, issue.issue_number),
-                    style,
-                ),
+                Span::styled(format!(" {} #{:<5} ", marker, issue.issue_number), style),
                 Span::styled(
                     format!("[{}] ", issue.issue_type),
                     Style::default().fg(Color::Cyan),
@@ -106,6 +96,13 @@ fn render_issue_request_tab(f: &mut Frame, app: &App, area: Rect) {
             .title(" Issues (awaiting session) "),
     );
     f.render_widget(list, chunks[0]);
+
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Min(0)])
+        .split(chunks[1]);
+
+    render_summary_card(f, &app.issue_request_summary_card(), right_chunks[0]);
 
     // Right: Interactive session area
     let session_title = if app.interactive_session_active {
@@ -137,12 +134,9 @@ fn render_issue_request_tab(f: &mut Frame, app: &App, area: Rect) {
             .to_string()
     };
 
-    let session = Paragraph::new(session_content).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(session_title),
-    );
-    f.render_widget(session, chunks[1]);
+    let session = Paragraph::new(session_content)
+        .block(Block::default().borders(Borders::ALL).title(session_title));
+    f.render_widget(session, right_chunks[1]);
 }
 
 fn render_monitoring_tab(f: &mut Frame, app: &App, area: Rect) {
@@ -178,18 +172,9 @@ fn render_monitoring_tab(f: &mut Frame, app: &App, area: Rect) {
                 AgentStatus::Idle => Color::DarkGray,
             };
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!(" #{:<5} ", session.issue_number),
-                    style,
-                ),
-                Span::styled(
-                    format!("{:<16} ", session.agent_type),
-                    style,
-                ),
-                Span::styled(
-                    session.status.symbol(),
-                    Style::default().fg(status_color),
-                ),
+                Span::styled(format!(" #{:<5} ", session.issue_number), style),
+                Span::styled(format!("{:<16} ", session.agent_type), style),
+                Span::styled(session.status.symbol(), Style::default().fg(status_color)),
             ]))
         })
         .collect();
@@ -218,12 +203,15 @@ fn render_monitoring_tab(f: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(format!("  Queue: {} pending", app.queue_depth)),
     ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Rate Limit "),
-    );
+    .block(Block::default().borders(Borders::ALL).title(" Rate Limit "));
     f.render_widget(rl_info, left_chunks[1]);
+
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Min(0)])
+        .split(chunks[1]);
+
+    render_summary_card(f, &app.monitoring_summary_card(), right_chunks[0]);
 
     // Right: Session detail with timeline
     let mut detail_lines: Vec<Line> = Vec::new();
@@ -231,9 +219,10 @@ fn render_monitoring_tab(f: &mut Frame, app: &App, area: Rect) {
     if app.agent_timeline.is_empty() {
         detail_lines.push(Line::from("  Select a session to see details."));
     } else {
-        detail_lines.push(Line::from(
-            Span::styled("  Agent Timeline:", Style::default().add_modifier(Modifier::BOLD)),
-        ));
+        detail_lines.push(Line::from(Span::styled(
+            "  Agent Timeline:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
         detail_lines.push(Line::from(""));
         for entry in &app.agent_timeline {
             let status_color = match entry.status {
@@ -258,19 +247,26 @@ fn render_monitoring_tab(f: &mut Frame, app: &App, area: Rect) {
     }
 
     detail_lines.push(Line::from(""));
-    detail_lines.push(Line::from(
-        Span::styled("  [c] Comment on PR", Style::default().fg(Color::DarkGray)),
-    ));
+    detail_lines.push(Line::from(Span::styled(
+        "  [c] Comment on PR",
+        Style::default().fg(Color::DarkGray),
+    )));
 
     let detail = Paragraph::new(detail_lines).block(
         Block::default()
             .borders(Borders::ALL)
             .title(" Session Detail "),
     );
-    f.render_widget(detail, chunks[1]);
+    f.render_widget(detail, right_chunks[1]);
 }
 
 fn render_release_tab(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Min(0)])
+        .split(area);
+    render_summary_card(f, &app.release_summary_card(), chunks[0]);
+
     let mut lines: Vec<Line> = Vec::new();
 
     match &app.release_info {
@@ -286,20 +282,19 @@ fn render_release_tab(f: &mut Frame, app: &App, area: Rect) {
             }
 
             lines.push(Line::from(""));
-            lines.push(Line::from(
-                Span::styled("  Included Issues:", Style::default().add_modifier(Modifier::BOLD)),
-            ));
+            lines.push(Line::from(Span::styled(
+                "  Included Issues:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
             for (num, title) in &info.included_issues {
                 lines.push(Line::from(format!("    #{} {}", num, title)));
             }
 
             lines.push(Line::from(""));
-            lines.push(Line::from(
-                Span::styled(
-                    "  Dogfooding Checklist:",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-            ));
+            lines.push(Line::from(Span::styled(
+                "  Dogfooding Checklist:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
             for item in &info.checklist {
                 let check = if item.checked { "[x]" } else { "[ ]" };
                 lines.push(Line::from(format!("    {} {}", check, item.text)));
@@ -315,15 +310,64 @@ fn render_release_tab(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled("  [r] Run release  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[o] Open PR in browser", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "[o] Open PR in browser",
+            Style::default().fg(Color::DarkGray),
+        ),
     ]));
 
-    let release = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Release "),
-    );
-    f.render_widget(release, area);
+    let release =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Release "));
+    f.render_widget(release, chunks[1]);
+}
+
+fn render_summary_card(f: &mut Frame, card: &SummaryCard, area: Rect) {
+    let tone_color = match card.tone {
+        CardTone::Info => Color::Cyan,
+        CardTone::Success => Color::Green,
+        CardTone::Warning => Color::Yellow,
+        CardTone::Danger => Color::Red,
+    };
+    let state_label = match card.action_state {
+        CardActionState::Passive => "PASSIVE",
+        CardActionState::Watching => "WATCHING",
+        CardActionState::NeedsDecision => "DECISION",
+        CardActionState::Blocked => "BLOCKED",
+        CardActionState::InProgress => "LIVE",
+        CardActionState::Done => "DONE",
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(&card.title, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(
+                state_label,
+                Style::default().fg(tone_color).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            &card.status_line,
+            Style::default().fg(tone_color),
+        )),
+        Line::from(""),
+    ];
+
+    for bullet in card.bullets.iter().take(3) {
+        lines.push(Line::from(vec![Span::raw("- "), Span::raw(bullet)]));
+    }
+
+    if let Some(next_action) = &card.next_action {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Next: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(next_action),
+        ]));
+    }
+
+    let widget =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Summary "));
+    f.render_widget(widget, area);
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {

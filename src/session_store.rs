@@ -81,11 +81,7 @@ impl SessionStore {
         let dir = self.session_dir(repo, issue_id);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
-            tracing::debug!(
-                repo = repo,
-                issue_id = issue_id,
-                "deleted session"
-            );
+            tracing::debug!(repo = repo, issue_id = issue_id, "deleted session");
         }
         Ok(())
     }

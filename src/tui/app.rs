@@ -207,12 +207,8 @@ impl App {
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|_| ".".to_string());
 
-                    match super::pty::PtySession::spawn_claude(
-                        &session_name,
-                        &working_dir,
-                        80,
-                        24,
-                    ) {
+                    match super::pty::PtySession::spawn_claude(&session_name, &working_dir, 80, 24)
+                    {
                         Ok(pty) => {
                             self.pty_session = Some(pty);
                             self.pty_output.clear();
