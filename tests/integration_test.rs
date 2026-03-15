@@ -61,6 +61,12 @@ async fn test_webhook_to_queue_roundtrip() {
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         orchestrator_backend: githubclaw::orchestrator::session::OrchestratorBackend::Codex,
         orchestrators: Mutex::new(HashMap::new()),
+        issue_router: githubclaw::issue_router::IssueRouter::new(
+            tmp.path().join("sessions"),
+        ),
+        session_store: githubclaw::session_store::SessionStore::with_base_dir(
+            tmp.path().join("sessions"),
+        ),
     });
 
     let app = create_router(state.clone());

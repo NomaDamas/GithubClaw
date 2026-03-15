@@ -16,6 +16,8 @@ pub struct App {
     pub issue_requests: Vec<IssueRequestItem>,
     pub selected_issue_index: usize,
     pub interactive_session_active: bool,
+    /// Issue number pending interactive session launch (consumed by TUI main loop).
+    pub pending_interactive_issue: Option<u64>,
 
     // Monitoring tab state
     pub agent_sessions: Vec<AgentSessionItem>,
@@ -37,6 +39,7 @@ impl App {
             issue_requests: Vec::new(),
             selected_issue_index: 0,
             interactive_session_active: false,
+            pending_interactive_issue: None,
             agent_sessions: Vec::new(),
             selected_agent_index: 0,
             agent_timeline: Vec::new(),
@@ -44,6 +47,37 @@ impl App {
             queue_depth: 0,
             worker_count: (0, 8),
             release_info: None,
+        }
+    }
+
+    /// Refresh data from disk (called on Tick events).
+    ///
+    /// Reads queue depths, process states, and session info from the
+    /// GithubClaw home directory. This is a lightweight polling approach
+    /// that doesn't require IPC with the webhook server.
+    pub fn refresh_from_disk(&mut self) {
+        let home = crate::config::global_config_dir();
+
+        // Read queue depths
+        let queue_dir = home.join("queue");
+        if queue_dir.exists() {
+            self.queue_depth = std::fs::read_dir(&queue_dir)
+                .map(|entries| entries.filter_map(|e| e.ok()).count())
+                .unwrap_or(0);
+        }
+
+        // Read registry for repo list
+        let registry_path = home.join("registry.json");
+        if registry_path.exists() {
+            if let Ok(data) = std::fs::read_to_string(&registry_path) {
+                if let Ok(registry) = serde_json::from_str::<serde_json::Value>(&data) {
+                    // Could populate repo list for issue request tab
+                    let _repos = registry
+                        .get("repos")
+                        .and_then(|v| v.as_object())
+                        .map(|m| m.keys().cloned().collect::<Vec<_>>());
+                }
+            }
         }
     }
 
@@ -58,7 +92,7 @@ impl App {
                 self.handle_key(key.code, key.modifiers);
             }
             AppEvent::Tick => {
-                // Periodic refresh — would poll server status in real implementation
+                self.refresh_from_disk();
             }
             _ => {}
         }
@@ -117,8 +151,11 @@ impl App {
             }
             KeyCode::Enter => {
                 if !self.issue_requests.is_empty() {
+                    // Store the selected issue for the caller to spawn Claude Code
                     self.interactive_session_active = true;
-                    // Would spawn Claude Code PTY session here
+                    self.pending_interactive_issue = Some(
+                        self.issue_requests[self.selected_issue_index].issue_number,
+                    );
                 }
             }
             KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {

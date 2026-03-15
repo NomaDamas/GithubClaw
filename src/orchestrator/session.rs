@@ -67,6 +67,7 @@ impl OrchestratorSession {
         let persistence_dir = home_dir().join(".githubclaw/sessions").join(&repo_name);
 
         let conversation_history = Self::load_persisted_state(&persistence_dir).unwrap_or_default();
+        let dispatch_log = Self::load_persisted_dispatch_log(&persistence_dir);
 
         Self {
             repo: repo.to_string(),
@@ -80,7 +81,7 @@ impl OrchestratorSession {
             global_prompt_path: format!("{}/.githubclaw/global-prompt.md", repo_dir),
             persistence_dir,
             conversation_history,
-            dispatch_log: Vec::new(),
+            dispatch_log,
         }
     }
 
@@ -464,6 +465,7 @@ impl OrchestratorSession {
             "repo": self.repo,
             "model": self.model,
             "conversation_history": self.conversation_history,
+            "dispatch_log": self.dispatch_log,
         });
 
         let data = serde_json::to_string_pretty(&state)
@@ -488,6 +490,25 @@ impl OrchestratorSession {
             .get("conversation_history")
             .and_then(|v| v.as_array())
             .cloned()
+    }
+
+    /// Load prior dispatch log from persisted state.
+    pub fn load_persisted_dispatch_log(
+        persistence_dir: &Path,
+    ) -> Vec<(String, String, String)> {
+        let state_path = persistence_dir.join("session_state.json");
+        let data = match std::fs::read_to_string(&state_path) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let state: serde_json::Value = match serde_json::from_str(&data) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        state
+            .get("dispatch_log")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
     }
 }
 

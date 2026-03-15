@@ -50,6 +50,10 @@ pub struct ServerState {
     pub orchestrator_backend: crate::orchestrator::session::OrchestratorBackend,
     /// Per-repo orchestrator sessions (created on demand in the drain loop).
     pub orchestrators: Mutex<HashMap<String, OrchestratorSession>>,
+    /// V2: Routes GitHub events to their root issue for Orchestrator session routing.
+    pub issue_router: crate::issue_router::IssueRouter,
+    /// V2: Session ID persistence for Claude Code --resume pattern.
+    pub session_store: crate::session_store::SessionStore,
 }
 
 /// A single entry in `registry.json`.
@@ -652,10 +656,16 @@ async fn execute_dispatch(
 
     // 4. Check concurrency capacity — return a special error so the drain
     //    loop knows to wait instead of nacking.
-    if !state.process_manager.has_capacity().await {
+    if !state
+        .process_manager
+        .has_capacity_for(crate::process_manager::ProcessKind::Worker)
+        .await
+    {
         return Err(format!(
-            "CAPACITY_FULL: No concurrency capacity for agent '{}' — {} agents already running",
-            dispatch.agent_type, state.process_manager.max_concurrent_agents,
+            "CAPACITY_FULL: No worker capacity for agent '{}' — {}/{} workers running",
+            dispatch.agent_type,
+            state.process_manager.active_worker_count().await,
+            state.process_manager.max_concurrent_workers,
         ));
     }
 
@@ -918,6 +928,61 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                 let _ = q.dequeue();
             }
             continue;
+        }
+
+        // 2b. V2: Route event to root issue for correct Orchestrator session.
+        let root_issue = state
+            .issue_router
+            .route_event(repo_name, &event.payload)
+            .unwrap_or(None);
+        if let Some(root) = root_issue {
+            tracing::debug!(
+                repo = %repo_name,
+                root_issue = root,
+                "Routed event to root issue #{}",
+                root
+            );
+        }
+
+        // 2c. V2: Detect markers in issue_comment events for pipeline state transitions.
+        if let Some(comment_body) = event
+            .payload
+            .pointer("/comment/body")
+            .and_then(|v| v.as_str())
+        {
+            let markers = crate::markers::parse_markers(comment_body);
+            let summary = crate::markers::extract_summary(comment_body);
+            for marker in &markers {
+                tracing::info!(
+                    repo = %repo_name,
+                    root_issue = ?root_issue,
+                    marker = marker.marker_type.as_str(),
+                    "V2 marker detected: {:?}",
+                    marker.marker_type
+                );
+                // V2 TODO: When Orchestrator is fully Claude Code subprocess,
+                // build ResumeMessage here and resume the Orchestrator session.
+                // For now, markers are logged and the V1 orchestrator handles them.
+                if let Some(root) = root_issue {
+                    let agent_type = event
+                        .payload
+                        .pointer("/comment/user/login")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let comment_url = event
+                        .payload
+                        .pointer("/comment/html_url")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let _resume_msg = crate::resume_message::ResumeMessage::from_marker(
+                        root,
+                        marker,
+                        summary.clone(),
+                        agent_type,
+                        comment_url,
+                    );
+                }
+            }
         }
 
         // 3. Check rate limiter before sending to orchestrator.
@@ -1204,6 +1269,12 @@ mod tests {
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             orchestrator_backend: crate::orchestrator::session::OrchestratorBackend::Codex,
             orchestrators: Mutex::new(HashMap::new()),
+            issue_router: crate::issue_router::IssueRouter::new(
+                tmp.path().join("sessions"),
+            ),
+            session_store: crate::session_store::SessionStore::with_base_dir(
+                tmp.path().join("sessions"),
+            ),
         })
     }
 

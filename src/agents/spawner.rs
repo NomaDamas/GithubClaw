@@ -105,7 +105,7 @@ impl AgentSpawner {
         // GITHUBCLAW_ROOT_ISSUE is injected by the caller via extra_env
 
         // V2: gh wrapper PATH injection
-        // Prepend the scripts/ directory (containing gh-wrapper.sh renamed to gh)
+        // Prepend the scripts/ directory (containing gh renamed to gh)
         // to PATH so all gh CLI calls go through our wrapper.
         if let Some(wrapper_dir) = self.gh_wrapper_dir() {
             let current_path = std::env::var("PATH").unwrap_or_default();
@@ -134,19 +134,19 @@ impl AgentSpawner {
 
     /// Locate the gh wrapper script directory.
     ///
-    /// Looks for `scripts/gh-wrapper.sh` relative to the binary location,
+    /// Looks for `scripts/gh` relative to the binary location,
     /// or falls back to the repo root's `scripts/` directory.
     fn gh_wrapper_dir(&self) -> Option<PathBuf> {
         // Check repo-local scripts dir first
         let repo_scripts = self.repo_root.join("scripts");
-        if repo_scripts.join("gh-wrapper.sh").exists() {
+        if repo_scripts.join("gh").exists() {
             return Some(repo_scripts);
         }
         // Check relative to the running binary
         if let Ok(exe) = std::env::current_exe() {
             if let Some(parent) = exe.parent() {
                 let bin_scripts = parent.join("scripts");
-                if bin_scripts.join("gh-wrapper.sh").exists() {
+                if bin_scripts.join("gh").exists() {
                     return Some(bin_scripts);
                 }
             }
@@ -183,7 +183,7 @@ impl AgentSpawner {
             "claude-code" => {
                 let mut cmd = vec![
                     "claude".to_string(),
-                    "--print".to_string(),
+                    "-p".to_string(),
                     "--prompt-file".to_string(),
                     prompt_path,
                     "--max-turns".to_string(),
@@ -332,7 +332,7 @@ mod tests {
         let cmd = spawner.build_command(&def, &prompt, "fix the bug").unwrap();
 
         assert_eq!(cmd[0], "claude");
-        assert!(cmd.contains(&"--print".to_string()));
+        assert!(cmd.contains(&"-p".to_string()));
         assert!(cmd.contains(&"--prompt-file".to_string()));
         assert!(cmd.contains(&"--max-turns".to_string()));
         assert!(cmd.contains(&"200".to_string()));
@@ -356,8 +356,8 @@ mod tests {
         assert!(cmd.contains(&"--prompt-file".to_string()));
         assert!(cmd.contains(&"--task".to_string()));
         assert!(cmd.contains(&"implement feature".to_string()));
-        // codex should NOT have --print or --max-turns
-        assert!(!cmd.contains(&"--print".to_string()));
+        // codex should NOT have -p or --max-turns
+        assert!(!cmd.contains(&"-p".to_string()));
         assert!(!cmd.contains(&"--max-turns".to_string()));
     }
 
