@@ -1332,6 +1332,14 @@ fn detect_github_remote(repo_root: &Path) -> Option<String> {
     parse_github_remote(&url)
 }
 
+fn runtime_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
 // ===========================================================================
 // cmd_dispatch — Dispatch a worker agent for a specific issue
 // ===========================================================================
@@ -1373,6 +1381,19 @@ fn cmd_dispatch(agent_type: &str, issue: u64, prompt: &str, repo: Option<&str>) 
         "Dispatching {} agent for {}#{} ...",
         agent_type, repo_name, issue
     );
+
+    let started_at = runtime_timestamp();
+    let session_store = crate::session_store::SessionStore::new();
+    let mut runtime_snapshot = session_store
+        .load_runtime_snapshot(&repo_name, issue)
+        .unwrap_or(None)
+        .unwrap_or_else(|| crate::runtime_state::IssueRuntimeSnapshot::new(&repo_name, issue));
+    runtime_snapshot.note_agent_started(
+        agent_type,
+        &started_at,
+        format!("Dispatch started for {}#{}", repo_name, issue),
+    );
+    let _ = session_store.save_runtime_snapshot(&repo_name, &runtime_snapshot);
 
     // Build environment with root issue tracking
     let mut extra_env = HashMap::new();
@@ -1434,6 +1455,22 @@ fn cmd_dispatch(agent_type: &str, issue: u64, prompt: &str, repo: Option<&str>) 
     match status {
         Ok(s) => {
             let code = s.code().unwrap_or(-1);
+            let mut runtime_snapshot = session_store
+                .load_runtime_snapshot(&repo_name, issue)
+                .unwrap_or(None)
+                .unwrap_or_else(|| {
+                    crate::runtime_state::IssueRuntimeSnapshot::new(&repo_name, issue)
+                });
+            let detail = if code == 0 {
+                format!("Dispatch completed for {}#{}", repo_name, issue)
+            } else {
+                format!(
+                    "Dispatch exited with code {} for {}#{}",
+                    code, repo_name, issue
+                )
+            };
+            runtime_snapshot.note_agent_finished(agent_type, &started_at, code == 0, detail);
+            let _ = session_store.save_runtime_snapshot(&repo_name, &runtime_snapshot);
             if code == 0 {
                 println!("Agent '{}' completed successfully.", agent_type);
             } else {
@@ -1442,6 +1479,22 @@ fn cmd_dispatch(agent_type: &str, issue: u64, prompt: &str, repo: Option<&str>) 
             }
         }
         Err(e) => {
+            let mut runtime_snapshot = session_store
+                .load_runtime_snapshot(&repo_name, issue)
+                .unwrap_or(None)
+                .unwrap_or_else(|| {
+                    crate::runtime_state::IssueRuntimeSnapshot::new(&repo_name, issue)
+                });
+            runtime_snapshot.note_agent_finished(
+                agent_type,
+                &started_at,
+                false,
+                format!(
+                    "Dispatch failed to spawn for {}#{}: {}",
+                    repo_name, issue, e
+                ),
+            );
+            let _ = session_store.save_runtime_snapshot(&repo_name, &runtime_snapshot);
             eprintln!("Error spawning agent '{}': {}", agent_type, e);
             std::process::exit(1);
         }
@@ -1611,6 +1664,7 @@ fn cmd_tui() {
     execute!(stdout, EnterAlternateScreen).unwrap();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).unwrap();
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
     // Create app state
     let mut app = crate::tui::App::new();
@@ -1627,6 +1681,16 @@ fn cmd_tui() {
         };
         if let Some(event) = crate::tui::event::poll_event(Duration::from_millis(poll_ms)) {
             app.handle_event(event);
+        }
+
+        if let Some(issue_number) = app.take_pending_interactive_issue() {
+            app.start_interactive_session_for_issue(issue_number, &repo_root);
+        }
+
+        if let Some(review) = app.take_pending_issue_review() {
+            if let Err(err) = app.apply_issue_review(&repo_root, review) {
+                tracing::warn!(issue = review.issue_number, error = %err, "Failed to apply issue review");
+            }
         }
 
         if app.should_quit {

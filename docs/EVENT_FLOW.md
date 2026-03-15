@@ -20,7 +20,7 @@ GitHub Event
 [Disk-Persisted Queue]
     │
     ▼
-[Webhook Server: Deliver to Orchestrator via Unix Socket]
+[Webhook Server: Launch or Resume Orchestrator]
     │
     ├── Orchestrator idle → Cold-start, resume session
     │
@@ -29,20 +29,17 @@ GitHub Event
     │
     ├── Re-read global-prompt.md (roster)
     ├── Read relevant memory.md sections
-    ├── Gather context (scoped tools)
+    ├── Gather context (CLI built-in tools)
     ├── Classify event
     │
     ▼
-[Orchestrator: Structured Output]
+[Orchestrator: Decide and Dispatch]
     │
-    ├── no_action → Log reasoning, done
-    ├── dispatch → Webhook server spawns agent(s)
-    ├── schedule_event → Webhook server persists to scheduled.json
-    ├── cancel_event → Webhook server removes from scheduled.json
-    │   (multiple actions can be combined)
+    ├── no follow-up needed → Exit successfully, done
+    ├── githubclaw dispatch → Webhook server spawns agent(s)
     │
     ▼
-[Webhook Server: Execute Dispatches]
+[Webhook Server: Execute Worker Dispatches]
     │
     ├── Validate agent_type against .githubclaw/agents/
     │   ├── Not found → Error feedback event to orchestrator

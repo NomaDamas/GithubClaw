@@ -100,21 +100,33 @@ To test the webhook delivery, open an issue on your repo. You should see it appe
             | - Process management   |
             | - Prompt assembly      |
             +------------------------+
-                |              |
-         (Unix socket)   (CLI spawn)
-                |              |
-                v              v
-        +-------------+  +-------------+
-        | Orchestrator |  |   Worker    |
-        | (per-repo)   |  |   Agents    |
-        | Codex /      |  | Codex /     |
-        | Claude Code  |  | Claude Code |
-        +-------------+  +-------------+
-                               |
-                         (gh CLI / git)
-                               |
-                               v
-                            GitHub
+                |
+           (CLI spawn)
+                |
+                v
+        +-----------------------+
+        | Orchestrator Session  |
+        | Claude Code / Codex   |
+        |                       |
+        | - inspect context     |
+        | - classify event      |
+        | - call dispatch CLI   |
+        +-----------------------+
+                |
+          githubclaw dispatch
+                |
+                v
+        +-------------+
+        |   Worker    |
+        |   Agents    |
+        | Codex /     |
+        | Claude Code |
+        +-------------+
+               |
+         (gh CLI / git)
+               |
+               v
+            GitHub
 ```
 
 Events flow in a loop: GitHub fires a webhook, the server routes it to a per-repo orchestrator, the orchestrator dispatches a worker agent, the agent acts on GitHub, and the resulting event re-enters the loop.

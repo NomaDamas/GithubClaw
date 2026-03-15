@@ -2,7 +2,7 @@
 
 ## Overview
 
-GithubClaw is a system of near-autonomous AI agents that manage open-source projects end-to-end using **GitHub as the single source of truth**. A Rust webhook server receives GitHub events and routes them to a stateful orchestrator, which classifies each event and dispatches specialized worker agents (Claude Code / Codex CLI processes) to handle tasks autonomously.
+GithubClaw is a system of near-autonomous AI agents that manage open-source projects end-to-end using **GitHub as the single source of truth**. A Rust webhook server receives GitHub events and launches or resumes an orchestrator session, which classifies each event and directly dispatches specialized worker agents via `githubclaw dispatch`.
 
 ## Core Philosophy
 
@@ -32,32 +32,21 @@ GithubClaw is a system of near-autonomous AI agents that manage open-source proj
               | - Scheduled events     |
               | - Rate limit handling  |
               +------------------------+
-                  |              |
-           (Unix socket)    (CLI spawn)
-                  |              |
-                  v              v
-          +-------------+  +-------------+
-          | Orchestrator |  |   Worker    |
-          | (per-repo)   |  |   Agents    |
-          | Agent SDK    |  | Claude Code |
-          |              |  |   / Codex   |
-          | - Classify   |  |             |
-          | - Route      |  | - CS        |
-          | - Schedule   |  | - Bug Track |
-          | - Memory     |  | - Librarian |
-          +-------------+  | - PM        |
-                            | - Coder     |
-                            | - QA        |
-                            | - Reviewer  |
-                            | - Marketer  |
-                            | - Visionary |
-                            | - Security  |
-                            +-------------+
-                                  |
-                            (gh CLI / git)
-                                  |
-                                  v
-                               GitHub
+                  |
+             (CLI spawn)
+                  |
+                  v
+          +-------------------+  githubclaw dispatch  +-------------+
+          |  Orchestrator     |---------------------->|   Worker    |
+          |  Claude Code /    |                       |   Agents    |
+          |  Codex session    |                       | Claude Code |
+          |                   |                       |   / Codex   |
+          | - Classify        |                       +-------------+
+          | - Read state      |                              |
+          | - Route           |                        (gh CLI / git)
+          +-------------------+                              |
+                                                           v
+                                                        GitHub
 ```
 
 ## Process Architecture
@@ -66,8 +55,8 @@ Flat process tree — webhook server manages all child processes as siblings:
 
 ```
 webhook server (axum, persistent)
-├── orchestrator-repoA     (Anthropic API client, Unix socket IPC)
-├── orchestrator-repoB     (Anthropic API client, Unix socket IPC)
+├── orchestrator-repoA     (Claude Code / Codex session)
+├── orchestrator-repoB     (Claude Code / Codex session)
 ├── coder-repoA-issue42    (Claude Code / Codex CLI)
 ├── qa-repoA-pr88          (Claude Code / Codex CLI)
 ├── bugtracker-repoB-#12   (Claude Code / Codex CLI)
@@ -83,10 +72,10 @@ webhook server (axum, persistent)
 1. GitHub event fires (e.g., new issue created)
 2. Webhook server receives POST, verifies `X-Hub-Signature-256`
 3. Routes to correct repo queue via `registry.json`
-4. Delivers event as user message turn to repo's orchestrator via Unix socket
-5. Orchestrator re-reads `global-prompt.md` + gathers context via scoped tools
-6. Orchestrator produces structured output: `[{type: "dispatch", agent_type: "cs", task_context: "..."}]`
-7. Webhook server parses agent frontmatter, assembles 4-layer prompt, spawns CLI process
+4. Spawns or resumes the repo's orchestrator session with the latest event prompt
+5. Orchestrator re-reads prompts, gathers context via built-in CLI tools, and decides what to do
+6. Orchestrator directly calls `githubclaw dispatch <agent> --issue N --prompt "..."`
+7. Webhook server parses agent frontmatter, assembles 4-layer prompt, spawns worker CLI process
 8. Agent works autonomously (gh, git, Playwright, etc.)
 9. Agent posts branded status comment on GitHub, exits
 10. Status comment triggers new webhook event → cycle repeats
@@ -110,9 +99,8 @@ feature/#42 ─── PR ──→ dev ─── PR ──→ main
 |-----------|-----------|
 | Webhook server | Rust, axum, tokio |
 | CLI | Rust, clap |
-| Orchestrator | Direct Anthropic API client (Rust, reqwest) with agentic tool loop |
+| Orchestrator | Claude Code / Codex CLI |
 | Worker agents | Claude Code CLI / Codex CLI |
-| IPC | Unix sockets (tokio) |
 | Scheduling | tokio timers + `~/.githubclaw/scheduled.json` |
 | Daemonization | launchd (macOS) / systemd (Linux) |
 | Browser testing | Playwright + VLM (Vision Language Model) |
@@ -127,7 +115,7 @@ feature/#42 ─── PR ──→ dev ─── PR ──→ main
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Agent execution | Claude Code / Codex CLI | Instruction-following + full tool access, easy to implement |
-| Orchestrator runtime | Direct Anthropic API + agentic tool loop (Rust) | Minimal dependency, full control over tool execution |
+| Orchestrator runtime | Claude Code / Codex CLI session | Reuse battle-tested tools and let the session dispatch directly |
 | Inter-agent comms | Async, stateless, GitHub trail | Simplicity — stateful coordination too complex |
 | Task lifecycle | No explicit tracking | LLM judgment from accumulated context + GitHub state |
 | Behavioral enforcement | Instruction prompts (except security gates) | Complexity/autonomy tradeoff — trust the model |

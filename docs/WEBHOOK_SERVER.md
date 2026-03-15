@@ -1,6 +1,6 @@
 # Webhook Server
 
-The webhook server is the central nervous system of GithubClaw — a persistent Rust axum process that receives GitHub events, routes them to per-repo orchestrators, manages all child processes, and executes dispatch instructions.
+The webhook server is the central nervous system of GithubClaw — a persistent Rust axum process that receives GitHub events, launches or resumes orchestrator sessions, manages all child processes, and spawns worker agents requested via `githubclaw dispatch`.
 
 ## Responsibilities
 
@@ -8,11 +8,11 @@ The webhook server is the central nervous system of GithubClaw — a persistent 
 2. **Signature verification**: Validate `X-Hub-Signature-256` on every request
 3. **Registry routing**: Route events to correct repo based on `repository` field in payload
 4. **Queue management**: Disk-persisted serial FIFO queues per repo
-5. **Orchestrator IPC**: Deliver events to orchestrator child processes via Unix sockets
+5. **Orchestrator launch/resume**: Start the orchestrator session with the latest event prompt
 6. **Prompt assembly**: Mechanically assemble 4-layer agent prompts from config files
 7. **Frontmatter parsing**: YAML parser for agent tool permissions — never trusted to LLM
 8. **Process lifecycle**: Spawn, monitor exit codes, idle timeout, crash detection for all child processes
-9. **Dispatch execution**: Translate orchestrator structured output into CLI spawn commands
+9. **Worker execution**: Spawn worker agents when the orchestrator invokes `githubclaw dispatch`
 10. **Fork PR gate**: Mechanical `githubclaw-approved` label check from webhook payload fields
 11. **Scheduled events**: asyncio timer loop checking `~/.githubclaw/scheduled.json` every 60s
 12. **Rate limit handling**: Three-tier detection, hibernation, and timer-based recovery

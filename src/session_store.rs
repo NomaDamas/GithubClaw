@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use crate::config::global_config_dir;
 use crate::errors::Result;
+use crate::runtime_state::IssueRuntimeSnapshot;
 
 // ---------------------------------------------------------------------------
 // SessionStore
@@ -47,6 +48,10 @@ impl SessionStore {
         self.session_dir(repo, issue_id).join("session_id")
     }
 
+    fn runtime_snapshot_path(&self, repo: &str, issue_id: u64) -> PathBuf {
+        self.session_dir(repo, issue_id).join("runtime.json")
+    }
+
     fn read_session_id(path: &std::path::Path) -> Result<Option<String>> {
         let session_id = std::fs::read_to_string(path)?.trim().to_string();
         if session_id.is_empty() {
@@ -82,6 +87,98 @@ impl SessionStore {
             return Ok(None);
         }
         Self::read_session_id(&path)
+    }
+
+    /// Persist a runtime snapshot for a given repo + issue.
+    pub fn save_runtime_snapshot(&self, repo: &str, snapshot: &IssueRuntimeSnapshot) -> Result<()> {
+        let path = self.runtime_snapshot_path(repo, snapshot.issue_number);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("json.tmp");
+        let json = serde_json::to_string_pretty(snapshot)?;
+        std::fs::write(&tmp_path, json)?;
+        std::fs::rename(&tmp_path, &path)?;
+        Ok(())
+    }
+
+    /// Load a runtime snapshot for a given repo + issue.
+    pub fn load_runtime_snapshot(
+        &self,
+        repo: &str,
+        issue_id: u64,
+    ) -> Result<Option<IssueRuntimeSnapshot>> {
+        let path = self.runtime_snapshot_path(repo, issue_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let json = std::fs::read_to_string(path)?;
+        Ok(Some(serde_json::from_str(&json)?))
+    }
+
+    /// List all runtime snapshots for a given repo.
+    pub fn list_runtime_snapshots(&self, repo: &str) -> Result<Vec<IssueRuntimeSnapshot>> {
+        let repo_dir = self.repo_dir(repo);
+        if !repo_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut snapshots = Vec::new();
+        for entry in std::fs::read_dir(&repo_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let issue_id: u64 = match entry.file_name().to_string_lossy().parse() {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            if let Some(snapshot) = self.load_runtime_snapshot(repo, issue_id)? {
+                snapshots.push(snapshot);
+            }
+        }
+
+        snapshots.sort_by_key(|snapshot| snapshot.issue_number);
+        Ok(snapshots)
+    }
+
+    /// List every runtime snapshot across all repos.
+    pub fn list_all_runtime_snapshots(&self) -> Result<Vec<IssueRuntimeSnapshot>> {
+        if !self.base_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut snapshots = Vec::new();
+        for entry in std::fs::read_dir(&self.base_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let repo = entry.file_name().to_string_lossy().to_string();
+            for issue_dir in std::fs::read_dir(entry.path())? {
+                let issue_dir = issue_dir?;
+                if !issue_dir.file_type()?.is_dir() {
+                    continue;
+                }
+                let path = issue_dir.path().join("runtime.json");
+                if !path.exists() {
+                    continue;
+                }
+                let json = std::fs::read_to_string(path)?;
+                let mut snapshot: IssueRuntimeSnapshot = serde_json::from_str(&json)?;
+                if snapshot.repo.is_empty() {
+                    snapshot.repo = repo.clone();
+                }
+                snapshots.push(snapshot);
+            }
+        }
+
+        snapshots.sort_by(|left, right| {
+            left.repo
+                .cmp(&right.repo)
+                .then(left.issue_number.cmp(&right.issue_number))
+        });
+        Ok(snapshots)
     }
 
     /// Delete a session ID (e.g., when an issue is closed/completed).
@@ -149,6 +246,7 @@ impl Default for SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_state::IssueRuntimeSnapshot;
     use tempfile::TempDir;
 
     fn test_store(tmp: &TempDir) -> SessionStore {
@@ -239,6 +337,62 @@ mod tests {
         store.save("owner/repo", 42, "new-session").unwrap();
         let loaded = store.load("owner/repo", 42).unwrap();
         assert_eq!(loaded, Some("new-session".to_string()));
+    }
+
+    #[test]
+    fn save_and_load_runtime_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+        let mut snapshot = IssueRuntimeSnapshot::new("owner/repo", 42);
+        snapshot.title = "Add dark mode".into();
+
+        store
+            .save_runtime_snapshot("owner/repo", &snapshot)
+            .unwrap();
+        let loaded = store
+            .load_runtime_snapshot("owner/repo", 42)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(loaded.repo, "owner/repo");
+        assert_eq!(loaded.issue_number, 42);
+        assert_eq!(loaded.title, "Add dark mode");
+    }
+
+    #[test]
+    fn list_runtime_snapshots_for_repo() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+
+        store
+            .save_runtime_snapshot("owner/repo", &IssueRuntimeSnapshot::new("owner/repo", 20))
+            .unwrap();
+        store
+            .save_runtime_snapshot("owner/repo", &IssueRuntimeSnapshot::new("owner/repo", 10))
+            .unwrap();
+
+        let snapshots = store.list_runtime_snapshots("owner/repo").unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].issue_number, 10);
+        assert_eq!(snapshots[1].issue_number, 20);
+    }
+
+    #[test]
+    fn list_all_runtime_snapshots_across_repos() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+
+        store
+            .save_runtime_snapshot("owner/repo", &IssueRuntimeSnapshot::new("owner/repo", 10))
+            .unwrap();
+        store
+            .save_runtime_snapshot("other/repo", &IssueRuntimeSnapshot::new("other/repo", 5))
+            .unwrap();
+
+        let snapshots = store.list_all_runtime_snapshots().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].repo, "other/repo");
+        assert_eq!(snapshots[1].repo, "owner/repo");
     }
 
     // 9. Repo with slash is sanitized

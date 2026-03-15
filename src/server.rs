@@ -24,6 +24,7 @@ use crate::agents::prompt_assembler::PromptAssembler;
 use crate::agents::spawner::AgentSpawner;
 use crate::process_manager::{check_fork_pr_gate, ProcessManager};
 use crate::queue::DiskPersistedQueue;
+use crate::runtime_state::IssueRuntimeSnapshot;
 use crate::scheduler::ScheduledEventManager;
 use crate::signature::verify_webhook_signature;
 
@@ -269,6 +270,41 @@ fn fallback_queue_dir(githubclaw_home: &Path, repo_full_name: &str) -> PathBuf {
         dir.display()
     );
     dir
+}
+
+fn runtime_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn load_or_new_runtime_snapshot(
+    state: &ServerState,
+    repo_name: &str,
+    issue_id: u64,
+) -> IssueRuntimeSnapshot {
+    state
+        .session_store
+        .load_runtime_snapshot(repo_name, issue_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| IssueRuntimeSnapshot::new(repo_name, issue_id))
+}
+
+fn save_runtime_snapshot(state: &ServerState, repo_name: &str, snapshot: &IssueRuntimeSnapshot) {
+    if let Err(err) = state
+        .session_store
+        .save_runtime_snapshot(repo_name, snapshot)
+    {
+        warn!(
+            repo = repo_name,
+            issue = snapshot.issue_number,
+            error = %err,
+            "Failed to persist runtime snapshot",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -879,6 +915,10 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                 "Routed event to root issue #{}",
                 root
             );
+
+            let mut snapshot = load_or_new_runtime_snapshot(state, repo_name, root);
+            snapshot.apply_event(&event.payload, root);
+            save_runtime_snapshot(state, repo_name, &snapshot);
         }
 
         // 2c. Build the prompt for the orchestrator subprocess.
@@ -1083,6 +1123,17 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         {
             Ok(mut child) => {
                 let pid = child.id().unwrap_or(0);
+                let started_at = runtime_timestamp();
+
+                if issue_id > 0 {
+                    let mut snapshot = load_or_new_runtime_snapshot(state, repo_name, issue_id);
+                    snapshot.note_agent_started(
+                        "orchestrator",
+                        &started_at,
+                        format!("Processing queued event for issue #{}", issue_id),
+                    );
+                    save_runtime_snapshot(state, repo_name, &snapshot);
+                }
 
                 // Register with process manager
                 state
@@ -1097,6 +1148,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                     .await;
 
                 // Monitor in background
+                let started_at_clone = started_at.clone();
                 tokio::spawn(async move {
                     match child.wait().await {
                         Ok(status) => {
@@ -1116,6 +1168,32 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                                     pid = pid,
                                     "Orchestrator completed successfully"
                                 );
+                            }
+
+                            if issue_id > 0 {
+                                let store = crate::session_store::SessionStore::new();
+                                let mut snapshot = store
+                                    .load_runtime_snapshot(&repo_name_clone, issue_id)
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(|| {
+                                        IssueRuntimeSnapshot::new(&repo_name_clone, issue_id)
+                                    });
+                                let detail = if exit_code == 0 {
+                                    format!("Completed issue #{}", issue_id)
+                                } else {
+                                    format!(
+                                        "Exited with status {} while processing issue #{}",
+                                        exit_code, issue_id
+                                    )
+                                };
+                                snapshot.note_agent_finished(
+                                    "orchestrator",
+                                    &started_at_clone,
+                                    exit_code == 0,
+                                    &detail,
+                                );
+                                let _ = store.save_runtime_snapshot(&repo_name_clone, &snapshot);
                             }
 
                             // Try to capture session ID from stdout for --resume
@@ -1143,6 +1221,22 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                 });
             }
             Err(e) => {
+                if issue_id > 0 {
+                    let started_at = runtime_timestamp();
+                    let mut snapshot = load_or_new_runtime_snapshot(state, repo_name, issue_id);
+                    snapshot.note_agent_started(
+                        "orchestrator",
+                        &started_at,
+                        format!("Processing queued event for issue #{}", issue_id),
+                    );
+                    snapshot.note_agent_finished(
+                        "orchestrator",
+                        &started_at,
+                        false,
+                        format!("Failed to spawn while processing issue #{}", issue_id),
+                    );
+                    save_runtime_snapshot(state, repo_name, &snapshot);
+                }
                 error!(
                     repo = %repo_name,
                     "Failed to spawn orchestrator: {}",

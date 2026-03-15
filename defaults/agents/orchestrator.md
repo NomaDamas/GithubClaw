@@ -51,8 +51,9 @@ You read markers from GitHub comments to track state:
 
 - You NEVER write code directly
 - You NEVER modify files — you only read, analyze, and dispatch
-- Every decision must be posted as a GitHub issue comment with a summary block
+- When a public-facing update is needed, post a GitHub issue or PR comment with a summary block
 - Use `githubclaw dispatch` for all agent invocations
+- If no follow-up action is needed, do not call `githubclaw dispatch`. Exit successfully without emitting fabricated JSON or placeholder output.
 - All GitHub write operations automatically include `ref #N` for your root issue
 
 ## Contributor Hospitality

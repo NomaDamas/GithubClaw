@@ -11,7 +11,6 @@ use tokio::sync::Mutex;
 use githubclaw::agents::parser::parse_agent_file;
 use githubclaw::agents::prompt_assembler::PromptAssembler;
 use githubclaw::config::GlobalConfig;
-use githubclaw::orchestrator::schema::Action;
 use githubclaw::process_manager::{check_fork_pr_gate, ProcessManager};
 use githubclaw::queue::DiskPersistedQueue;
 use githubclaw::rate_limiter::RateLimiter;
@@ -103,29 +102,6 @@ async fn test_webhook_to_queue_roundtrip() {
     assert_eq!(repo_name, "owner/repo");
 }
 
-/// Test: ActionList parsing from various model outputs
-#[test]
-fn test_action_list_parsing_variants() {
-    use githubclaw::orchestrator::session::OrchestratorSession;
-
-    // Valid JSON
-    let json = r##"{"actions":[{"type":"dispatch","agent_type":"coder","issue_ref":"#42","task_context":"Fix bug"}],"reasoning":"test"}"##;
-    let result = OrchestratorSession::extract_action_list(json);
-    assert!(result.validate().is_ok());
-    assert_eq!(result.actions.len(), 1);
-
-    // JSON in code fences
-    let fenced = format!("Here's my decision:\n```json\n{}\n```", json);
-    let result = OrchestratorSession::extract_action_list(&fenced);
-    assert!(result.validate().is_ok());
-
-    // Garbage text falls back to no_action
-    let garbage = "I'm not sure what to do about this event.";
-    let result = OrchestratorSession::extract_action_list(garbage);
-    assert!(result.validate().is_ok());
-    assert!(matches!(&result.actions[0], Action::NoAction { .. }));
-}
-
 /// Test: Agent parser -> prompt assembler -> spawner pipeline
 #[test]
 fn test_agent_pipeline() {
@@ -212,10 +188,15 @@ fn test_default_orchestrator_prompts_include_contributor_hospitality() {
     assert!(system_prompt.contains("Contributor Hospitality"));
     assert!(system_prompt.contains("thank"));
     assert!(system_prompt.contains("What happens next"));
+    assert!(system_prompt.contains("do not call `githubclaw dispatch` and exit successfully"));
+    assert!(!system_prompt.contains("structured output"));
+    assert!(!system_prompt.contains("choose `no_action`"));
 
     assert!(agent_prompt.contains("Contributor Hospitality"));
     assert!(agent_prompt.contains("warm"));
     assert!(agent_prompt.contains("additional information"));
+    assert!(agent_prompt.contains("Use `githubclaw dispatch` for all agent invocations"));
+    assert!(agent_prompt.contains("Exit successfully without emitting fabricated JSON"));
 }
 
 /// Test: Fork PR gate end-to-end

@@ -3,7 +3,9 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
+use ratatui::widgets::{
+    Bar, BarChart, BarGroup, Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline, Tabs,
+};
 use ratatui::Frame;
 
 use super::app::App;
@@ -113,7 +115,7 @@ fn render_issue_request_tab(f: &mut Frame, app: &App, area: Rect) {
 
     let session_content = if app.interactive_session_active {
         if app.pty_output.is_empty() {
-            "Starting Claude Code session...".to_string()
+            "Starting interactive session...".to_string()
         } else {
             // Show last N lines that fit the panel
             let available_height = chunks[1].height.saturating_sub(2) as usize;
@@ -142,16 +144,21 @@ fn render_issue_request_tab(f: &mut Frame, app: &App, area: Rect) {
 fn render_monitoring_tab(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(area);
 
-    // Left: split into agent list + rate limit status
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(5)])
+        .constraints([
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Min(0),
+        ])
         .split(chunks[0]);
 
-    // Agent list
+    render_githubclaw_ascii(f, left_chunks[0]);
+    render_monitoring_status(f, app, left_chunks[1]);
+
     let items: Vec<ListItem> = app
         .agent_sessions
         .iter()
@@ -184,80 +191,284 @@ fn render_monitoring_tab(f: &mut Frame, app: &App, area: Rect) {
             .borders(Borders::ALL)
             .title(" Active Sessions "),
     );
-    f.render_widget(agent_list, left_chunks[0]);
-
-    // Rate limit status
-    let rl_color = if app.rate_limit_tier == "None" {
-        Color::Green
-    } else {
-        Color::Red
-    };
-    let rl_info = Paragraph::new(vec![
-        Line::from(vec![
-            Span::raw("  Tier: "),
-            Span::styled(&app.rate_limit_tier, Style::default().fg(rl_color)),
-        ]),
-        Line::from(format!(
-            "  Workers: {}/{}",
-            app.worker_count.0, app.worker_count.1
-        )),
-        Line::from(format!("  Queue: {} pending", app.queue_depth)),
-    ])
-    .block(Block::default().borders(Borders::ALL).title(" Rate Limit "));
-    f.render_widget(rl_info, left_chunks[1]);
+    f.render_widget(agent_list, left_chunks[2]);
 
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Length(10),
+            Constraint::Min(0),
+        ])
         .split(chunks[1]);
 
-    render_summary_card(f, &app.monitoring_summary_card(), right_chunks[0]);
+    render_monitoring_heartbeat(f, app, right_chunks[0]);
+    render_stage_flow(f, app, right_chunks[1]);
 
-    // Right: Session detail with timeline
-    let mut detail_lines: Vec<Line> = Vec::new();
+    let detail_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(8)])
+        .split(right_chunks[2]);
+
+    render_issue_waterfall(f, app, detail_chunks[0]);
+    render_recent_events(f, app, detail_chunks[1]);
+}
+
+fn render_githubclaw_ascii(f: &mut Frame, area: Rect) {
+    let art = vec![
+        Line::from("   ____ _ _   _   _     _                 "),
+        Line::from("  / ___(_) |_| |_| |__ | |__   ___ _ _    "),
+        Line::from(" | |  _| | __| __| '_ \\| '_ \\ / _ \\ '_|   "),
+        Line::from(" | |_| | | |_| |_| | | | |_) |  __/ |     "),
+        Line::from("  \\____|_|\\__|\\__|_| |_|_.__/ \\___|_|     "),
+        Line::from("        claws on the queue                "),
+    ];
+
+    let widget =
+        Paragraph::new(art).block(Block::default().borders(Borders::ALL).title(" GithubClaw "));
+    f.render_widget(widget, area);
+}
+
+fn render_monitoring_status(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    let rate_color = rate_limit_color(&app.rate_limit_tier);
+    let rate_label = rate_limit_label(&app.rate_limit_tier);
+    let rate = Paragraph::new(Line::from(vec![
+        Span::raw("  Rate Limit "),
+        Span::styled(
+            format!("{:<12}", rate_label),
+            Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("tier {}", app.rate_limit_tier),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]))
+    .block(Block::default().borders(Borders::ALL).title(" Rate "));
+    f.render_widget(rate, chunks[0]);
+
+    let worker_ratio = if app.worker_count.1 == 0 {
+        0.0
+    } else {
+        app.worker_count.0 as f64 / app.worker_count.1 as f64
+    };
+    let worker_gauge = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Worker Load "),
+        )
+        .ratio(worker_ratio.clamp(0.0, 1.0))
+        .label(format!(
+            "{}/{} active",
+            app.worker_count.0, app.worker_count.1
+        ))
+        .gauge_style(worker_color(app.worker_count));
+    f.render_widget(worker_gauge, chunks[1]);
+
+    let queue_color = queue_color(app.queue_depth, app.oldest_queue_age_seconds);
+    let queue_state = queue_state_label(app.queue_depth, app.oldest_queue_age_seconds);
+    let queue = Paragraph::new(vec![
+        Line::from(vec![
+            Span::raw("  Queue       "),
+            Span::styled(
+                format!("{:<10}", format!("{} pending", app.queue_depth)),
+                Style::default().fg(queue_color),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  Oldest wait "),
+            Span::styled(
+                format_oldest_wait(app.oldest_queue_age_seconds),
+                Style::default().fg(queue_color),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  Health      "),
+            Span::styled(
+                queue_state,
+                Style::default()
+                    .fg(queue_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Queue Health "),
+    );
+    f.render_widget(queue, chunks[2]);
+}
+
+fn render_monitoring_heartbeat(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(area);
+
+    let queue_history = history_or_zero(&app.queue_history);
+    let worker_history = history_or_zero(&app.worker_history);
+    let activity_history = history_or_zero(&app.activity_history);
+
+    let queue_spark = Sparkline::default()
+        .block(Block::default().borders(Borders::ALL).title(" Queue 30m "))
+        .data(&queue_history)
+        .max(queue_history.iter().copied().max().unwrap_or(1).max(1))
+        .style(queue_color(app.queue_depth, app.oldest_queue_age_seconds));
+    f.render_widget(queue_spark, chunks[0]);
+
+    let worker_spark = Sparkline::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Workers 30m "),
+        )
+        .data(&worker_history)
+        .max(app.worker_count.1.max(1) as u64)
+        .style(worker_color(app.worker_count));
+    f.render_widget(worker_spark, chunks[1]);
+
+    let activity_spark = Sparkline::default()
+        .block(Block::default().borders(Borders::ALL).title(" Events 30m "))
+        .data(&activity_history)
+        .max(activity_history.iter().copied().max().unwrap_or(1).max(1))
+        .style(activity_color(
+            activity_history.last().copied().unwrap_or_default(),
+        ));
+    f.render_widget(activity_spark, chunks[2]);
+}
+
+fn render_stage_flow(f: &mut Frame, app: &App, area: Rect) {
+    let mut queued = 0;
+    let mut running = 0;
+    let mut completed = 0;
+    let mut failed = 0;
+
+    for session in &app.agent_sessions {
+        match session.status {
+            AgentStatus::Queued => queued += 1,
+            AgentStatus::Running => running += 1,
+            AgentStatus::Completed => completed += 1,
+            AgentStatus::Failed => failed += 1,
+            AgentStatus::Idle => {}
+        }
+    }
+
+    let max_value = queued.max(running).max(completed).max(failed).max(1) as u64;
+    let bars = vec![
+        Bar::default()
+            .label("queued".into())
+            .value(queued as u64)
+            .style(Style::default().fg(Color::Yellow)),
+        Bar::default()
+            .label("running".into())
+            .value(running as u64)
+            .style(Style::default().fg(Color::Green)),
+        Bar::default()
+            .label("done".into())
+            .value(completed as u64)
+            .style(Style::default().fg(Color::Blue)),
+        Bar::default()
+            .label("failed".into())
+            .value(failed as u64)
+            .style(Style::default().fg(Color::Red)),
+    ];
+
+    let chart = BarChart::default()
+        .block(Block::default().borders(Borders::ALL).title(" Stage Flow "))
+        .data(BarGroup::default().bars(&bars))
+        .bar_width(8)
+        .bar_gap(1)
+        .max(max_value)
+        .value_style(Style::default().add_modifier(Modifier::BOLD))
+        .label_style(Style::default().fg(Color::DarkGray));
+    f.render_widget(chart, area);
+}
+
+fn render_issue_waterfall(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
 
     if app.agent_timeline.is_empty() {
-        detail_lines.push(Line::from("  Select a session to see details."));
+        lines.push(Line::from("  Select a session to see the issue waterfall."));
     } else {
-        detail_lines.push(Line::from(Span::styled(
-            "  Agent Timeline:",
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        detail_lines.push(Line::from(""));
-        for entry in &app.agent_timeline {
-            let status_color = match entry.status {
-                AgentStatus::Running => Color::Green,
-                AgentStatus::Completed => Color::Blue,
-                AgentStatus::Failed => Color::Red,
-                _ => Color::DarkGray,
-            };
-            detail_lines.push(Line::from(vec![
-                Span::raw("  "),
+        let issue_label = app
+            .selected_issue_number_for_timeline()
+            .map(|issue| format!("#{}", issue))
+            .unwrap_or_else(|| "selected issue".to_string());
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {} pipeline", issue_label),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "sequence over recent events",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        lines.push(Line::from(""));
+
+        let lanes = build_waterfall_lanes(&app.agent_timeline);
+        for (agent_type, segments) in lanes {
+            lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{} ", entry.status.symbol()),
-                    Style::default().fg(status_color),
-                ),
-                Span::styled(
-                    format!("{:<20} ", entry.agent_type),
+                    format!("  {:<16}", truncate_agent_label(&agent_type, 16)),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(&entry.detail),
+                Span::raw(" "),
+                Span::raw(segments),
             ]));
         }
     }
 
-    detail_lines.push(Line::from(""));
-    detail_lines.push(Line::from(Span::styled(
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
         "  [c] Comment on PR",
         Style::default().fg(Color::DarkGray),
     )));
 
-    let detail = Paragraph::new(detail_lines).block(
+    let widget = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Session Detail "),
+            .title(" Issue Waterfall "),
     );
-    f.render_widget(detail, right_chunks[1]);
+    f.render_widget(widget, area);
+}
+
+fn render_recent_events(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+
+    if app.recent_events.is_empty() {
+        lines.push(Line::from("  No recent timeline events yet."));
+    } else {
+        for event in &app.recent_events {
+            lines.push(Line::from(vec![
+                Span::styled("  > ", Style::default().fg(Color::DarkGray)),
+                Span::raw(event),
+            ]));
+        }
+    }
+
+    let widget = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Recent Events "),
+    );
+    f.render_widget(widget, area);
 }
 
 fn render_release_tab(f: &mut Frame, app: &App, area: Rect) {
@@ -388,6 +599,124 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray),
     ));
     f.render_widget(bar, area);
+}
+
+fn history_or_zero(history: &std::collections::VecDeque<u64>) -> Vec<u64> {
+    if history.is_empty() {
+        vec![0]
+    } else {
+        history.iter().copied().collect()
+    }
+}
+
+fn rate_limit_label(tier: &str) -> &'static str {
+    if tier.eq_ignore_ascii_case("none") || tier.eq_ignore_ascii_case("clear") {
+        "CLEAR"
+    } else if tier.eq_ignore_ascii_case("low")
+        || tier.eq_ignore_ascii_case("soft")
+        || tier.eq_ignore_ascii_case("watch")
+    {
+        "WATCHING"
+    } else {
+        "CONSTRAINED"
+    }
+}
+
+fn rate_limit_color(tier: &str) -> Color {
+    match rate_limit_label(tier) {
+        "CLEAR" => Color::Green,
+        "WATCHING" => Color::Yellow,
+        _ => Color::Red,
+    }
+}
+
+fn worker_color(worker_count: (usize, usize)) -> Color {
+    let (active, max) = worker_count;
+    if max == 0 {
+        return Color::DarkGray;
+    }
+
+    let ratio = active as f64 / max as f64;
+    if ratio < 0.6 {
+        Color::Green
+    } else if ratio < 0.9 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+fn queue_color(queue_depth: usize, oldest_queue_age_seconds: Option<u64>) -> Color {
+    if queue_depth == 0 {
+        return Color::Green;
+    }
+
+    match oldest_queue_age_seconds.unwrap_or_default() {
+        0..=299 if queue_depth <= 3 => Color::Green,
+        0..=899 if queue_depth <= 8 => Color::Yellow,
+        _ => Color::Red,
+    }
+}
+
+fn queue_state_label(queue_depth: usize, oldest_queue_age_seconds: Option<u64>) -> &'static str {
+    match queue_color(queue_depth, oldest_queue_age_seconds) {
+        Color::Green => "STABLE",
+        Color::Yellow => "WATCHING",
+        _ => "PRESSURE",
+    }
+}
+
+fn activity_color(last_value: u64) -> Color {
+    if last_value == 0 {
+        Color::DarkGray
+    } else if last_value <= 2 {
+        Color::Cyan
+    } else {
+        Color::Green
+    }
+}
+
+fn format_oldest_wait(age_seconds: Option<u64>) -> String {
+    match age_seconds {
+        Some(seconds) => {
+            let minutes = seconds / 60;
+            let seconds = seconds % 60;
+            format!("{minutes:02}m{seconds:02}s")
+        }
+        None => "00m00s".into(),
+    }
+}
+
+fn build_waterfall_lanes(timeline: &[super::tabs::TimelineEntry]) -> Vec<(String, String)> {
+    let mut lanes: Vec<(String, Vec<char>)> = Vec::new();
+
+    for entry in timeline {
+        let symbol = match entry.status {
+            AgentStatus::Queued => '.',
+            AgentStatus::Running => '=',
+            AgentStatus::Completed => '#',
+            AgentStatus::Failed => '!',
+            AgentStatus::Idle => '-',
+        };
+
+        if let Some((_, segments)) = lanes
+            .iter_mut()
+            .find(|(agent_type, _)| agent_type == &entry.agent_type)
+        {
+            segments.push(symbol);
+        } else {
+            lanes.push((entry.agent_type.clone(), vec![symbol]));
+        }
+    }
+
+    lanes
+        .into_iter()
+        .map(|(agent_type, segments)| (agent_type, segments.into_iter().collect()))
+        .collect()
+}
+
+fn truncate_agent_label(agent_type: &str, width: usize) -> String {
+    agent_type.chars().take(width).collect()
 }
 
 #[cfg(test)]

@@ -9,8 +9,8 @@ events and decide what actions to take.
 - Always verify the current state of the issue/PR via your tools before acting.
 - Always read enough context from Github logs and codebase to decide each triage.
 - Respect direct human requests with the highest priority.
-- When in doubt, choose `no_action` over a wrong dispatch.
-- If there is nothing to do anymore, choose `no_action`.
+- When in doubt, avoid a wrong dispatch.
+- If there is nothing to do anymore, do not call `githubclaw dispatch` and exit successfully.
 - If you detect a review loop (same PR reviewed > 3 times), escalate to a human.
 
 ## Contributor Hospitality
@@ -54,11 +54,11 @@ Use the heading `What happens next` when you are explaining the process to contr
 
 ## Rules
 - Never dispatch execution-capable agents on unapproved fork PRs.
-- Always include `reasoning` in your structured output.
-- Combine multiple actions when appropriate (e.g., dispatch + schedule follow-up).
+- Perform real dispatches when needed; otherwise exit cleanly with no dispatch.
 - Treat code-change work as incomplete until a PR targeting `dev` exists.
 - If coding work is requested and `dev` does not exist, instruct the coder to create `dev` from `main` before starting the feature branch.
 - Do not treat a coder run as `SUCCESS` if it reports implementation without a PR URL.
+- Do not fabricate JSON, schemas, or placeholder output.
 
 ## Anti-Loop Rules (CRITICAL)
 - **Do NOT dispatch an agent for an issue that already has an open PR.** Check first with `gh pr list`.

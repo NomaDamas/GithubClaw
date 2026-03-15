@@ -42,7 +42,7 @@ impl App {
                 title: format!("Interactive session live for {}", issue_label),
                 status_line: "Operator is in the loop".into(),
                 bullets: vec![
-                    "Claude Code PTY session is active in the right pane.".into(),
+                    "Interactive PTY session is active in the right pane.".into(),
                     "Approval and rejection stay available after the session exits.".into(),
                 ],
                 next_action: Some(
@@ -195,14 +195,6 @@ impl App {
                 action_state: CardActionState::Passive,
             },
         }
-    }
-
-    fn selected_issue(&self) -> Option<&super::tabs::IssueRequestItem> {
-        self.issue_requests.get(self.selected_issue_index)
-    }
-
-    fn selected_agent_session(&self) -> Option<&super::tabs::AgentSessionItem> {
-        self.agent_sessions.get(self.selected_agent_index)
     }
 }
 

@@ -4,9 +4,54 @@
 //! for rendering inside a ratatui panel. Input from the TUI is forwarded
 //! to the PTY.
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+/// Interactive backend for the embedded PTY session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractiveBackend {
+    ClaudeCode,
+    Codex,
+}
+
+impl InteractiveBackend {
+    /// Resolve the interactive backend from repo-local agent definitions.
+    ///
+    /// Order of precedence:
+    /// 1. `.githubclaw/agents/orchestrator.md`
+    /// 2. Majority backend from `.githubclaw/agents/*.md`
+    /// 3. `defaults/agents/orchestrator.md`
+    /// 4. `codex`
+    pub fn for_repo(repo_root: &Path) -> Self {
+        backend_from_agent_file(&repo_root.join(".githubclaw/agents/orchestrator.md"))
+            .or_else(|| backend_from_agent_dir(&repo_root.join(".githubclaw/agents")))
+            .or_else(|| backend_from_agent_file(&repo_root.join("defaults/agents/orchestrator.md")))
+            .unwrap_or(Self::Codex)
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+        }
+    }
+
+    fn program_and_args(&self, session_name: &str) -> (&'static str, Vec<String>) {
+        match self {
+            Self::ClaudeCode => (
+                "claude",
+                vec!["--resume".to_string(), session_name.to_string()],
+            ),
+            Self::Codex => (
+                "codex",
+                vec!["resume".to_string(), session_name.to_string()],
+            ),
+        }
+    }
+}
 
 /// An embedded PTY session running Claude Code or Codex.
 pub struct PtySession {
@@ -19,10 +64,11 @@ pub struct PtySession {
 }
 
 impl PtySession {
-    /// Spawn a Claude Code interactive session in a PTY.
+    /// Spawn an interactive session in a PTY.
     ///
-    /// `session_name` is used for `--resume` if a prior session exists.
-    pub fn spawn_claude(
+    /// `session_name` is used for the backend-specific resume command.
+    pub fn spawn(
+        backend: InteractiveBackend,
         session_name: &str,
         working_dir: &str,
         cols: u16,
@@ -38,15 +84,17 @@ impl PtySession {
             })
             .map_err(|e| format!("Failed to open PTY: {}", e))?;
 
-        let mut cmd = CommandBuilder::new("claude");
-        cmd.arg("--resume");
-        cmd.arg(session_name);
+        let (program, args) = backend.program_and_args(session_name);
+        let mut cmd = CommandBuilder::new(program);
+        for arg in &args {
+            cmd.arg(arg);
+        }
         cmd.cwd(working_dir);
 
         let child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| format!("Failed to spawn claude in PTY: {}", e))?;
+            .map_err(|e| format!("Failed to spawn {} in PTY: {}", backend.display_name(), e))?;
 
         // Drop slave — we only need the master side
         drop(pair.slave);
@@ -146,5 +194,135 @@ impl PtySession {
         // portable-pty resize requires the master handle which we can't
         // easily access after construction. For now, this is a no-op.
         // A future improvement could store the master for resizing.
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_stub() -> Self {
+        Self {
+            output_buf: Arc::new(Mutex::new(Vec::new())),
+            writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
+            exited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+fn backend_from_agent_file(path: &Path) -> Option<InteractiveBackend> {
+    let agent = crate::agents::parser::parse_agent_file(path).ok()?;
+    Some(match agent.backend.as_str() {
+        "claude-code" => InteractiveBackend::ClaudeCode,
+        _ => InteractiveBackend::Codex,
+    })
+}
+
+fn backend_from_agent_dir(path: &Path) -> Option<InteractiveBackend> {
+    let entries = std::fs::read_dir(path).ok()?;
+    let mut codex = 0usize;
+    let mut claude = 0usize;
+
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+
+        if let Some(backend) = backend_from_agent_file(&path) {
+            match backend {
+                InteractiveBackend::ClaudeCode => claude += 1,
+                InteractiveBackend::Codex => codex += 1,
+            }
+        }
+    }
+
+    if claude == 0 && codex == 0 {
+        None
+    } else if claude > codex {
+        Some(InteractiveBackend::ClaudeCode)
+    } else {
+        Some(InteractiveBackend::Codex)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn claude_resume_command_uses_resume_flag() {
+        let (program, args) = InteractiveBackend::ClaudeCode.program_and_args("session-name");
+        assert_eq!(program, "claude");
+        assert_eq!(
+            args,
+            vec!["--resume".to_string(), "session-name".to_string()]
+        );
+    }
+
+    #[test]
+    fn codex_resume_command_uses_resume_subcommand() {
+        let (program, args) = InteractiveBackend::Codex.program_and_args("session-name");
+        assert_eq!(program, "codex");
+        assert_eq!(args, vec!["resume".to_string(), "session-name".to_string()]);
+    }
+
+    #[test]
+    fn repo_local_orchestrator_backend_takes_precedence() {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path();
+        let agent_dir = repo_root.join(".githubclaw/agents");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("orchestrator.md"),
+            "---\nbackend: codex\n---\n\n# Orchestrator\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            InteractiveBackend::for_repo(repo_root),
+            InteractiveBackend::Codex
+        );
+    }
+
+    #[test]
+    fn repo_agent_backend_majority_beats_default_orchestrator() {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path();
+        let agent_dir = repo_root.join(".githubclaw/agents");
+        let default_dir = repo_root.join("defaults/agents");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::create_dir_all(&default_dir).unwrap();
+        fs::write(
+            agent_dir.join("coder.md"),
+            "---\nbackend: codex\n---\n\n# Coder\n",
+        )
+        .unwrap();
+        fs::write(
+            default_dir.join("orchestrator.md"),
+            "---\nbackend: claude-code\n---\n\n# Orchestrator\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            InteractiveBackend::for_repo(repo_root),
+            InteractiveBackend::Codex
+        );
+    }
+
+    #[test]
+    fn default_orchestrator_backend_is_used_when_repo_has_no_agent_overrides() {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path();
+        let default_dir = repo_root.join("defaults/agents");
+        fs::create_dir_all(&default_dir).unwrap();
+        fs::write(
+            default_dir.join("orchestrator.md"),
+            "---\nbackend: claude-code\n---\n\n# Orchestrator\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            InteractiveBackend::for_repo(repo_root),
+            InteractiveBackend::ClaudeCode
+        );
     }
 }

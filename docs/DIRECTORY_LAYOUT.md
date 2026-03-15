@@ -177,8 +177,6 @@ memory.md
 
 ```
 /tmp/
-├── githubclaw-my-project.sock      # Unix socket for orchestrator IPC
-├── githubclaw-another-repo.sock    # Unix socket per repo
 ├── githubclaw_prompt_abc123.md     # Temp prompt file for agent spawn
 └── ...                              # Temp files cleaned up after agent exit
 ```
