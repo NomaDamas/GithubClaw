@@ -115,6 +115,12 @@ enum Commands {
         /// Repository (owner/name). Defaults to current repo.
         #[arg(long)]
         repo: Option<String>,
+        /// Logical event ID used for dispatch deduplication.
+        #[arg(long)]
+        event_id: Option<String>,
+        /// Optional suffix to distinguish intentionally repeated identical dispatches.
+        #[arg(long)]
+        dedupe_key: Option<String>,
     },
     /// Start a release pipeline: dev -> release branch + PR
     Release {
@@ -141,7 +147,16 @@ pub fn run() {
             issue,
             prompt,
             repo,
-        } => cmd_dispatch(&agent_type, issue, &prompt, repo.as_deref()),
+            event_id,
+            dedupe_key,
+        } => cmd_dispatch(
+            &agent_type,
+            issue,
+            &prompt,
+            repo.as_deref(),
+            event_id.as_deref(),
+            dedupe_key.as_deref(),
+        ),
         Commands::Release { repo } => cmd_release(repo.as_deref()),
         Commands::Tui => cmd_tui(),
     }
@@ -1344,8 +1359,16 @@ fn runtime_timestamp() -> String {
 // cmd_dispatch — Dispatch a worker agent for a specific issue
 // ===========================================================================
 
-fn cmd_dispatch(agent_type: &str, issue: u64, prompt: &str, repo: Option<&str>) {
+fn cmd_dispatch(
+    agent_type: &str,
+    issue: u64,
+    prompt: &str,
+    repo: Option<&str>,
+    event_id_arg: Option<&str>,
+    dedupe_key_arg: Option<&str>,
+) {
     use crate::constants::AGENT_TYPES;
+    use crate::dispatch_receipts::DispatchReceiptStore;
 
     // Validate agent type
     if !AGENT_TYPES.contains(&agent_type) {
@@ -1376,6 +1399,57 @@ fn cmd_dispatch(agent_type: &str, issue: u64, prompt: &str, repo: Option<&str>) 
         eprintln!("Error: not inside a git repository.");
         std::process::exit(1);
     });
+
+    let receipt_store = DispatchReceiptStore::new(&repo_root);
+    let dispatch_event_id = event_id_arg.map(ToString::to_string).or_else(|| {
+        std::env::var("GITHUBCLAW_EVENT_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let dispatch_dedupe_suffix = dedupe_key_arg.map(ToString::to_string).or_else(|| {
+        std::env::var("GITHUBCLAW_DISPATCH_DEDUPE_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let dispatch_receipt_key = dispatch_event_id.as_ref().map(|event_id| {
+        DispatchReceiptStore::key_for(
+            event_id,
+            agent_type,
+            issue,
+            prompt,
+            dispatch_dedupe_suffix.as_deref(),
+        )
+    });
+
+    if let Some(ref receipt_key) = dispatch_receipt_key {
+        if receipt_store.has_receipt(receipt_key) {
+            println!(
+                "Skipping duplicate {} dispatch for {}#{} (receipt {}).",
+                agent_type, repo_name, issue, receipt_key
+            );
+            let started_at = runtime_timestamp();
+            let session_store = crate::session_store::SessionStore::new();
+            let mut runtime_snapshot = session_store
+                .load_runtime_snapshot(&repo_name, issue)
+                .unwrap_or(None)
+                .unwrap_or_else(|| {
+                    crate::runtime_state::IssueRuntimeSnapshot::new(&repo_name, issue)
+                });
+            runtime_snapshot.note_agent_finished(
+                agent_type,
+                &started_at,
+                true,
+                format!(
+                    "Skipped duplicate dispatch for {}#{} (event {})",
+                    repo_name,
+                    issue,
+                    dispatch_event_id.as_deref().unwrap_or_default()
+                ),
+            );
+            let _ = session_store.save_runtime_snapshot(&repo_name, &runtime_snapshot);
+            return;
+        }
+    }
 
     println!(
         "Dispatching {} agent for {}#{} ...",
@@ -1472,6 +1546,20 @@ fn cmd_dispatch(agent_type: &str, issue: u64, prompt: &str, repo: Option<&str>) 
             runtime_snapshot.note_agent_finished(agent_type, &started_at, code == 0, detail);
             let _ = session_store.save_runtime_snapshot(&repo_name, &runtime_snapshot);
             if code == 0 {
+                if let Some(event_id) = dispatch_event_id.as_deref() {
+                    if let Err(err) = receipt_store.record_success(
+                        event_id,
+                        agent_type,
+                        issue,
+                        prompt,
+                        dispatch_dedupe_suffix.as_deref(),
+                    ) {
+                        eprintln!(
+                            "Warning: failed to persist dispatch receipt for '{}': {}",
+                            agent_type, err
+                        );
+                    }
+                }
                 println!("Agent '{}' completed successfully.", agent_type);
             } else {
                 eprintln!("Agent '{}' exited with code {}.", agent_type, code);
@@ -1735,5 +1823,41 @@ mod tests {
         assert_eq!(parse_github_remote("not-a-url"), None);
         assert_eq!(parse_github_remote("https://gitlab.com/owner/repo"), None);
         assert_eq!(parse_github_remote(""), None);
+    }
+
+    #[test]
+    fn test_dispatch_command_accepts_dedupe_flags() {
+        let cli = Cli::try_parse_from([
+            "githubclaw",
+            "dispatch",
+            "implementer",
+            "--issue",
+            "42",
+            "--prompt",
+            "Fix bug",
+            "--event-id",
+            "evt-123",
+            "--dedupe-key",
+            "second-pass",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Dispatch {
+                agent_type,
+                issue,
+                prompt,
+                event_id,
+                dedupe_key,
+                ..
+            } => {
+                assert_eq!(agent_type, "implementer");
+                assert_eq!(issue, 42);
+                assert_eq!(prompt, "Fix bug");
+                assert_eq!(event_id.as_deref(), Some("evt-123"));
+                assert_eq!(dedupe_key.as_deref(), Some("second-pass"));
+            }
+            _ => panic!("expected dispatch command"),
+        }
     }
 }

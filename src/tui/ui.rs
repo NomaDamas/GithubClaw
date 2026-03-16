@@ -28,7 +28,6 @@ pub fn render(f: &mut Frame, app: &App) {
     match app.active_tab {
         Tab::IssueRequest => render_issue_request_tab(f, app, chunks[1]),
         Tab::Monitoring => render_monitoring_tab(f, app, chunks[1]),
-        Tab::Release => render_release_tab(f, app, chunks[1]),
     }
 
     render_status_bar(f, app, chunks[2]);
@@ -55,7 +54,6 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         .select(match app.active_tab {
             Tab::IssueRequest => 0,
             Tab::Monitoring => 1,
-            Tab::Release => 2,
         });
 
     f.render_widget(tabs, area);
@@ -471,67 +469,6 @@ fn render_recent_events(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(widget, area);
 }
 
-fn render_release_tab(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(0)])
-        .split(area);
-    render_summary_card(f, &app.release_summary_card(), chunks[0]);
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    match &app.release_info {
-        Some(info) => {
-            lines.push(Line::from(vec![
-                Span::raw("  Branch: "),
-                Span::styled(&info.branch, Style::default().fg(Color::Cyan)),
-                Span::raw(" -> main"),
-            ]));
-
-            if let Some(pr) = info.pr_number {
-                lines.push(Line::from(format!("  PR: #{}", pr)));
-            }
-
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "  Included Issues:",
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-            for (num, title) in &info.included_issues {
-                lines.push(Line::from(format!("    #{} {}", num, title)));
-            }
-
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "  Dogfooding Checklist:",
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-            for item in &info.checklist {
-                let check = if item.checked { "[x]" } else { "[ ]" };
-                lines.push(Line::from(format!("    {} {}", check, item.text)));
-            }
-        }
-        None => {
-            lines.push(Line::from("  No active release pipeline."));
-            lines.push(Line::from(""));
-            lines.push(Line::from("  Press [r] to start a release."));
-        }
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  [r] Run release  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "[o] Open PR in browser",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
-
-    let release =
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Release "));
-    f.render_widget(release, chunks[1]);
-}
-
 fn render_summary_card(f: &mut Frame, card: &SummaryCard, area: Rect) {
     let tone_color = match card.tone {
         CardTone::Info => Color::Cyan,
@@ -590,8 +527,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 "j/k: Navigate  Enter: Open Session  Ctrl+A: Approve  Ctrl+R: Reject  Tab: Switch  q: Quit"
             }
         }
-        Tab::Monitoring => "j/k: Navigate  c: Comment  Tab: Switch  q: Quit",
-        Tab::Release => "r: Release  o: Open PR  Tab: Switch  q: Quit",
+        Tab::Monitoring => "j/k: Navigate  Tab: Switch  q: Quit",
     };
 
     let bar = Paragraph::new(Span::styled(
@@ -728,16 +664,14 @@ mod tests {
     fn tab_titles() {
         assert_eq!(Tab::IssueRequest.title(), "Issue Request");
         assert_eq!(Tab::Monitoring.title(), "Monitoring");
-        assert_eq!(Tab::Release.title(), "Release");
     }
 
     // 2. Tab cycling
     #[test]
     fn tab_cycling() {
         assert_eq!(Tab::IssueRequest.next(), Tab::Monitoring);
-        assert_eq!(Tab::Monitoring.next(), Tab::Release);
-        assert_eq!(Tab::Release.next(), Tab::IssueRequest);
-        assert_eq!(Tab::IssueRequest.prev(), Tab::Release);
+        assert_eq!(Tab::Monitoring.next(), Tab::IssueRequest);
+        assert_eq!(Tab::IssueRequest.prev(), Tab::Monitoring);
     }
 
     // 3. AgentStatus symbols

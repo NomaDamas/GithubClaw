@@ -56,7 +56,7 @@ const READ_ONLY_AGENT_TYPES: &[&str] = &["security_reviewer"];
 
 /// Return `true` if the dispatch is allowed, `false` if it should be blocked.
 ///
-/// Enforcement rules (from SECURITY.md):
+/// Enforcement rules for fork PR execution:
 /// - Not a fork PR -> allow
 /// - Fork PR with `githubclaw-approved` label -> allow
 /// - Read-only agents (e.g. `security_reviewer`) -> always allow

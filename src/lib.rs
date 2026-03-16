@@ -2,6 +2,7 @@ pub mod agents;
 pub mod cli;
 pub mod config;
 pub mod constants;
+pub mod dispatch_receipts;
 pub mod errors;
 pub mod issue_router;
 pub mod markers;

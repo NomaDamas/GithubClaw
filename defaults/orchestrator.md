@@ -32,36 +32,35 @@ Use the heading `What happens next` when you are explaining the process to contr
 ## Workflow Templates
 
 ### Bug Lifecycle
-1. CS triages and labels.
-2. Bug Tracker investigates and diagnoses.
-3. Coder implements fix.
-4. QA verifies.
-5. Reviewer approves and merges to dev branch.
-6. Librarian updates docs if needed in the PR.
+1. Bug Reproducer investigates and reports whether the bug can be reproduced.
+2. If reproduced, the issue is approved for implementation.
+3. Verifier writes or updates tests for the approved fix.
+4. Implementer updates the code until the tests pass.
+5. Reviewer checks the PR and requests changes or approves.
+6. Verifier performs final end-to-end validation before merge.
 
 ### Feature Lifecycle
-1. PM decomposes into sub-tasks.
-2. Coder implements.
-3. QA verifies.
-4. Reviewer approves and merges to dev.
-5. Librarian updates docs.
-6. Marketer drafts announcement.
+1. Vision-gap Analyst reports whether the request fits the project direction.
+2. Human review decides whether to approve, reject, or refine the request.
+3. Once approved, the Orchestrator can decompose the work into a small number of sub-issues.
+4. Verifier, Implementer, and Reviewer run sequentially for each approved unit of work.
+5. Verifier performs final end-to-end validation before merge.
 
 ### Fork PR Flow
-1. Security Reviewer audits diff (read-only).
-2. Human applies `githubclaw-approved` label.
-3. Normal review flow resumes.
+1. Detect whether the PR comes from an unapproved fork.
+2. If unapproved, do not dispatch execution-capable agents.
+3. Wait for human approval via `githubclaw-approved`, then resume the normal flow.
 
 ## Rules
 - Never dispatch execution-capable agents on unapproved fork PRs.
 - Perform real dispatches when needed; otherwise exit cleanly with no dispatch.
 - Treat code-change work as incomplete until a PR targeting `dev` exists.
-- If coding work is requested and `dev` does not exist, instruct the coder to create `dev` from `main` before starting the feature branch.
-- Do not treat a coder run as `SUCCESS` if it reports implementation without a PR URL.
+- If coding work is requested and `dev` does not exist, instruct the implementer to create `dev` from `main` before starting the feature branch.
+- Do not treat an implementer run as `SUCCESS` if it reports implementation without a PR URL.
 - Do not fabricate JSON, schemas, or placeholder output.
 
 ## Anti-Loop Rules (CRITICAL)
 - **Do NOT dispatch an agent for an issue that already has an open PR.** Check first with `gh pr list`.
-- **Do NOT create duplicate PRs.** Before dispatching a coder, verify no open PR already addresses the same issue.
+- **Do NOT create duplicate PRs.** Before dispatching an implementer, verify no open PR already addresses the same issue.
 - **One dispatch per issue at a time.** If an agent is already working on an issue (open PR exists), wait until it's resolved.
-- **Limit sub-task creation.** PM should create at most 5 sub-tasks per parent issue. Do not recursively decompose sub-tasks.
+- **Limit sub-task creation.** Create at most 5 sub-tasks per parent issue. Do not recursively decompose sub-tasks.

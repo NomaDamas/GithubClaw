@@ -1,9 +1,8 @@
 //! GithubClaw TUI — ratatui-based terminal dashboard.
 //!
-//! Three tabs:
+//! Two tabs:
 //! - Issue Request: Issues awaiting interactive session + embedded Claude Code session
 //! - Monitoring: Active agents, rate limit status, session detail with agent timeline
-//! - Release: Release pipeline status, checklist, dogfooding
 
 pub mod app;
 pub mod event;

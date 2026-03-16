@@ -135,16 +135,12 @@ Events flow in a loop: GitHub fires a webhook, the server routes it to a per-rep
 
 | Agent | Role | Trigger |
 |-------|------|---------|
-| **CS** | Triage issues, answer questions, close duplicates | New issues, external comments |
-| **Bug Tracker** | Reproduce and diagnose bugs (never fixes them) | Issues labeled as bugs |
-| **Librarian** | Maintain docs, README, and guides | PR merges with feature changes |
-| **Project Manager** | Decompose tasks, prioritize, detect blockers | Large or new issues needing breakdown |
-| **Coder** | Write code, open PRs, fix CI failures | Implementation tasks |
-| **QA** | E2E testing with Playwright + VLM screenshots | After Coder opens PR and CI passes |
-| **Reviewer** | Code review, request changes, merge to dev | After QA passes |
-| **Contents Marketer** | Draft tweets, blog posts, announcements | Notable feature merges or cron |
-| **Visionary** | Daily summaries, roadmap proposals, strategic ideas | Daily cron |
-| **Security Reviewer** | Read-only audit of fork PR diffs | Fork PRs detected |
+| **Orchestrator** | Classify issues, analyze context, dispatch the next agent via `githubclaw dispatch` | Every actionable GitHub event |
+| **Bug Reproducer** | Reproduce and diagnose bugs without fixing them | Bug issues |
+| **Vision-gap Analyst** | Analyze feature and refactoring requests before human approval | Feature and refactoring issues |
+| **Verifier** | Write tests first and perform end-to-end validation | Before implementation and before merge |
+| **Implementer** | Write code to satisfy the verified plan and tests | Approved implementation work |
+| **Reviewer** | Review PRs and gate progress to `dev` | After implementation updates |
 
 ## CLI Commands
 
@@ -165,10 +161,11 @@ Events flow in a loop: GitHub fires a webhook, the server routes it to a per-rep
 ├── global-prompt.md         # Common rules, agent roster, handoff conventions
 ├── VALUE.md                 # Project mission / north star
 ├── agents/                  # One prompt file per agent (YAML frontmatter + markdown)
-│   ├── cs.md
-│   ├── bug_tracker.md
-│   ├── coder.md
-│   ├── qa.md
+│   ├── orchestrator.md
+│   ├── bug_reproducer.md
+│   ├── vision_gap_analyst.md
+│   ├── verifier.md
+│   ├── implementer.md
 │   ├── reviewer.md
 │   └── ...
 ├── ai_instructions/         # Shared skill modules (Playwright, GitHub Projects, etc.)
@@ -192,9 +189,7 @@ All agent PRs target `dev`. The Reviewer agent can approve and merge to `dev`, b
 
 For detailed specs, see:
 
-- `docs/ARCHITECTURE.md` -- System components, event flow, technology stack
-- `docs/AGENTS.md` -- Full agent roster with triggers, scopes, and interaction patterns
-- `docs/DIRECTORY_LAYOUT.md` -- Complete file listing and ownership matrix
+- `docs/ARCHITECTURE.md` -- Current system design and runtime model
 
 ## Requirements
 

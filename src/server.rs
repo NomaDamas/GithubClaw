@@ -272,6 +272,19 @@ fn fallback_queue_dir(githubclaw_home: &Path, repo_full_name: &str) -> PathBuf {
     dir
 }
 
+fn is_process_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    if result == 0 {
+        return true;
+    }
+
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(code) if code == libc::EPERM => true,
+        Some(code) if code == libc::ESRCH => false,
+        _ => false,
+    }
+}
+
 fn runtime_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -373,6 +386,13 @@ async fn webhook_handler(
         .get("X-Github-Event")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
+    let delivery_id = headers
+        .get("X-GitHub-Delivery")
+        .or_else(|| headers.get("X-Github-Delivery"))
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let action = payload.get("action").and_then(Value::as_str).unwrap_or("");
 
@@ -387,6 +407,10 @@ async fn webhook_handler(
         obj.insert(
             "_githubclaw_event_type".to_string(),
             serde_json::Value::String(event_type.to_string()),
+        );
+        obj.insert(
+            "_githubclaw_event_id".to_string(),
+            serde_json::Value::String(delivery_id.clone()),
         );
     }
 
@@ -406,12 +430,14 @@ async fn webhook_handler(
         )
     })?;
 
-    queue.enqueue(payload, &event_label).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Enqueue error: {}", e),
-        )
-    })?;
+    queue
+        .enqueue_with_id(payload, &event_label, Some(delivery_id))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Enqueue error: {}", e),
+            )
+        })?;
 
     let queue_size = queue.size();
     info!(
@@ -851,7 +877,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             );
             break;
         }
-        // 1. Peek the queue for the next event.
+        // 1. Recover any orphaned inflight event and peek the next queued event.
         let peeked = {
             let mut queues = state.queues.lock().await;
             let registry = registry_snapshot(state).await;
@@ -868,13 +894,30 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                     continue;
                 }
             };
-            match queue.peek() {
-                Ok(Some(event)) => Some(event),
-                Ok(None) => None,
+
+            match queue.recover_orphaned_inflight(is_process_alive) {
+                Ok(recovered) if recovered > 0 => {
+                    info!(repo = %repo_name, recovered, "Recovered orphaned inflight events");
+                }
+                Ok(_) => {}
                 Err(e) => {
-                    error!(repo = %repo_name, "Failed to peek queue: {}", e);
+                    error!(repo = %repo_name, "Failed to recover inflight events: {}", e);
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     continue;
+                }
+            }
+
+            if queue.has_inflight() {
+                None
+            } else {
+                match queue.peek() {
+                    Ok(Some(event)) => Some(event),
+                    Ok(None) => None,
+                    Err(e) => {
+                        error!(repo = %repo_name, "Failed to peek queue: {}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
                 }
             }
         };
@@ -882,7 +925,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         let event = match peeked {
             Some(ev) => ev,
             None => {
-                // Queue is empty — sleep and try again.
+                // Queue is empty or another orchestrator attempt is still inflight.
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 continue;
             }
@@ -1037,7 +1080,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             Some(entry) => entry.local_path.clone(),
             None => {
                 error!(repo = %repo_name, "Repo not in registry");
-                nack_head_event(state, repo_name, &event.filename).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 continue;
             }
         };
@@ -1050,9 +1093,43 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             prompt_tmp_dir.join(format!("{}-{}.txt", repo_name.replace('/', "_"), issue_id));
         if let Err(e) = std::fs::write(&prompt_file, &orchestrator_prompt) {
             error!(repo = %repo_name, "Failed to write orchestrator prompt file: {}", e);
-            nack_head_event(state, repo_name, &event.filename).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             continue;
         }
+
+        let mut reserved_event = {
+            let mut queues = state.queues.lock().await;
+            let registry = registry_snapshot(state).await;
+            let queue = match get_or_create_queue(
+                &mut queues,
+                &registry,
+                &state.githubclaw_home,
+                repo_name,
+            ) {
+                Ok(q) => q,
+                Err(e) => {
+                    error!(repo = %repo_name, "Failed to get queue for reserve: {}", e);
+                    let _ = std::fs::remove_file(&prompt_file);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+
+            match queue.reserve_next() {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    let _ = std::fs::remove_file(&prompt_file);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+                Err(e) => {
+                    error!(repo = %repo_name, "Failed to reserve queue head: {}", e);
+                    let _ = std::fs::remove_file(&prompt_file);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            }
+        };
 
         // Build orchestrator command
         // Use a deterministic session name so --resume works across invocations
@@ -1074,6 +1151,10 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             env.insert("GITHUBCLAW_ROOT_ISSUE".to_string(), issue_id.to_string());
         }
         env.insert("GITHUBCLAW_REPO".to_string(), repo_name.to_string());
+        env.insert(
+            "GITHUBCLAW_EVENT_ID".to_string(),
+            reserved_event.event_id.clone(),
+        );
 
         // Inject gh wrapper PATH
         let spawner = crate::agents::spawner::AgentSpawner::new(
@@ -1108,32 +1189,29 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         // Spawn orchestrator
         let program = cmd_args[0].clone();
         let args = cmd_args[1..].to_vec();
-        let repo_dir_clone = repo_dir.clone();
-        let process_manager = Arc::clone(&state.process_manager);
-        let rate_limiter = Arc::clone(&state.rate_limiter);
-        let repo_name_clone = repo_name.to_string();
+        let started_at = runtime_timestamp();
 
-        match tokio::process::Command::new(&program)
+        if issue_id > 0 {
+            let mut snapshot = load_or_new_runtime_snapshot(state, repo_name, issue_id);
+            snapshot.note_agent_started(
+                "orchestrator",
+                &started_at,
+                format!("Processing queued event for issue #{}", issue_id),
+            );
+            save_runtime_snapshot(state, repo_name, &snapshot);
+        }
+
+        let spawn_result = tokio::process::Command::new(&program)
             .args(&args)
             .envs(&env)
-            .current_dir(&repo_dir_clone)
+            .current_dir(&repo_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(mut child) => {
-                let pid = child.id().unwrap_or(0);
-                let started_at = runtime_timestamp();
+            .spawn();
 
-                if issue_id > 0 {
-                    let mut snapshot = load_or_new_runtime_snapshot(state, repo_name, issue_id);
-                    snapshot.note_agent_started(
-                        "orchestrator",
-                        &started_at,
-                        format!("Processing queued event for issue #{}", issue_id),
-                    );
-                    save_runtime_snapshot(state, repo_name, &snapshot);
-                }
+        match spawn_result {
+            Ok(child) => {
+                let pid = child.id().unwrap_or(0);
 
                 // Register with process manager
                 state
@@ -1147,88 +1225,156 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                     )
                     .await;
 
-                // Monitor in background
-                let started_at_clone = started_at.clone();
-                tokio::spawn(async move {
-                    match child.wait().await {
-                        Ok(status) => {
-                            let exit_code = status.code().unwrap_or(-1);
-                            process_manager.report_exit(pid, exit_code).await;
-                            if exit_code != 0 {
-                                tracing::warn!(
-                                    repo = %repo_name_clone,
-                                    pid = pid,
-                                    exit_code = exit_code,
-                                    "Orchestrator exited with non-zero code"
-                                );
-                                rate_limiter.report_orchestrator_rate_limit();
-                            } else {
-                                tracing::info!(
-                                    repo = %repo_name_clone,
-                                    pid = pid,
-                                    "Orchestrator completed successfully"
-                                );
-                            }
-
-                            if issue_id > 0 {
-                                let store = crate::session_store::SessionStore::new();
-                                let mut snapshot = store
-                                    .load_runtime_snapshot(&repo_name_clone, issue_id)
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_else(|| {
-                                        IssueRuntimeSnapshot::new(&repo_name_clone, issue_id)
-                                    });
-                                let detail = if exit_code == 0 {
-                                    format!("Completed issue #{}", issue_id)
-                                } else {
-                                    format!(
-                                        "Exited with status {} while processing issue #{}",
-                                        exit_code, issue_id
-                                    )
-                                };
-                                snapshot.note_agent_finished(
-                                    "orchestrator",
-                                    &started_at_clone,
-                                    exit_code == 0,
-                                    &detail,
-                                );
-                                let _ = store.save_runtime_snapshot(&repo_name_clone, &snapshot);
-                            }
-
-                            // Try to capture session ID from stdout for --resume
-                            if let Some(stdout) = child.stdout {
-                                use tokio::io::AsyncReadExt;
-                                let mut buf = String::new();
-                                let mut reader = tokio::io::BufReader::new(stdout);
-                                let _ = reader.read_to_string(&mut buf).await;
-                                // Session ID is typically in the output
-                                // For now, the session persistence is handled by
-                                // Claude Code's built-in session management
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                repo = %repo_name_clone,
+                {
+                    let mut queues = state.queues.lock().await;
+                    let registry = registry_snapshot(state).await;
+                    if let Ok(queue) = get_or_create_queue(
+                        &mut queues,
+                        &registry,
+                        &state.githubclaw_home,
+                        repo_name,
+                    ) {
+                        if let Err(err) = queue.attach_processor_pid(&mut reserved_event, pid) {
+                            warn!(
+                                repo = %repo_name,
                                 pid = pid,
-                                "Failed to wait on orchestrator: {}",
-                                e
+                                "Failed to attach orchestrator pid to inflight reservation: {}",
+                                err
                             );
-                            process_manager.report_exit(pid, 1).await;
-                            rate_limiter.report_orchestrator_rate_limit();
                         }
                     }
-                });
+                }
+
+                let output = child.wait_with_output().await;
+                match output {
+                    Ok(output) => {
+                        let exit_code = output.status.code().unwrap_or(-1);
+                        state.process_manager.report_exit(pid, exit_code).await;
+
+                        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+                        if exit_code == 0 {
+                            info!(
+                                repo = %repo_name,
+                                pid = pid,
+                                event_id = %reserved_event.event_id,
+                                stdout = %stdout,
+                                "Orchestrator completed successfully"
+                            );
+                            let mut queues = state.queues.lock().await;
+                            let registry = registry_snapshot(state).await;
+                            if let Ok(queue) = get_or_create_queue(
+                                &mut queues,
+                                &registry,
+                                &state.githubclaw_home,
+                                repo_name,
+                            ) {
+                                if let Err(err) = queue.ack_reserved(&reserved_event) {
+                                    error!(
+                                        repo = %repo_name,
+                                        event_id = %reserved_event.event_id,
+                                        "Failed to ack reserved event: {}",
+                                        err
+                                    );
+                                }
+                            }
+                        } else {
+                            warn!(
+                                repo = %repo_name,
+                                pid = pid,
+                                exit_code = exit_code,
+                                event_id = %reserved_event.event_id,
+                                stdout = %stdout,
+                                stderr = %stderr,
+                                "Orchestrator exited with non-zero code"
+                            );
+                            state.rate_limiter.report_orchestrator_rate_limit();
+                            let mut queues = state.queues.lock().await;
+                            let registry = registry_snapshot(state).await;
+                            if let Ok(queue) = get_or_create_queue(
+                                &mut queues,
+                                &registry,
+                                &state.githubclaw_home,
+                                repo_name,
+                            ) {
+                                if let Err(err) = queue.nack_reserved(&mut reserved_event) {
+                                    error!(
+                                        repo = %repo_name,
+                                        event_id = %reserved_event.event_id,
+                                        "Failed to nack reserved event: {}",
+                                        err
+                                    );
+                                }
+                            }
+                        }
+
+                        if issue_id > 0 {
+                            let mut snapshot =
+                                load_or_new_runtime_snapshot(state, repo_name, issue_id);
+                            let detail = if exit_code == 0 {
+                                format!("Completed issue #{}", issue_id)
+                            } else {
+                                format!(
+                                    "Exited with status {} while processing issue #{}",
+                                    exit_code, issue_id
+                                )
+                            };
+                            snapshot.note_agent_finished(
+                                "orchestrator",
+                                &started_at,
+                                exit_code == 0,
+                                detail,
+                            );
+                            save_runtime_snapshot(state, repo_name, &snapshot);
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            repo = %repo_name,
+                            pid = pid,
+                            event_id = %reserved_event.event_id,
+                            "Failed to wait on orchestrator: {}",
+                            e
+                        );
+                        state.process_manager.report_exit(pid, 1).await;
+                        state.rate_limiter.report_orchestrator_rate_limit();
+
+                        let mut queues = state.queues.lock().await;
+                        let registry = registry_snapshot(state).await;
+                        if let Ok(queue) = get_or_create_queue(
+                            &mut queues,
+                            &registry,
+                            &state.githubclaw_home,
+                            repo_name,
+                        ) {
+                            if let Err(err) = queue.nack_reserved(&mut reserved_event) {
+                                error!(
+                                    repo = %repo_name,
+                                    event_id = %reserved_event.event_id,
+                                    "Failed to nack reserved event after wait error: {}",
+                                    err
+                                );
+                            }
+                        }
+
+                        if issue_id > 0 {
+                            let mut snapshot =
+                                load_or_new_runtime_snapshot(state, repo_name, issue_id);
+                            snapshot.note_agent_finished(
+                                "orchestrator",
+                                &started_at,
+                                false,
+                                format!("Failed to wait for issue #{}: {}", issue_id, e),
+                            );
+                            save_runtime_snapshot(state, repo_name, &snapshot);
+                        }
+                    }
+                }
             }
             Err(e) => {
                 if issue_id > 0 {
-                    let started_at = runtime_timestamp();
                     let mut snapshot = load_or_new_runtime_snapshot(state, repo_name, issue_id);
-                    snapshot.note_agent_started(
-                        "orchestrator",
-                        &started_at,
-                        format!("Processing queued event for issue #{}", issue_id),
-                    );
                     snapshot.note_agent_finished(
                         "orchestrator",
                         &started_at,
@@ -1243,59 +1389,26 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                     e,
                 );
                 state.rate_limiter.report_orchestrator_rate_limit();
-                nack_head_event(state, repo_name, &event.filename).await;
+                let mut queues = state.queues.lock().await;
+                let registry = registry_snapshot(state).await;
+                if let Ok(queue) =
+                    get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+                {
+                    if let Err(err) = queue.nack_reserved(&mut reserved_event) {
+                        error!(
+                            repo = %repo_name,
+                            event_id = %reserved_event.event_id,
+                            "Failed to nack reserved event after spawn failure: {}",
+                            err
+                        );
+                    }
+                }
+                let _ = std::fs::remove_file(&prompt_file);
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 continue;
             }
         }
-
-        // 6. The orchestrator subprocess is fire-and-forget.
-        //    The Orchestrator handles dispatch via `githubclaw dispatch` CLI.
-        //    Dequeue the event — it's been handed off to the subprocess.
-        {
-            let mut queues = state.queues.lock().await;
-            let registry = registry_snapshot(state).await;
-            if let Ok(q) =
-                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
-            {
-                if let Err(e) = q.dequeue() {
-                    error!(repo = %repo_name, "Failed to dequeue after orchestrator spawn: {}", e);
-                }
-            }
-        }
-    }
-}
-
-/// Helper: dequeue the head event and nack it (re-enqueue with incremented retry
-/// or move to dead-letter if max retries exceeded).
-async fn nack_head_event(state: &Arc<ServerState>, repo_name: &str, _filename: &str) {
-    let mut queues = state.queues.lock().await;
-    let registry = registry_snapshot(state).await;
-    let queue = match get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
-    {
-        Ok(q) => q,
-        Err(e) => {
-            error!(repo = %repo_name, "Failed to get queue for nack: {}", e);
-            return;
-        }
-    };
-    match queue.dequeue() {
-        Ok(Some(mut event)) => {
-            if let Err(e) = queue.nack(&mut event, "event") {
-                error!(
-                    repo = %repo_name,
-                    seq = event.sequence,
-                    "Failed to nack event: {}",
-                    e,
-                );
-            }
-        }
-        Ok(None) => {
-            warn!(repo = %repo_name, "Tried to nack but queue was empty");
-        }
-        Err(e) => {
-            error!(repo = %repo_name, "Failed to dequeue for nack: {}", e);
-        }
+        let _ = std::fs::remove_file(&prompt_file);
     }
 }
 
@@ -1742,6 +1855,7 @@ mod tests {
                     .uri("/webhook")
                     .header("Content-Type", "application/json")
                     .header("X-Github-Event", "issues")
+                    .header("X-GitHub-Delivery", "delivery-123")
                     .header("X-Hub-Signature-256", &signature)
                     .body(Body::from(payload))
                     .unwrap(),
@@ -1755,6 +1869,9 @@ mod tests {
         let queues = state_clone.queues.lock().await;
         let queue = queues.get("owner/repo").unwrap();
         assert_eq!(queue.size(), 1);
+        let event = queue.peek().unwrap().unwrap();
+        assert_eq!(event.event_id, "delivery-123");
+        assert_eq!(event.event_type, "issues_opened");
     }
 
     // ---------------------------------------------------------------

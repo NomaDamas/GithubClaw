@@ -56,9 +56,6 @@ pub struct App {
     pub recent_events: VecDeque<String>,
     last_history_minute: Option<u64>,
     last_timeline_len: usize,
-
-    // Release tab state
-    pub release_info: Option<ReleaseInfo>,
 }
 
 impl App {
@@ -86,7 +83,6 @@ impl App {
             recent_events: VecDeque::with_capacity(8),
             last_history_minute: None,
             last_timeline_len: 0,
-            release_info: None,
         }
     }
 
@@ -223,7 +219,6 @@ impl App {
         match self.active_tab {
             Tab::IssueRequest => self.handle_issue_request_key(code, modifiers),
             Tab::Monitoring => self.handle_monitoring_key(code, modifiers),
-            Tab::Release => self.handle_release_key(code, modifiers),
         }
     }
 
@@ -317,21 +312,6 @@ impl App {
                         .checked_sub(1)
                         .unwrap_or(self.agent_sessions.len() - 1);
                 }
-            }
-            KeyCode::Char('c') => {
-                // Would open PR comment input
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_release_key(&mut self, code: KeyCode, _modifiers: KeyModifiers) {
-        match code {
-            KeyCode::Char('r') => {
-                // Would run githubclaw release
-            }
-            KeyCode::Char('o') => {
-                // Would open PR in browser
             }
             _ => {}
         }
@@ -740,8 +720,6 @@ mod tests {
         app.handle_event(key_event(KeyCode::Tab));
         assert_eq!(app.active_tab, Tab::Monitoring);
         app.handle_event(key_event(KeyCode::Tab));
-        assert_eq!(app.active_tab, Tab::Release);
-        app.handle_event(key_event(KeyCode::Tab));
         assert_eq!(app.active_tab, Tab::IssueRequest);
     }
 
@@ -750,9 +728,9 @@ mod tests {
     fn backtab_cycles_backward() {
         let mut app = App::new();
         app.handle_event(key_event(KeyCode::BackTab));
-        assert_eq!(app.active_tab, Tab::Release);
-        app.handle_event(key_event(KeyCode::BackTab));
         assert_eq!(app.active_tab, Tab::Monitoring);
+        app.handle_event(key_event(KeyCode::BackTab));
+        assert_eq!(app.active_tab, Tab::IssueRequest);
     }
 
     // 4. q quits the app

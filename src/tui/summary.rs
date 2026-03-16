@@ -1,7 +1,7 @@
 //! Deterministic summary cards for the TUI.
 
 use super::app::App;
-use super::tabs::{AgentStatus, ReleaseInfo};
+use super::tabs::AgentStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardTone {
@@ -179,68 +179,12 @@ impl App {
             action_state,
         }
     }
-
-    pub fn release_summary_card(&self) -> SummaryCard {
-        match &self.release_info {
-            Some(info) => release_summary(info),
-            None => SummaryCard {
-                title: "No active release pipeline".into(),
-                status_line: "Release tab is ready when you are".into(),
-                bullets: vec![
-                    "A release run will prepare the branch and show the checklist here.".into(),
-                    "Use this tab when you want a calm end-of-day ship room.".into(),
-                ],
-                next_action: Some("Press r when you want to kick off a release.".into()),
-                tone: CardTone::Info,
-                action_state: CardActionState::Passive,
-            },
-        }
-    }
-}
-
-fn release_summary(info: &ReleaseInfo) -> SummaryCard {
-    let remaining = info.checklist.iter().filter(|item| !item.checked).count();
-    let included = info.included_issues.len();
-    let mut bullets = vec![format!(
-        "{} issues are grouped into this release.",
-        included
-    )];
-    if let Some(pr) = info.pr_number {
-        bullets.push(format!("Release PR #{} is already open.", pr));
-    } else {
-        bullets.push("Release PR has not been opened yet.".into());
-    }
-    bullets.push(format!(
-        "{} checklist item{} still need attention.",
-        remaining,
-        if remaining == 1 { "" } else { "s" }
-    ));
-
-    if remaining == 0 {
-        SummaryCard {
-            title: format!("{} is ready for the final release pass", info.branch),
-            status_line: "Checklist complete".into(),
-            bullets,
-            next_action: Some("Open the PR or move into final human review.".into()),
-            tone: CardTone::Success,
-            action_state: CardActionState::Done,
-        }
-    } else {
-        SummaryCard {
-            title: format!("{} is in release prep", info.branch),
-            status_line: "Checklist still in progress".into(),
-            bullets,
-            next_action: Some("Finish the remaining checklist items before shipping.".into()),
-            tone: CardTone::Warning,
-            action_state: CardActionState::Watching,
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::tabs::{AgentSessionItem, ChecklistItem, IssueRequestItem, TimelineEntry};
+    use crate::tui::tabs::{AgentSessionItem, IssueRequestItem, TimelineEntry};
 
     #[test]
     fn issue_request_card_shows_needs_decision() {
@@ -277,31 +221,5 @@ mod tests {
         assert_eq!(card.action_state, CardActionState::Blocked);
         assert_eq!(card.tone, CardTone::Danger);
         assert!(card.next_action.unwrap().contains("retry path"));
-    }
-
-    #[test]
-    fn release_card_highlights_remaining_checklist_items() {
-        let mut app = App::new();
-        app.release_info = Some(ReleaseInfo {
-            branch: "release/2026-03-15".into(),
-            pr_number: Some(88),
-            pr_url: None,
-            included_issues: vec![(1, "Ship summary card".into())],
-            checklist: vec![
-                ChecklistItem {
-                    text: "Dogfood locally".into(),
-                    checked: true,
-                },
-                ChecklistItem {
-                    text: "Merge release PR".into(),
-                    checked: false,
-                },
-            ],
-        });
-
-        let card = app.release_summary_card();
-        assert_eq!(card.tone, CardTone::Warning);
-        assert_eq!(card.action_state, CardActionState::Watching);
-        assert!(card.status_line.contains("Checklist still in progress"));
     }
 }

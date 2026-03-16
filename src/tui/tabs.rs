@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 pub enum Tab {
     IssueRequest,
     Monitoring,
-    Release,
 }
 
 impl Tab {
@@ -15,27 +14,24 @@ impl Tab {
         match self {
             Self::IssueRequest => "Issue Request",
             Self::Monitoring => "Monitoring",
-            Self::Release => "Release",
         }
     }
 
     pub fn all() -> &'static [Tab] {
-        &[Tab::IssueRequest, Tab::Monitoring, Tab::Release]
+        &[Tab::IssueRequest, Tab::Monitoring]
     }
 
     pub fn next(&self) -> Tab {
         match self {
             Self::IssueRequest => Self::Monitoring,
-            Self::Monitoring => Self::Release,
-            Self::Release => Self::IssueRequest,
+            Self::Monitoring => Self::IssueRequest,
         }
     }
 
     pub fn prev(&self) -> Tab {
         match self {
-            Self::IssueRequest => Self::Release,
+            Self::IssueRequest => Self::Monitoring,
             Self::Monitoring => Self::IssueRequest,
-            Self::Release => Self::Monitoring,
         }
     }
 }
@@ -86,20 +82,4 @@ pub struct TimelineEntry {
     pub agent_type: String,
     pub status: AgentStatus,
     pub detail: String,
-}
-
-/// Release info (shown in Release tab).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReleaseInfo {
-    pub branch: String,
-    pub pr_number: Option<u64>,
-    pub pr_url: Option<String>,
-    pub included_issues: Vec<(u64, String)>,
-    pub checklist: Vec<ChecklistItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChecklistItem {
-    pub text: String,
-    pub checked: bool,
 }

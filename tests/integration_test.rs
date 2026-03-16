@@ -191,12 +191,45 @@ fn test_default_orchestrator_prompts_include_contributor_hospitality() {
     assert!(system_prompt.contains("do not call `githubclaw dispatch` and exit successfully"));
     assert!(!system_prompt.contains("structured output"));
     assert!(!system_prompt.contains("choose `no_action`"));
+    assert!(!system_prompt.contains("CS triages"));
+    assert!(!system_prompt.contains("Coder implements"));
+    assert!(system_prompt.contains("Bug Reproducer investigates"));
+    assert!(system_prompt.contains("Vision-gap Analyst"));
 
     assert!(agent_prompt.contains("Contributor Hospitality"));
     assert!(agent_prompt.contains("warm"));
     assert!(agent_prompt.contains("additional information"));
     assert!(agent_prompt.contains("Use `githubclaw dispatch` for all agent invocations"));
     assert!(agent_prompt.contains("Exit successfully without emitting fabricated JSON"));
+}
+
+#[test]
+fn test_global_prompt_uses_current_agent_roster() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let global_prompt = std::fs::read_to_string(root.join("defaults/global_prompt.md")).unwrap();
+
+    assert!(global_prompt.contains("Orchestrator"));
+    assert!(global_prompt.contains("Bug Reproducer"));
+    assert!(global_prompt.contains("Vision-gap Analyst"));
+    assert!(global_prompt.contains("Verifier"));
+    assert!(global_prompt.contains("Implementer"));
+    assert!(global_prompt.contains("Reviewer"));
+    assert!(!global_prompt.contains("| CS |"));
+    assert!(!global_prompt.contains("| Coder |"));
+    assert!(!global_prompt.contains("| QA |"));
+    assert!(!global_prompt.contains("handoff keyword"));
+}
+
+#[test]
+fn test_bug_reproducer_prompt_prefers_isolation_without_requiring_it() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let prompt = std::fs::read_to_string(root.join("defaults/agents/bug_reproducer.md")).unwrap();
+
+    assert!(prompt.contains("Prefer an isolated environment"));
+    assert!(prompt.contains("If that is not practical"));
+    assert!(prompt.contains("local fallback"));
+    assert!(!prompt.contains("always use Docker"));
+    assert!(!prompt.contains(".githubclaw/environments/"));
 }
 
 /// Test: Fork PR gate end-to-end
