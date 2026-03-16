@@ -18,9 +18,9 @@ use crossterm::terminal::{self, BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use crossterm::{cursor, execute, queue};
 use slt::event::KeyEvent as SltKeyEvent;
 use slt::{
-    frame, AppState as SltAppState, Backend, Border, Buffer, Color, ColorDepth, Context, Event,
-    KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseKind, Rect, RunConfig,
-    ScrollState, SpinnerState, Style, TabsState, Theme,
+    frame, AppState as SltAppState, Backend, Border, Breakpoint, Buffer, Color, ColorDepth,
+    Context, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseKind, Rect,
+    RunConfig, ScrollState, SpinnerState, Style, TabsState, Theme,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -38,16 +38,13 @@ pub fn run(repo_root: &Path) -> io::Result<()> {
         tick_rate: Duration::from_millis(50),
         mouse: true,
         kitty_keyboard: false,
-        theme: Theme::catppuccin(),
+        theme: Theme::tokyo_night(),
         color_depth: None,
         max_fps: Some(30),
     };
 
     let color_depth = config.color_depth.unwrap_or_else(ColorDepth::detect);
     let mut backend = TerminalBackend::new(config.mouse, config.kitty_keyboard, color_depth)?;
-    if config.theme.bg != Color::Reset {
-        backend.theme_bg = Some(config.theme.bg);
-    }
 
     let mut slt_state = SltAppState::new();
     let mut app = App::new();
@@ -141,33 +138,74 @@ fn render_dashboard(
     app_screen_scroll: &mut ScrollState,
 ) {
     tabs.selected = tab_index(app.active_tab);
+    let compact = matches!(ui.breakpoint(), Breakpoint::Xs | Breakpoint::Sm);
 
     ui.bordered(Border::Rounded)
         .title("GithubClaw Control Room")
         .pad(1)
+        .gap(1)
         .grow(1)
         .col(|ui| {
             render_header(ui, repo_root, app, tabs, spinner);
             ui.divider_text("Overview");
-            render_metrics(ui, app);
+            render_metrics(ui, app, compact);
             ui.divider_text(match app.active_tab {
                 Tab::IssueRequest => "Issue Request",
                 Tab::Monitoring => "Monitoring",
             });
 
-            ui.scrollable(app_screen_scroll)
-                .grow(1)
-                .col(|ui| match app.active_tab {
+            if compact {
+                ui.scrollable(app_screen_scroll)
+                    .grow(1)
+                    .col(|ui| match app.active_tab {
+                        Tab::IssueRequest => {
+                            render_issue_request(
+                                ui,
+                                app,
+                                issue_scroll,
+                                issue_detail_scroll,
+                                repo_root,
+                                compact,
+                            );
+                        }
+                        Tab::Monitoring => {
+                            render_monitoring(
+                                ui,
+                                app,
+                                session_scroll,
+                                timeline_scroll,
+                                events_scroll,
+                                compact,
+                            );
+                        }
+                    });
+            } else {
+                ui.container().grow(1).col(|ui| match app.active_tab {
                     Tab::IssueRequest => {
-                        render_issue_request(ui, app, issue_scroll, issue_detail_scroll, repo_root);
+                        render_issue_request(
+                            ui,
+                            app,
+                            issue_scroll,
+                            issue_detail_scroll,
+                            repo_root,
+                            compact,
+                        );
                     }
                     Tab::Monitoring => {
-                        render_monitoring(ui, app, session_scroll, timeline_scroll, events_scroll);
+                        render_monitoring(
+                            ui,
+                            app,
+                            session_scroll,
+                            timeline_scroll,
+                            events_scroll,
+                            compact,
+                        );
                     }
                 });
+            }
 
             ui.divider_text("Controls");
-            render_help(ui, app);
+            render_help(ui, app, compact);
         });
 }
 
@@ -180,14 +218,14 @@ fn render_header(
 ) {
     ui.row(|ui| {
         ui.spinner(spinner);
-        ui.text(" GithubClaw").bold().fg(Color::Cyan);
+        ui.text(" GithubClaw").bold().fg(Color::LightCyan);
         if app.interactive_session_active {
-            ui.badge_colored("SESSION LIVE", Color::Yellow);
+            ui.text(" LIVE").bold().fg(Color::Yellow);
         } else {
-            ui.badge_colored("READY", Color::Green);
+            ui.text(" READY").bold().fg(Color::Green);
         }
         ui.spacer();
-        ui.text(repo_root.to_string_lossy()).dim();
+        ui.text_wrap(repo_root.to_string_lossy()).dim();
     });
 
     ui.row(|ui| {
@@ -203,7 +241,7 @@ fn render_header(
     });
 }
 
-fn render_metrics(ui: &mut Context, app: &App) {
+fn render_metrics(ui: &mut Context, app: &App, compact: bool) {
     let waiting = app.issue_requests.len();
     let running = app.worker_count.0;
     let total = app.agent_sessions.len();
@@ -213,18 +251,39 @@ fn render_metrics(ui: &mut Context, app: &App) {
         Color::Yellow
     };
 
-    ui.row(|ui| {
-        metric_card(ui, "Inbox", &waiting.to_string(), Color::Cyan);
-        metric_card(ui, "Running", &running.to_string(), Color::Green);
-        metric_card(ui, "Observed", &total.to_string(), Color::Blue);
-        metric_card(
-            ui,
-            "Queue",
-            &app.queue_depth.to_string(),
-            queue_color(app.queue_depth),
-        );
-        metric_card(ui, "Rate", &app.rate_limit_tier, rate_color);
-    });
+    if compact {
+        ui.col(|ui| {
+            ui.row(|ui| {
+                metric_card(ui, "Inbox", &waiting.to_string(), Color::Cyan);
+                metric_card(ui, "Running", &running.to_string(), Color::Green);
+            });
+            ui.row(|ui| {
+                metric_card(ui, "Observed", &total.to_string(), Color::Blue);
+                metric_card(
+                    ui,
+                    "Queue",
+                    &app.queue_depth.to_string(),
+                    queue_color(app.queue_depth),
+                );
+            });
+            ui.row(|ui| {
+                metric_card(ui, "Rate", &app.rate_limit_tier, rate_color);
+            });
+        });
+    } else {
+        ui.row(|ui| {
+            metric_card(ui, "Inbox", &waiting.to_string(), Color::Cyan);
+            metric_card(ui, "Running", &running.to_string(), Color::Green);
+            metric_card(ui, "Observed", &total.to_string(), Color::Blue);
+            metric_card(
+                ui,
+                "Queue",
+                &app.queue_depth.to_string(),
+                queue_color(app.queue_depth),
+            );
+            metric_card(ui, "Rate", &app.rate_limit_tier, rate_color);
+        });
+    }
 }
 
 fn metric_card(ui: &mut Context, label: &str, value: &str, color: Color) {
@@ -240,16 +299,21 @@ fn render_issue_request(
     issue_scroll: &mut ScrollState,
     issue_detail_scroll: &mut ScrollState,
     _repo_root: &Path,
+    compact: bool,
 ) {
-    ui.row(|ui| {
+    let layout = |ui: &mut Context| {
         ui.bordered(Border::Rounded)
             .title("Inbox")
             .pad(1)
             .grow(1)
+            .min_h(16)
             .col(|ui| {
                 if app.issue_requests.is_empty() {
-                    ui.text("No issues are waiting for interactive review.").fg(Color::Green);
-                    ui.text("Feature and refactor requests will appear here after analysis.").dim();
+                    ui.text_wrap("No issues are waiting for interactive review.")
+                        .fg(Color::Green);
+                    ui.text_wrap("Feature and refactor requests will appear here after analysis.")
+                        .dim();
+                    ui.spacer();
                     return;
                 }
 
@@ -265,6 +329,7 @@ fn render_issue_request(
             .title("Interactive Session")
             .pad(1)
             .grow(2)
+            .min_h(16)
             .col(|ui| {
                 let summary = app.issue_request_summary_card();
                 render_summary_card(ui, &summary);
@@ -275,11 +340,13 @@ fn render_issue_request(
                         ui.text(format!("#{}", issue.issue_number))
                             .bold()
                             .fg(Color::Cyan);
-                        ui.badge_colored(&issue.issue_type, issue_type_color(&issue.issue_type));
+                        ui.text(format!("[{}]", issue.issue_type))
+                            .bold()
+                            .fg(issue_type_color(&issue.issue_type));
                         if issue.vision_report_ready {
-                            ui.badge_colored("READY", Color::Green);
+                            ui.text(" READY").bold().fg(Color::Green);
                         } else {
-                            ui.badge_colored("WARMING", Color::Yellow);
+                            ui.text(" WARMING").bold().fg(Color::Yellow);
                         }
                     });
 
@@ -300,7 +367,7 @@ fn render_issue_request(
                                     decision: IssueReviewDecision::Reject,
                                 });
                             }
-                            ui.text("Esc returns to the inbox.").dim();
+                            ui.text_wrap("Esc returns to the inbox.").dim();
                         });
                     } else {
                         ui.row(|ui| {
@@ -336,17 +403,27 @@ fn render_issue_request(
                                 }
                             }
                         } else {
-                            ui.text("Open the session to speak directly with the orchestrator.")
+                            ui.text_wrap("Open the session to speak directly with the orchestrator.")
                                 .fg(Color::LightBlue);
-                            ui.text("Keyboard input is passed through to the embedded PTY once the session starts.")
+                            ui.text_wrap(
+                                "Keyboard input is passed through to the embedded PTY once the session starts.",
+                            )
                                 .dim();
                         }
                     });
                 } else {
-                    ui.text("Select an issue from the inbox to inspect it.").dim();
+                    ui.text_wrap("Select an issue from the inbox to inspect it.")
+                        .dim();
+                    ui.spacer();
                 }
             });
-    });
+    };
+
+    if compact {
+        ui.container().grow(1).col(layout);
+    } else {
+        ui.container().grow(1).row(layout);
+    }
 }
 
 fn render_issue_row(ui: &mut Context, app: &mut App, index: usize, issue: IssueRequestItem) {
@@ -371,12 +448,14 @@ fn render_issue_row(ui: &mut Context, app: &mut App, index: usize, issue: IssueR
                 app.selected_issue_index = index;
             }
             ui.spacer();
-            ui.badge_colored(&issue.issue_type, issue_type_color(&issue.issue_type));
+            ui.text(format!("[{}]", issue.issue_type))
+                .bold()
+                .fg(issue_type_color(&issue.issue_type));
             if issue.vision_report_ready {
-                ui.badge_colored("READY", Color::Green);
+                ui.text(" READY").bold().fg(Color::Green);
             }
         });
-        ui.text(format!(
+        ui.text_wrap(format!(
             "{} request is waiting for operator review.",
             issue.issue_type
         ))
@@ -390,15 +469,18 @@ fn render_monitoring(
     session_scroll: &mut ScrollState,
     timeline_scroll: &mut ScrollState,
     events_scroll: &mut ScrollState,
+    compact: bool,
 ) {
-    ui.row(|ui| {
+    let layout = |ui: &mut Context| {
         ui.bordered(Border::Rounded)
             .title("Sessions")
             .pad(1)
             .grow(1)
+            .min_h(18)
             .col(|ui| {
                 if app.agent_sessions.is_empty() {
                     ui.text("No active or recorded sessions yet.").dim();
+                    ui.spacer();
                 } else {
                     ui.scrollable(session_scroll).grow(1).col(|ui| {
                         for index in 0..app.agent_sessions.len() {
@@ -413,6 +495,7 @@ fn render_monitoring(
             .title("Timeline")
             .pad(1)
             .grow(2)
+            .min_h(18)
             .col(|ui| {
                 let summary = app.monitoring_summary_card();
                 render_summary_card(ui, &summary);
@@ -420,7 +503,7 @@ fn render_monitoring(
 
                 ui.scrollable(timeline_scroll).grow(1).col(|ui| {
                     if app.agent_timeline.is_empty() {
-                        ui.text("No timeline entries yet.").dim();
+                        ui.text_wrap("No timeline entries yet.").dim();
                     } else {
                         for entry in &app.agent_timeline {
                             ui.row(|ui| {
@@ -439,15 +522,21 @@ fn render_monitoring(
                 ui.text("Recent Events").bold().fg(Color::Cyan);
                 ui.scrollable(events_scroll).grow(1).col(|ui| {
                     if app.recent_events.is_empty() {
-                        ui.text("No recent timeline events.").dim();
+                        ui.text_wrap("No recent timeline events.").dim();
                     } else {
                         for event in &app.recent_events {
-                            ui.text(event);
+                            ui.text_wrap(event);
                         }
                     }
                 });
             });
-    });
+    };
+
+    if compact {
+        ui.container().grow(1).col(layout);
+    } else {
+        ui.container().grow(1).row(layout);
+    }
 }
 
 fn render_session_row(ui: &mut Context, app: &mut App, index: usize, session: AgentSessionItem) {
@@ -467,7 +556,9 @@ fn render_session_row(ui: &mut Context, app: &mut App, index: usize, session: Ag
                 app.selected_agent_index = index;
             }
             ui.spacer();
-            ui.badge_colored(session.status.symbol(), agent_status_color(&session.status));
+            ui.text(session.status.symbol())
+                .bold()
+                .fg(agent_status_color(&session.status));
         });
         ui.text(format!("Started at {}", session.started_at)).dim();
     });
@@ -477,45 +568,61 @@ fn render_summary_card(ui: &mut Context, card: &SummaryCard) {
     ui.bordered(Border::Rounded)
         .title(&card.title)
         .pad(1)
+        .gap(1)
         .col(|ui| {
             ui.text(&card.status_line)
                 .bold()
                 .fg(card_tone_color(card.tone));
             for bullet in card.bullets.iter().take(3) {
-                ui.text(format!("- {bullet}")).fg(Color::Indexed(248));
+                ui.text_wrap(format!("- {bullet}")).fg(Color::Indexed(248));
             }
             if let Some(next_action) = &card.next_action {
                 ui.separator();
                 ui.text("Next").bold().fg(Color::Cyan);
-                ui.text(next_action);
+                ui.text_wrap(next_action);
             }
             ui.row(|ui| {
                 ui.spacer();
-                ui.badge_colored(
-                    action_state_label(card.action_state),
-                    card_tone_color(card.tone),
-                );
+                ui.text(action_state_label(card.action_state))
+                    .bold()
+                    .fg(card_tone_color(card.tone));
             });
         });
 }
 
-fn render_help(ui: &mut Context, app: &App) {
+fn render_help(ui: &mut Context, app: &App, compact: bool) {
+    let narrow_help = compact || ui.width() < 120;
+
     if app.interactive_session_active {
-        ui.help(&[
-            ("Esc", "back"),
-            ("Ctrl+A", "approve"),
-            ("Ctrl+R", "reject"),
-            ("q", "stay in PTY"),
-        ]);
+        if narrow_help {
+            ui.col(|ui| {
+                ui.help(&[("Esc", "back"), ("Ctrl+A", "approve")]);
+                ui.help(&[("Ctrl+R", "reject"), ("q", "stay in PTY")]);
+            });
+        } else {
+            ui.help(&[
+                ("Esc", "back"),
+                ("Ctrl+A", "approve"),
+                ("Ctrl+R", "reject"),
+                ("q", "stay in PTY"),
+            ]);
+        }
     } else {
-        ui.help(&[
-            ("Tab", "switch view"),
-            ("j/k", "move"),
-            ("Enter", "open session"),
-            ("Ctrl+A", "approve"),
-            ("Ctrl+R", "reject"),
-            ("q", "quit"),
-        ]);
+        if narrow_help {
+            ui.col(|ui| {
+                ui.help(&[("Tab", "switch view"), ("j/k", "move"), ("Enter", "open")]);
+                ui.help(&[("Ctrl+A", "approve"), ("Ctrl+R", "reject"), ("q", "quit")]);
+            });
+        } else {
+            ui.help(&[
+                ("Tab", "switch view"),
+                ("j/k", "move"),
+                ("Enter", "open session"),
+                ("Ctrl+A", "approve"),
+                ("Ctrl+R", "reject"),
+                ("q", "quit"),
+            ]);
+        }
     }
 }
 
