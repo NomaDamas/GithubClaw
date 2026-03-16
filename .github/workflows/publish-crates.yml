@@ -1,6 +1,6 @@
 name: Publish to crates.io
 
-'on':
+on:
   release:
     types:
       - published
