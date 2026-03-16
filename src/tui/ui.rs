@@ -1,692 +1,1021 @@
-//! TUI rendering with ratatui.
+//! SuperLightTUI renderer and event loop for GithubClaw.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Bar, BarChart, BarGroup, Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline, Tabs,
+use std::io::{self, IsTerminal, Stdout, Write};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event as CrosstermEvent, KeyCode as CtKeyCode,
+    KeyEventKind as CtKeyEventKind, KeyModifiers as CtKeyModifiers, MouseButton as CtMouseButton,
+    MouseEventKind as CtMouseEventKind,
 };
-use ratatui::Frame;
+use crossterm::style::{
+    Attribute, Color as CtColor, Print, ResetColor, SetAttribute, SetBackgroundColor,
+    SetForegroundColor,
+};
+use crossterm::terminal::{self, BeginSynchronizedUpdate, EndSynchronizedUpdate};
+use crossterm::{cursor, execute, queue};
+use slt::event::KeyEvent as SltKeyEvent;
+use slt::{
+    frame, AppState as SltAppState, Backend, Border, Buffer, Color, ColorDepth, Context, Event,
+    KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseKind, Rect, RunConfig,
+    ScrollState, SpinnerState, Style, TabsState, Theme,
+};
+use unicode_width::UnicodeWidthStr;
 
-use super::app::App;
+use super::app::{App, IssueReviewDecision, PendingIssueReview};
+use super::event::AppEvent;
 use super::summary::{CardActionState, CardTone, SummaryCard};
-use super::tabs::{AgentStatus, Tab};
+use super::tabs::{AgentSessionItem, AgentStatus, IssueRequestItem, Tab};
 
-/// Render the entire TUI frame.
-pub fn render(f: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Tab bar
-            Constraint::Min(0),    // Content
-            Constraint::Length(1), // Status bar
-        ])
-        .split(f.area());
-
-    render_tab_bar(f, app, chunks[0]);
-
-    match app.active_tab {
-        Tab::IssueRequest => render_issue_request_tab(f, app, chunks[1]),
-        Tab::Monitoring => render_monitoring_tab(f, app, chunks[1]),
+pub fn run(repo_root: &Path) -> io::Result<()> {
+    if !io::stdout().is_terminal() {
+        return Ok(());
     }
 
-    render_status_bar(f, app, chunks[2]);
-}
-
-fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
-    let titles: Vec<Line> = Tab::all()
-        .iter()
-        .map(|t| {
-            let style = if *t == app.active_tab {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            Line::from(Span::styled(t.title(), style))
-        })
-        .collect();
-
-    let tabs = Tabs::new(titles)
-        .block(Block::default().borders(Borders::ALL).title(" GithubClaw "))
-        .highlight_style(Style::default().fg(Color::Yellow))
-        .select(match app.active_tab {
-            Tab::IssueRequest => 0,
-            Tab::Monitoring => 1,
-        });
-
-    f.render_widget(tabs, area);
-}
-
-fn render_issue_request_tab(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(area);
-
-    // Left: Issue list
-    let items: Vec<ListItem> = app
-        .issue_requests
-        .iter()
-        .enumerate()
-        .map(|(i, issue)| {
-            let marker = if issue.vision_report_ready { "+" } else { " " };
-            let style = if i == app.selected_issue_index {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!(" {} #{:<5} ", marker, issue.issue_number), style),
-                Span::styled(
-                    format!("[{}] ", issue.issue_type),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(&issue.title, style),
-            ]))
-        })
-        .collect();
-
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Issues (awaiting session) "),
-    );
-    f.render_widget(list, chunks[0]);
-
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(0)])
-        .split(chunks[1]);
-
-    render_summary_card(f, &app.issue_request_summary_card(), right_chunks[0]);
-
-    // Right: Interactive session area
-    let session_title = if app.interactive_session_active {
-        " Interactive Session (Esc to exit) "
-    } else {
-        " Interactive Session "
+    let config = RunConfig {
+        tick_rate: Duration::from_millis(50),
+        mouse: true,
+        kitty_keyboard: false,
+        theme: Theme::catppuccin(),
+        color_depth: None,
+        max_fps: Some(30),
     };
 
-    let session_content = if app.interactive_session_active {
-        if app.pty_output.is_empty() {
-            "Starting interactive session...".to_string()
+    let color_depth = config.color_depth.unwrap_or_else(ColorDepth::detect);
+    let mut backend = TerminalBackend::new(config.mouse, config.kitty_keyboard, color_depth)?;
+    if config.theme.bg != Color::Reset {
+        backend.theme_bg = Some(config.theme.bg);
+    }
+
+    let mut slt_state = SltAppState::new();
+    let mut app = App::new();
+    let mut slt_events = Vec::new();
+    let mut tabs = TabsState::new(vec!["Issue Request", "Monitoring"]);
+    let spinner = SpinnerState::dots();
+
+    let mut issue_scroll = ScrollState::new();
+    let mut issue_detail_scroll = ScrollState::new();
+    let mut session_scroll = ScrollState::new();
+    let mut timeline_scroll = ScrollState::new();
+    let mut events_scroll = ScrollState::new();
+    let mut app_screen_scroll = ScrollState::new();
+
+    app.handle_event(AppEvent::Tick);
+
+    loop {
+        let keep_going = frame(
+            &mut backend,
+            &mut slt_state,
+            &config,
+            &slt_events,
+            &mut |ui| {
+                render_dashboard(
+                    ui,
+                    repo_root,
+                    &mut app,
+                    &mut tabs,
+                    &spinner,
+                    &mut issue_scroll,
+                    &mut issue_detail_scroll,
+                    &mut session_scroll,
+                    &mut timeline_scroll,
+                    &mut events_scroll,
+                    &mut app_screen_scroll,
+                );
+            },
+        )?;
+
+        if !keep_going || app.should_quit {
+            break;
+        }
+
+        if let Some(issue_number) = app.take_pending_interactive_issue() {
+            app.start_interactive_session_for_issue(issue_number, repo_root);
+        }
+
+        if let Some(review) = app.take_pending_issue_review() {
+            if let Err(err) = app.apply_issue_review(repo_root, review) {
+                tracing::warn!(issue = review.issue_number, error = %err, "Failed to apply issue review");
+            }
+        }
+
+        slt_events.clear();
+        let poll_timeout = if app.interactive_session_active {
+            Duration::from_millis(50)
         } else {
-            // Show last N lines that fit the panel
-            let available_height = chunks[1].height.saturating_sub(2) as usize;
-            let lines: Vec<&str> = app.pty_output.lines().collect();
-            let start = lines.len().saturating_sub(available_height);
-            lines[start..].join("\n")
+            Duration::from_millis(250)
+        };
+
+        if event::poll(poll_timeout)? {
+            let raw = event::read()?;
+            handle_terminal_event(&mut app, &mut slt_events, &mut backend, raw)?;
+
+            while event::poll(Duration::ZERO)? {
+                let raw = event::read()?;
+                handle_terminal_event(&mut app, &mut slt_events, &mut backend, raw)?;
+            }
+        } else {
+            app.handle_event(AppEvent::Tick);
         }
-    } else if app.issue_requests.is_empty() {
-        "No issues awaiting interactive session.\n\n\
-         Bugs are auto-processed.\n\
-         Feature/Refactoring issues will appear here\n\
-         after Vision-gap Analyst completes analysis."
-            .to_string()
+
+        sleep_for_fps_cap(config.max_fps, Instant::now());
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_dashboard(
+    ui: &mut Context,
+    repo_root: &Path,
+    app: &mut App,
+    tabs: &mut TabsState,
+    spinner: &SpinnerState,
+    issue_scroll: &mut ScrollState,
+    issue_detail_scroll: &mut ScrollState,
+    session_scroll: &mut ScrollState,
+    timeline_scroll: &mut ScrollState,
+    events_scroll: &mut ScrollState,
+    app_screen_scroll: &mut ScrollState,
+) {
+    tabs.selected = tab_index(app.active_tab);
+
+    ui.bordered(Border::Rounded)
+        .title("GithubClaw Control Room")
+        .pad(1)
+        .grow(1)
+        .col(|ui| {
+            render_header(ui, repo_root, app, tabs, spinner);
+            ui.divider_text("Overview");
+            render_metrics(ui, app);
+            ui.divider_text(match app.active_tab {
+                Tab::IssueRequest => "Issue Request",
+                Tab::Monitoring => "Monitoring",
+            });
+
+            ui.scrollable(app_screen_scroll)
+                .grow(1)
+                .col(|ui| match app.active_tab {
+                    Tab::IssueRequest => {
+                        render_issue_request(ui, app, issue_scroll, issue_detail_scroll, repo_root);
+                    }
+                    Tab::Monitoring => {
+                        render_monitoring(ui, app, session_scroll, timeline_scroll, events_scroll);
+                    }
+                });
+
+            ui.divider_text("Controls");
+            render_help(ui, app);
+        });
+}
+
+fn render_header(
+    ui: &mut Context,
+    repo_root: &Path,
+    app: &mut App,
+    tabs: &mut TabsState,
+    spinner: &SpinnerState,
+) {
+    ui.row(|ui| {
+        ui.spinner(spinner);
+        ui.text(" GithubClaw").bold().fg(Color::Cyan);
+        if app.interactive_session_active {
+            ui.badge_colored("SESSION LIVE", Color::Yellow);
+        } else {
+            ui.badge_colored("READY", Color::Green);
+        }
+        ui.spacer();
+        ui.text(repo_root.to_string_lossy()).dim();
+    });
+
+    ui.row(|ui| {
+        let old_selected = tabs.selected;
+        let _ = ui.tabs(tabs);
+        if tabs.selected != old_selected {
+            app.active_tab = tab_from_index(tabs.selected);
+        }
+        ui.spacer();
+        if ui.button("Refresh").clicked {
+            app.handle_event(AppEvent::Tick);
+        }
+    });
+}
+
+fn render_metrics(ui: &mut Context, app: &App) {
+    let waiting = app.issue_requests.len();
+    let running = app.worker_count.0;
+    let total = app.agent_sessions.len();
+    let rate_color = if app.rate_limit_tier.eq_ignore_ascii_case("none") {
+        Color::Green
     } else {
-        "Select an issue and press Enter to start\n\
-         an interactive session with the Orchestrator.\n\n\
-         Ctrl+A: Approve  Ctrl+R: Reject"
-            .to_string()
+        Color::Yellow
     };
 
-    let session = Paragraph::new(session_content)
-        .block(Block::default().borders(Borders::ALL).title(session_title));
-    f.render_widget(session, right_chunks[1]);
+    ui.row(|ui| {
+        metric_card(ui, "Inbox", &waiting.to_string(), Color::Cyan);
+        metric_card(ui, "Running", &running.to_string(), Color::Green);
+        metric_card(ui, "Observed", &total.to_string(), Color::Blue);
+        metric_card(
+            ui,
+            "Queue",
+            &app.queue_depth.to_string(),
+            queue_color(app.queue_depth),
+        );
+        metric_card(ui, "Rate", &app.rate_limit_tier, rate_color);
+    });
 }
 
-fn render_monitoring_tab(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-        .split(area);
-
-    let left_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8),
-            Constraint::Length(10),
-            Constraint::Min(0),
-        ])
-        .split(chunks[0]);
-
-    render_githubclaw_ascii(f, left_chunks[0]);
-    render_monitoring_status(f, app, left_chunks[1]);
-
-    let items: Vec<ListItem> = app
-        .agent_sessions
-        .iter()
-        .enumerate()
-        .map(|(i, session)| {
-            let style = if i == app.selected_agent_index {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            let status_color = match session.status {
-                AgentStatus::Running => Color::Green,
-                AgentStatus::Queued => Color::DarkGray,
-                AgentStatus::Completed => Color::Blue,
-                AgentStatus::Failed => Color::Red,
-                AgentStatus::Idle => Color::DarkGray,
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!(" #{:<5} ", session.issue_number), style),
-                Span::styled(format!("{:<16} ", session.agent_type), style),
-                Span::styled(session.status.symbol(), Style::default().fg(status_color)),
-            ]))
-        })
-        .collect();
-
-    let agent_list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Active Sessions "),
-    );
-    f.render_widget(agent_list, left_chunks[2]);
-
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(7),
-            Constraint::Length(10),
-            Constraint::Min(0),
-        ])
-        .split(chunks[1]);
-
-    render_monitoring_heartbeat(f, app, right_chunks[0]);
-    render_stage_flow(f, app, right_chunks[1]);
-
-    let detail_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(8)])
-        .split(right_chunks[2]);
-
-    render_issue_waterfall(f, app, detail_chunks[0]);
-    render_recent_events(f, app, detail_chunks[1]);
+fn metric_card(ui: &mut Context, label: &str, value: &str, color: Color) {
+    ui.bordered(Border::Rounded).pad(1).grow(1).col(|ui| {
+        ui.text(label).dim();
+        ui.text(value).bold().fg(color);
+    });
 }
 
-fn render_githubclaw_ascii(f: &mut Frame, area: Rect) {
-    let art = vec![
-        Line::from("   ____ _ _   _   _     _                 "),
-        Line::from("  / ___(_) |_| |_| |__ | |__   ___ _ _    "),
-        Line::from(" | |  _| | __| __| '_ \\| '_ \\ / _ \\ '_|   "),
-        Line::from(" | |_| | | |_| |_| | | | |_) |  __/ |     "),
-        Line::from("  \\____|_|\\__|\\__|_| |_|_.__/ \\___|_|     "),
-        Line::from("        claws on the queue                "),
-    ];
+fn render_issue_request(
+    ui: &mut Context,
+    app: &mut App,
+    issue_scroll: &mut ScrollState,
+    issue_detail_scroll: &mut ScrollState,
+    _repo_root: &Path,
+) {
+    ui.row(|ui| {
+        ui.bordered(Border::Rounded)
+            .title("Inbox")
+            .pad(1)
+            .grow(1)
+            .col(|ui| {
+                if app.issue_requests.is_empty() {
+                    ui.text("No issues are waiting for interactive review.").fg(Color::Green);
+                    ui.text("Feature and refactor requests will appear here after analysis.").dim();
+                    return;
+                }
 
-    let widget =
-        Paragraph::new(art).block(Block::default().borders(Borders::ALL).title(" GithubClaw "));
-    f.render_widget(widget, area);
+                ui.scrollable(issue_scroll).grow(1).col(|ui| {
+                    for index in 0..app.issue_requests.len() {
+                        let issue = app.issue_requests[index].clone();
+                        render_issue_row(ui, app, index, issue);
+                    }
+                });
+            });
+
+        ui.bordered(Border::Rounded)
+            .title("Interactive Session")
+            .pad(1)
+            .grow(2)
+            .col(|ui| {
+                let summary = app.issue_request_summary_card();
+                render_summary_card(ui, &summary);
+                ui.separator();
+
+                if let Some(issue) = app.selected_issue().cloned() {
+                    ui.row(|ui| {
+                        ui.text(format!("#{}", issue.issue_number))
+                            .bold()
+                            .fg(Color::Cyan);
+                        ui.badge_colored(&issue.issue_type, issue_type_color(&issue.issue_type));
+                        if issue.vision_report_ready {
+                            ui.badge_colored("READY", Color::Green);
+                        } else {
+                            ui.badge_colored("WARMING", Color::Yellow);
+                        }
+                    });
+
+                    ui.text(&issue.title).bold();
+                    ui.separator();
+
+                    if app.interactive_session_active {
+                        ui.row(|ui| {
+                            if ui.button("Approve").clicked {
+                                app.pending_issue_review = Some(PendingIssueReview {
+                                    issue_number: issue.issue_number,
+                                    decision: IssueReviewDecision::Approve,
+                                });
+                            }
+                            if ui.button("Reject").clicked {
+                                app.pending_issue_review = Some(PendingIssueReview {
+                                    issue_number: issue.issue_number,
+                                    decision: IssueReviewDecision::Reject,
+                                });
+                            }
+                            ui.text("Esc returns to the inbox.").dim();
+                        });
+                    } else {
+                        ui.row(|ui| {
+                            if ui.button("Open session").clicked {
+                                app.pending_interactive_issue = Some(issue.issue_number);
+                            }
+                            if ui.button("Approve").clicked {
+                                app.pending_issue_review = Some(PendingIssueReview {
+                                    issue_number: issue.issue_number,
+                                    decision: IssueReviewDecision::Approve,
+                                });
+                            }
+                            if ui.button("Reject").clicked {
+                                app.pending_issue_review = Some(PendingIssueReview {
+                                    issue_number: issue.issue_number,
+                                    decision: IssueReviewDecision::Reject,
+                                });
+                            }
+                        });
+                    }
+
+                    ui.separator();
+                    if app.interactive_session_active && !app.pty_output.is_empty() {
+                        issue_detail_scroll.scroll_down(usize::MAX / 4);
+                    }
+                    ui.scrollable(issue_detail_scroll).grow(1).col(|ui| {
+                        if app.interactive_session_active {
+                            if app.pty_output.is_empty() {
+                                ui.text("Starting interactive session...").dim();
+                            } else {
+                                for line in app.pty_output.lines() {
+                                    ui.text(line);
+                                }
+                            }
+                        } else {
+                            ui.text("Open the session to speak directly with the orchestrator.")
+                                .fg(Color::LightBlue);
+                            ui.text("Keyboard input is passed through to the embedded PTY once the session starts.")
+                                .dim();
+                        }
+                    });
+                } else {
+                    ui.text("Select an issue from the inbox to inspect it.").dim();
+                }
+            });
+    });
 }
 
-fn render_monitoring_status(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ])
-        .split(area);
-
-    let rate_color = rate_limit_color(&app.rate_limit_tier);
-    let rate_label = rate_limit_label(&app.rate_limit_tier);
-    let rate = Paragraph::new(Line::from(vec![
-        Span::raw("  Rate Limit "),
-        Span::styled(
-            format!("{:<12}", rate_label),
-            Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("tier {}", app.rate_limit_tier),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]))
-    .block(Block::default().borders(Borders::ALL).title(" Rate "));
-    f.render_widget(rate, chunks[0]);
-
-    let worker_ratio = if app.worker_count.1 == 0 {
-        0.0
+fn render_issue_row(ui: &mut Context, app: &mut App, index: usize, issue: IssueRequestItem) {
+    let selected = index == app.selected_issue_index;
+    let border = if selected {
+        Border::Double
     } else {
-        app.worker_count.0 as f64 / app.worker_count.1 as f64
+        Border::Rounded
     };
-    let worker_gauge = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Worker Load "),
-        )
-        .ratio(worker_ratio.clamp(0.0, 1.0))
-        .label(format!(
-            "{}/{} active",
-            app.worker_count.0, app.worker_count.1
+    let accent = if selected {
+        Color::Yellow
+    } else {
+        Color::Indexed(246)
+    };
+
+    ui.bordered(border).pad(1).mb(1).col(|ui| {
+        ui.row(|ui| {
+            if ui
+                .button(format!("#{} {}", issue.issue_number, issue.title))
+                .clicked
+            {
+                app.selected_issue_index = index;
+            }
+            ui.spacer();
+            ui.badge_colored(&issue.issue_type, issue_type_color(&issue.issue_type));
+            if issue.vision_report_ready {
+                ui.badge_colored("READY", Color::Green);
+            }
+        });
+        ui.text(format!(
+            "{} request is waiting for operator review.",
+            issue.issue_type
         ))
-        .gauge_style(worker_color(app.worker_count));
-    f.render_widget(worker_gauge, chunks[1]);
-
-    let queue_color = queue_color(app.queue_depth, app.oldest_queue_age_seconds);
-    let queue_state = queue_state_label(app.queue_depth, app.oldest_queue_age_seconds);
-    let queue = Paragraph::new(vec![
-        Line::from(vec![
-            Span::raw("  Queue       "),
-            Span::styled(
-                format!("{:<10}", format!("{} pending", app.queue_depth)),
-                Style::default().fg(queue_color),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("  Oldest wait "),
-            Span::styled(
-                format_oldest_wait(app.oldest_queue_age_seconds),
-                Style::default().fg(queue_color),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("  Health      "),
-            Span::styled(
-                queue_state,
-                Style::default()
-                    .fg(queue_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Queue Health "),
-    );
-    f.render_widget(queue, chunks[2]);
+        .fg(accent);
+    });
 }
 
-fn render_monitoring_heartbeat(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
-        .split(area);
+fn render_monitoring(
+    ui: &mut Context,
+    app: &mut App,
+    session_scroll: &mut ScrollState,
+    timeline_scroll: &mut ScrollState,
+    events_scroll: &mut ScrollState,
+) {
+    ui.row(|ui| {
+        ui.bordered(Border::Rounded)
+            .title("Sessions")
+            .pad(1)
+            .grow(1)
+            .col(|ui| {
+                if app.agent_sessions.is_empty() {
+                    ui.text("No active or recorded sessions yet.").dim();
+                } else {
+                    ui.scrollable(session_scroll).grow(1).col(|ui| {
+                        for index in 0..app.agent_sessions.len() {
+                            let session = app.agent_sessions[index].clone();
+                            render_session_row(ui, app, index, session);
+                        }
+                    });
+                }
+            });
 
-    let queue_history = history_or_zero(&app.queue_history);
-    let worker_history = history_or_zero(&app.worker_history);
-    let activity_history = history_or_zero(&app.activity_history);
+        ui.bordered(Border::Rounded)
+            .title("Timeline")
+            .pad(1)
+            .grow(2)
+            .col(|ui| {
+                let summary = app.monitoring_summary_card();
+                render_summary_card(ui, &summary);
+                ui.separator();
 
-    let queue_spark = Sparkline::default()
-        .block(Block::default().borders(Borders::ALL).title(" Queue 30m "))
-        .data(&queue_history)
-        .max(queue_history.iter().copied().max().unwrap_or(1).max(1))
-        .style(queue_color(app.queue_depth, app.oldest_queue_age_seconds));
-    f.render_widget(queue_spark, chunks[0]);
+                ui.scrollable(timeline_scroll).grow(1).col(|ui| {
+                    if app.agent_timeline.is_empty() {
+                        ui.text("No timeline entries yet.").dim();
+                    } else {
+                        for entry in &app.agent_timeline {
+                            ui.row(|ui| {
+                                ui.badge_colored(
+                                    entry.status.symbol(),
+                                    agent_status_color(&entry.status),
+                                );
+                                ui.text(&entry.agent_type).bold();
+                                ui.text(&entry.detail).fg(Color::Indexed(248));
+                            });
+                        }
+                    }
+                });
 
-    let worker_spark = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Workers 30m "),
-        )
-        .data(&worker_history)
-        .max(app.worker_count.1.max(1) as u64)
-        .style(worker_color(app.worker_count));
-    f.render_widget(worker_spark, chunks[1]);
-
-    let activity_spark = Sparkline::default()
-        .block(Block::default().borders(Borders::ALL).title(" Events 30m "))
-        .data(&activity_history)
-        .max(activity_history.iter().copied().max().unwrap_or(1).max(1))
-        .style(activity_color(
-            activity_history.last().copied().unwrap_or_default(),
-        ));
-    f.render_widget(activity_spark, chunks[2]);
+                ui.separator();
+                ui.text("Recent Events").bold().fg(Color::Cyan);
+                ui.scrollable(events_scroll).grow(1).col(|ui| {
+                    if app.recent_events.is_empty() {
+                        ui.text("No recent timeline events.").dim();
+                    } else {
+                        for event in &app.recent_events {
+                            ui.text(event);
+                        }
+                    }
+                });
+            });
+    });
 }
 
-fn render_stage_flow(f: &mut Frame, app: &App, area: Rect) {
-    let mut queued = 0;
-    let mut running = 0;
-    let mut completed = 0;
-    let mut failed = 0;
-
-    for session in &app.agent_sessions {
-        match session.status {
-            AgentStatus::Queued => queued += 1,
-            AgentStatus::Running => running += 1,
-            AgentStatus::Completed => completed += 1,
-            AgentStatus::Failed => failed += 1,
-            AgentStatus::Idle => {}
-        }
-    }
-
-    let max_value = queued.max(running).max(completed).max(failed).max(1) as u64;
-    let bars = vec![
-        Bar::default()
-            .label("queued".into())
-            .value(queued as u64)
-            .style(Style::default().fg(Color::Yellow)),
-        Bar::default()
-            .label("running".into())
-            .value(running as u64)
-            .style(Style::default().fg(Color::Green)),
-        Bar::default()
-            .label("done".into())
-            .value(completed as u64)
-            .style(Style::default().fg(Color::Blue)),
-        Bar::default()
-            .label("failed".into())
-            .value(failed as u64)
-            .style(Style::default().fg(Color::Red)),
-    ];
-
-    let chart = BarChart::default()
-        .block(Block::default().borders(Borders::ALL).title(" Stage Flow "))
-        .data(BarGroup::default().bars(&bars))
-        .bar_width(8)
-        .bar_gap(1)
-        .max(max_value)
-        .value_style(Style::default().add_modifier(Modifier::BOLD))
-        .label_style(Style::default().fg(Color::DarkGray));
-    f.render_widget(chart, area);
-}
-
-fn render_issue_waterfall(f: &mut Frame, app: &App, area: Rect) {
-    let mut lines = Vec::new();
-
-    if app.agent_timeline.is_empty() {
-        lines.push(Line::from("  Select a session to see the issue waterfall."));
+fn render_session_row(ui: &mut Context, app: &mut App, index: usize, session: AgentSessionItem) {
+    let selected = index == app.selected_agent_index;
+    let border = if selected {
+        Border::Double
     } else {
-        let issue_label = app
-            .selected_issue_number_for_timeline()
-            .map(|issue| format!("#{}", issue))
-            .unwrap_or_else(|| "selected issue".to_string());
-
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {} pipeline", issue_label),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                "sequence over recent events",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-        lines.push(Line::from(""));
-
-        let lanes = build_waterfall_lanes(&app.agent_timeline);
-        for (agent_type, segments) in lanes {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {:<16}", truncate_agent_label(&agent_type, 16)),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::raw(segments),
-            ]));
-        }
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  [c] Comment on PR",
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    let widget = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Issue Waterfall "),
-    );
-    f.render_widget(widget, area);
-}
-
-fn render_recent_events(f: &mut Frame, app: &App, area: Rect) {
-    let mut lines = Vec::new();
-
-    if app.recent_events.is_empty() {
-        lines.push(Line::from("  No recent timeline events yet."));
-    } else {
-        for event in &app.recent_events {
-            lines.push(Line::from(vec![
-                Span::styled("  > ", Style::default().fg(Color::DarkGray)),
-                Span::raw(event),
-            ]));
-        }
-    }
-
-    let widget = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Recent Events "),
-    );
-    f.render_widget(widget, area);
-}
-
-fn render_summary_card(f: &mut Frame, card: &SummaryCard, area: Rect) {
-    let tone_color = match card.tone {
-        CardTone::Info => Color::Cyan,
-        CardTone::Success => Color::Green,
-        CardTone::Warning => Color::Yellow,
-        CardTone::Danger => Color::Red,
+        Border::Rounded
     };
-    let state_label = match card.action_state {
+
+    ui.bordered(border).pad(1).mb(1).col(|ui| {
+        ui.row(|ui| {
+            if ui
+                .button(format!("#{} {}", session.issue_number, session.agent_type))
+                .clicked
+            {
+                app.selected_agent_index = index;
+            }
+            ui.spacer();
+            ui.badge_colored(session.status.symbol(), agent_status_color(&session.status));
+        });
+        ui.text(format!("Started at {}", session.started_at)).dim();
+    });
+}
+
+fn render_summary_card(ui: &mut Context, card: &SummaryCard) {
+    ui.bordered(Border::Rounded)
+        .title(&card.title)
+        .pad(1)
+        .col(|ui| {
+            ui.text(&card.status_line)
+                .bold()
+                .fg(card_tone_color(card.tone));
+            for bullet in card.bullets.iter().take(3) {
+                ui.text(format!("- {bullet}")).fg(Color::Indexed(248));
+            }
+            if let Some(next_action) = &card.next_action {
+                ui.separator();
+                ui.text("Next").bold().fg(Color::Cyan);
+                ui.text(next_action);
+            }
+            ui.row(|ui| {
+                ui.spacer();
+                ui.badge_colored(
+                    action_state_label(card.action_state),
+                    card_tone_color(card.tone),
+                );
+            });
+        });
+}
+
+fn render_help(ui: &mut Context, app: &App) {
+    if app.interactive_session_active {
+        ui.help(&[
+            ("Esc", "back"),
+            ("Ctrl+A", "approve"),
+            ("Ctrl+R", "reject"),
+            ("q", "stay in PTY"),
+        ]);
+    } else {
+        ui.help(&[
+            ("Tab", "switch view"),
+            ("j/k", "move"),
+            ("Enter", "open session"),
+            ("Ctrl+A", "approve"),
+            ("Ctrl+R", "reject"),
+            ("q", "quit"),
+        ]);
+    }
+}
+
+fn tab_index(tab: Tab) -> usize {
+    match tab {
+        Tab::IssueRequest => 0,
+        Tab::Monitoring => 1,
+    }
+}
+
+fn tab_from_index(index: usize) -> Tab {
+    match index {
+        1 => Tab::Monitoring,
+        _ => Tab::IssueRequest,
+    }
+}
+
+fn issue_type_color(issue_type: &str) -> Color {
+    match issue_type {
+        "Feature" => Color::LightBlue,
+        "Refactoring" => Color::Magenta,
+        _ => Color::Cyan,
+    }
+}
+
+fn agent_status_color(status: &AgentStatus) -> Color {
+    match status {
+        AgentStatus::Running => Color::Green,
+        AgentStatus::Queued => Color::Yellow,
+        AgentStatus::Completed => Color::Blue,
+        AgentStatus::Failed => Color::Red,
+        AgentStatus::Idle => Color::Indexed(245),
+    }
+}
+
+fn queue_color(queue_depth: usize) -> Color {
+    match queue_depth {
+        0 => Color::Green,
+        1..=3 => Color::Yellow,
+        _ => Color::Red,
+    }
+}
+
+fn action_state_label(state: CardActionState) -> &'static str {
+    match state {
         CardActionState::Passive => "PASSIVE",
         CardActionState::Watching => "WATCHING",
         CardActionState::NeedsDecision => "DECISION",
         CardActionState::Blocked => "BLOCKED",
         CardActionState::InProgress => "LIVE",
         CardActionState::Done => "DONE",
-    };
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(&card.title, Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("  "),
-            Span::styled(
-                state_label,
-                Style::default().fg(tone_color).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(Span::styled(
-            &card.status_line,
-            Style::default().fg(tone_color),
-        )),
-        Line::from(""),
-    ];
-
-    for bullet in card.bullets.iter().take(3) {
-        lines.push(Line::from(vec![Span::raw("- "), Span::raw(bullet)]));
     }
-
-    if let Some(next_action) = &card.next_action {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("Next: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(next_action),
-        ]));
-    }
-
-    let widget =
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Summary "));
-    f.render_widget(widget, area);
 }
 
-fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
-    let help = match app.active_tab {
-        Tab::IssueRequest => {
-            if app.interactive_session_active {
-                "Esc: Back  |  Interactive Session Active"
-            } else {
-                "j/k: Navigate  Enter: Open Session  Ctrl+A: Approve  Ctrl+R: Reject  Tab: Switch  q: Quit"
+fn card_tone_color(tone: CardTone) -> Color {
+    match tone {
+        CardTone::Info => Color::Cyan,
+        CardTone::Success => Color::Green,
+        CardTone::Warning => Color::Yellow,
+        CardTone::Danger => Color::Red,
+    }
+}
+
+fn handle_terminal_event(
+    app: &mut App,
+    slt_events: &mut Vec<Event>,
+    backend: &mut TerminalBackend,
+    raw: CrosstermEvent,
+) -> io::Result<()> {
+    match &raw {
+        CrosstermEvent::Key(key) => {
+            app.handle_event(AppEvent::Key(*key));
+        }
+        CrosstermEvent::Mouse(mouse) => {
+            app.handle_event(AppEvent::Mouse(*mouse));
+        }
+        CrosstermEvent::Resize(width, height) => {
+            backend.handle_resize()?;
+            app.handle_event(AppEvent::Resize(*width, *height));
+        }
+        _ => {}
+    }
+
+    if let Some(event) = convert_crossterm_event(raw) {
+        if should_forward_to_slt(app, &event) {
+            slt_events.push(event);
+        }
+    }
+
+    Ok(())
+}
+
+fn should_forward_to_slt(app: &App, event: &Event) -> bool {
+    match event {
+        Event::Mouse(_) | Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => true,
+        Event::Paste(_) => !app.interactive_session_active,
+        Event::Key(_) => false,
+    }
+}
+
+fn convert_crossterm_event(raw: CrosstermEvent) -> Option<Event> {
+    match raw {
+        CrosstermEvent::Key(key) => Some(Event::Key(SltKeyEvent {
+            code: convert_key_code(key.code)?,
+            modifiers: convert_key_modifiers(key.modifiers),
+            kind: match key.kind {
+                CtKeyEventKind::Press => KeyEventKind::Press,
+                CtKeyEventKind::Repeat => KeyEventKind::Repeat,
+                CtKeyEventKind::Release => KeyEventKind::Release,
+            },
+        })),
+        CrosstermEvent::Mouse(mouse) => Some(Event::Mouse(MouseEvent {
+            kind: match mouse.kind {
+                CtMouseEventKind::Down(button) => MouseKind::Down(convert_mouse_button(button)),
+                CtMouseEventKind::Up(button) => MouseKind::Up(convert_mouse_button(button)),
+                CtMouseEventKind::Drag(button) => MouseKind::Drag(convert_mouse_button(button)),
+                CtMouseEventKind::Moved => MouseKind::Moved,
+                CtMouseEventKind::ScrollUp => MouseKind::ScrollUp,
+                CtMouseEventKind::ScrollDown => MouseKind::ScrollDown,
+                _ => return None,
+            },
+            x: mouse.column as u32,
+            y: mouse.row as u32,
+            modifiers: convert_key_modifiers(mouse.modifiers),
+        })),
+        CrosstermEvent::Resize(width, height) => Some(Event::Resize(width as u32, height as u32)),
+        CrosstermEvent::Paste(text) => Some(Event::Paste(text)),
+        CrosstermEvent::FocusGained => Some(Event::FocusGained),
+        CrosstermEvent::FocusLost => Some(Event::FocusLost),
+    }
+}
+
+fn convert_key_code(code: CtKeyCode) -> Option<KeyCode> {
+    match code {
+        CtKeyCode::Char(ch) => Some(KeyCode::Char(ch)),
+        CtKeyCode::Enter => Some(KeyCode::Enter),
+        CtKeyCode::Backspace => Some(KeyCode::Backspace),
+        CtKeyCode::Tab => Some(KeyCode::Tab),
+        CtKeyCode::BackTab => Some(KeyCode::BackTab),
+        CtKeyCode::Esc => Some(KeyCode::Esc),
+        CtKeyCode::Up => Some(KeyCode::Up),
+        CtKeyCode::Down => Some(KeyCode::Down),
+        CtKeyCode::Left => Some(KeyCode::Left),
+        CtKeyCode::Right => Some(KeyCode::Right),
+        CtKeyCode::Home => Some(KeyCode::Home),
+        CtKeyCode::End => Some(KeyCode::End),
+        CtKeyCode::PageUp => Some(KeyCode::PageUp),
+        CtKeyCode::PageDown => Some(KeyCode::PageDown),
+        CtKeyCode::Delete => Some(KeyCode::Delete),
+        CtKeyCode::F(number) => Some(KeyCode::F(number)),
+        _ => None,
+    }
+}
+
+fn convert_key_modifiers(modifiers: CtKeyModifiers) -> KeyModifiers {
+    let mut converted = KeyModifiers::NONE;
+    if modifiers.contains(CtKeyModifiers::SHIFT) {
+        converted.0 |= KeyModifiers::SHIFT.0;
+    }
+    if modifiers.contains(CtKeyModifiers::CONTROL) {
+        converted.0 |= KeyModifiers::CONTROL.0;
+    }
+    if modifiers.contains(CtKeyModifiers::ALT) {
+        converted.0 |= KeyModifiers::ALT.0;
+    }
+    converted
+}
+
+fn convert_mouse_button(button: CtMouseButton) -> MouseButton {
+    match button {
+        CtMouseButton::Left => MouseButton::Left,
+        CtMouseButton::Right => MouseButton::Right,
+        CtMouseButton::Middle => MouseButton::Middle,
+    }
+}
+
+fn sleep_for_fps_cap(max_fps: Option<u32>, frame_start: Instant) {
+    if let Some(fps) = max_fps.filter(|fps| *fps > 0) {
+        let target = Duration::from_secs_f64(1.0 / fps as f64);
+        let elapsed = frame_start.elapsed();
+        if elapsed < target {
+            std::thread::sleep(target - elapsed);
+        }
+    }
+}
+
+struct TerminalBackend {
+    stdout: Stdout,
+    current: Buffer,
+    previous: Buffer,
+    mouse_enabled: bool,
+    cursor_visible: bool,
+    kitty_keyboard: bool,
+    color_depth: ColorDepth,
+    theme_bg: Option<Color>,
+}
+
+impl TerminalBackend {
+    fn new(mouse: bool, kitty_keyboard: bool, color_depth: ColorDepth) -> io::Result<Self> {
+        let (cols, rows) = terminal::size()?;
+        let area = Rect::new(0, 0, cols as u32, rows as u32);
+
+        let mut stdout = io::stdout();
+        terminal::enable_raw_mode()?;
+        execute!(
+            stdout,
+            terminal::EnterAlternateScreen,
+            cursor::Hide,
+            EnableBracketedPaste
+        )?;
+        if mouse {
+            execute!(stdout, EnableMouseCapture, EnableFocusChange)?;
+        }
+        if kitty_keyboard {
+            use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+            let _ = execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            );
+        }
+
+        Ok(Self {
+            stdout,
+            current: Buffer::empty(area),
+            previous: Buffer::empty(area),
+            mouse_enabled: mouse,
+            cursor_visible: false,
+            kitty_keyboard,
+            color_depth,
+            theme_bg: None,
+        })
+    }
+
+    fn handle_resize(&mut self) -> io::Result<()> {
+        let (cols, rows) = terminal::size()?;
+        let area = Rect::new(0, 0, cols as u32, rows as u32);
+        self.current.resize(area);
+        self.previous.resize(area);
+        execute!(
+            self.stdout,
+            terminal::Clear(terminal::ClearType::All),
+            cursor::MoveTo(0, 0)
+        )?;
+        Ok(())
+    }
+}
+
+impl Backend for TerminalBackend {
+    fn size(&self) -> (u32, u32) {
+        (self.current.area.width, self.current.area.height)
+    }
+
+    fn buffer_mut(&mut self) -> &mut Buffer {
+        &mut self.current
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        queue!(self.stdout, BeginSynchronizedUpdate)?;
+
+        let mut last_style = Style::new();
+        let mut first_style = true;
+        let mut last_pos: Option<(u32, u32)> = None;
+        let mut active_link: Option<&str> = None;
+        let mut has_updates = false;
+
+        for y in self.current.area.y..self.current.area.bottom() {
+            for x in self.current.area.x..self.current.area.right() {
+                let cur = self.current.get(x, y);
+                let prev = self.previous.get(x, y);
+                if cur == prev || cur.symbol.is_empty() {
+                    continue;
+                }
+                has_updates = true;
+
+                let need_move = last_pos.is_none_or(|(lx, ly)| ly != y || lx != x);
+                if need_move {
+                    queue!(self.stdout, cursor::MoveTo(x as u16, y as u16))?;
+                }
+
+                if cur.style != last_style {
+                    if first_style {
+                        queue!(self.stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+                        apply_style(&mut self.stdout, &cur.style, self.color_depth)?;
+                        first_style = false;
+                    } else {
+                        apply_style_delta(
+                            &mut self.stdout,
+                            &last_style,
+                            &cur.style,
+                            self.color_depth,
+                        )?;
+                    }
+                    last_style = cur.style;
+                }
+
+                let cell_link = cur.hyperlink.as_deref();
+                if cell_link != active_link {
+                    if let Some(url) = cell_link {
+                        queue!(self.stdout, Print(format!("\x1b]8;;{url}\x07")))?;
+                    } else {
+                        queue!(self.stdout, Print("\x1b]8;;\x07"))?;
+                    }
+                    active_link = cell_link;
+                }
+
+                queue!(self.stdout, Print(&*cur.symbol))?;
+                let char_width = UnicodeWidthStr::width(cur.symbol.as_str()).max(1) as u32;
+                last_pos = Some((x + char_width, y));
             }
         }
-        Tab::Monitoring => "j/k: Navigate  Tab: Switch  q: Quit",
-    };
 
-    let bar = Paragraph::new(Span::styled(
-        format!(" {}", help),
-        Style::default().fg(Color::DarkGray),
-    ));
-    f.render_widget(bar, area);
-}
-
-fn history_or_zero(history: &std::collections::VecDeque<u64>) -> Vec<u64> {
-    if history.is_empty() {
-        vec![0]
-    } else {
-        history.iter().copied().collect()
-    }
-}
-
-fn rate_limit_label(tier: &str) -> &'static str {
-    if tier.eq_ignore_ascii_case("none") || tier.eq_ignore_ascii_case("clear") {
-        "CLEAR"
-    } else if tier.eq_ignore_ascii_case("low")
-        || tier.eq_ignore_ascii_case("soft")
-        || tier.eq_ignore_ascii_case("watch")
-    {
-        "WATCHING"
-    } else {
-        "CONSTRAINED"
-    }
-}
-
-fn rate_limit_color(tier: &str) -> Color {
-    match rate_limit_label(tier) {
-        "CLEAR" => Color::Green,
-        "WATCHING" => Color::Yellow,
-        _ => Color::Red,
-    }
-}
-
-fn worker_color(worker_count: (usize, usize)) -> Color {
-    let (active, max) = worker_count;
-    if max == 0 {
-        return Color::DarkGray;
-    }
-
-    let ratio = active as f64 / max as f64;
-    if ratio < 0.6 {
-        Color::Green
-    } else if ratio < 0.9 {
-        Color::Yellow
-    } else {
-        Color::Red
-    }
-}
-
-fn queue_color(queue_depth: usize, oldest_queue_age_seconds: Option<u64>) -> Color {
-    if queue_depth == 0 {
-        return Color::Green;
-    }
-
-    match oldest_queue_age_seconds.unwrap_or_default() {
-        0..=299 if queue_depth <= 3 => Color::Green,
-        0..=899 if queue_depth <= 8 => Color::Yellow,
-        _ => Color::Red,
-    }
-}
-
-fn queue_state_label(queue_depth: usize, oldest_queue_age_seconds: Option<u64>) -> &'static str {
-    match queue_color(queue_depth, oldest_queue_age_seconds) {
-        Color::Green => "STABLE",
-        Color::Yellow => "WATCHING",
-        _ => "PRESSURE",
-    }
-}
-
-fn activity_color(last_value: u64) -> Color {
-    if last_value == 0 {
-        Color::DarkGray
-    } else if last_value <= 2 {
-        Color::Cyan
-    } else {
-        Color::Green
-    }
-}
-
-fn format_oldest_wait(age_seconds: Option<u64>) -> String {
-    match age_seconds {
-        Some(seconds) => {
-            let minutes = seconds / 60;
-            let seconds = seconds % 60;
-            format!("{minutes:02}m{seconds:02}s")
+        if has_updates {
+            if active_link.is_some() {
+                queue!(self.stdout, Print("\x1b]8;;\x07"))?;
+            }
+            queue!(self.stdout, ResetColor, SetAttribute(Attribute::Reset))?;
         }
-        None => "00m00s".into(),
+
+        queue!(self.stdout, EndSynchronizedUpdate)?;
+
+        if let Some((cursor_x, cursor_y)) = find_cursor_marker(&self.current) {
+            if !self.cursor_visible {
+                queue!(self.stdout, cursor::Show)?;
+                self.cursor_visible = true;
+            }
+            queue!(
+                self.stdout,
+                cursor::MoveTo(cursor_x as u16, cursor_y as u16)
+            )?;
+        } else if self.cursor_visible {
+            queue!(self.stdout, cursor::Hide)?;
+            self.cursor_visible = false;
+        }
+
+        self.stdout.flush()?;
+
+        std::mem::swap(&mut self.current, &mut self.previous);
+        reset_current_buffer(&mut self.current, self.theme_bg);
+        Ok(())
     }
 }
 
-fn build_waterfall_lanes(timeline: &[super::tabs::TimelineEntry]) -> Vec<(String, String)> {
-    let mut lanes: Vec<(String, Vec<char>)> = Vec::new();
+impl Drop for TerminalBackend {
+    fn drop(&mut self) {
+        if self.kitty_keyboard {
+            use crossterm::event::PopKeyboardEnhancementFlags;
+            let _ = execute!(self.stdout, PopKeyboardEnhancementFlags);
+        }
+        if self.mouse_enabled {
+            let _ = execute!(self.stdout, DisableMouseCapture, DisableFocusChange);
+        }
+        let _ = execute!(
+            self.stdout,
+            ResetColor,
+            SetAttribute(Attribute::Reset),
+            cursor::Show,
+            DisableBracketedPaste,
+            terminal::LeaveAlternateScreen
+        );
+        let _ = terminal::disable_raw_mode();
+    }
+}
 
-    for entry in timeline {
-        let symbol = match entry.status {
-            AgentStatus::Queued => '.',
-            AgentStatus::Running => '=',
-            AgentStatus::Completed => '#',
-            AgentStatus::Failed => '!',
-            AgentStatus::Idle => '-',
-        };
+fn find_cursor_marker(buffer: &Buffer) -> Option<(u32, u32)> {
+    for y in buffer.area.y..buffer.area.bottom() {
+        for x in buffer.area.x..buffer.area.right() {
+            if buffer.get(x, y).symbol == "▎" {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
 
-        if let Some((_, segments)) = lanes
-            .iter_mut()
-            .find(|(agent_type, _)| agent_type == &entry.agent_type)
-        {
-            segments.push(symbol);
-        } else {
-            lanes.push((entry.agent_type.clone(), vec![symbol]));
+fn reset_current_buffer(buffer: &mut Buffer, theme_bg: Option<Color>) {
+    if let Some(bg) = theme_bg {
+        buffer.reset_with_bg(bg);
+    } else {
+        buffer.reset();
+    }
+}
+
+fn apply_style_delta(
+    writer: &mut impl Write,
+    old: &Style,
+    new: &Style,
+    depth: ColorDepth,
+) -> io::Result<()> {
+    if old.fg != new.fg {
+        match new.fg {
+            Some(fg) => queue!(writer, SetForegroundColor(to_crossterm_color(fg, depth)))?,
+            None => queue!(writer, SetForegroundColor(CtColor::Reset))?,
+        }
+    }
+    if old.bg != new.bg {
+        match new.bg {
+            Some(bg) => queue!(writer, SetBackgroundColor(to_crossterm_color(bg, depth)))?,
+            None => queue!(writer, SetBackgroundColor(CtColor::Reset))?,
         }
     }
 
-    lanes
-        .into_iter()
-        .map(|(agent_type, segments)| (agent_type, segments.into_iter().collect()))
-        .collect()
+    let removed = slt::Modifiers(old.modifiers.0 & !new.modifiers.0);
+    let added = slt::Modifiers(new.modifiers.0 & !old.modifiers.0);
+
+    if removed.contains(slt::Modifiers::BOLD) || removed.contains(slt::Modifiers::DIM) {
+        queue!(writer, SetAttribute(Attribute::NormalIntensity))?;
+        if new.modifiers.contains(slt::Modifiers::BOLD) {
+            queue!(writer, SetAttribute(Attribute::Bold))?;
+        }
+        if new.modifiers.contains(slt::Modifiers::DIM) {
+            queue!(writer, SetAttribute(Attribute::Dim))?;
+        }
+    } else {
+        if added.contains(slt::Modifiers::BOLD) {
+            queue!(writer, SetAttribute(Attribute::Bold))?;
+        }
+        if added.contains(slt::Modifiers::DIM) {
+            queue!(writer, SetAttribute(Attribute::Dim))?;
+        }
+    }
+    if removed.contains(slt::Modifiers::ITALIC) {
+        queue!(writer, SetAttribute(Attribute::NoItalic))?;
+    }
+    if added.contains(slt::Modifiers::ITALIC) {
+        queue!(writer, SetAttribute(Attribute::Italic))?;
+    }
+    if removed.contains(slt::Modifiers::UNDERLINE) {
+        queue!(writer, SetAttribute(Attribute::NoUnderline))?;
+    }
+    if added.contains(slt::Modifiers::UNDERLINE) {
+        queue!(writer, SetAttribute(Attribute::Underlined))?;
+    }
+    if removed.contains(slt::Modifiers::REVERSED) {
+        queue!(writer, SetAttribute(Attribute::NoReverse))?;
+    }
+    if added.contains(slt::Modifiers::REVERSED) {
+        queue!(writer, SetAttribute(Attribute::Reverse))?;
+    }
+    if removed.contains(slt::Modifiers::STRIKETHROUGH) {
+        queue!(writer, SetAttribute(Attribute::NotCrossedOut))?;
+    }
+    if added.contains(slt::Modifiers::STRIKETHROUGH) {
+        queue!(writer, SetAttribute(Attribute::CrossedOut))?;
+    }
+    Ok(())
 }
 
-fn truncate_agent_label(agent_type: &str, width: usize) -> String {
-    agent_type.chars().take(width).collect()
+fn apply_style(writer: &mut impl Write, style: &Style, depth: ColorDepth) -> io::Result<()> {
+    if let Some(fg) = style.fg {
+        queue!(writer, SetForegroundColor(to_crossterm_color(fg, depth)))?;
+    }
+    if let Some(bg) = style.bg {
+        queue!(writer, SetBackgroundColor(to_crossterm_color(bg, depth)))?;
+    }
+
+    if style.modifiers.contains(slt::Modifiers::BOLD) {
+        queue!(writer, SetAttribute(Attribute::Bold))?;
+    }
+    if style.modifiers.contains(slt::Modifiers::DIM) {
+        queue!(writer, SetAttribute(Attribute::Dim))?;
+    }
+    if style.modifiers.contains(slt::Modifiers::ITALIC) {
+        queue!(writer, SetAttribute(Attribute::Italic))?;
+    }
+    if style.modifiers.contains(slt::Modifiers::UNDERLINE) {
+        queue!(writer, SetAttribute(Attribute::Underlined))?;
+    }
+    if style.modifiers.contains(slt::Modifiers::REVERSED) {
+        queue!(writer, SetAttribute(Attribute::Reverse))?;
+    }
+    if style.modifiers.contains(slt::Modifiers::STRIKETHROUGH) {
+        queue!(writer, SetAttribute(Attribute::CrossedOut))?;
+    }
+    Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // 1. Tab titles are correct
-    #[test]
-    fn tab_titles() {
-        assert_eq!(Tab::IssueRequest.title(), "Issue Request");
-        assert_eq!(Tab::Monitoring.title(), "Monitoring");
-    }
-
-    // 2. Tab cycling
-    #[test]
-    fn tab_cycling() {
-        assert_eq!(Tab::IssueRequest.next(), Tab::Monitoring);
-        assert_eq!(Tab::Monitoring.next(), Tab::IssueRequest);
-        assert_eq!(Tab::IssueRequest.prev(), Tab::Monitoring);
-    }
-
-    // 3. AgentStatus symbols
-    #[test]
-    fn agent_status_symbols() {
-        assert_eq!(AgentStatus::Running.symbol(), ">>");
-        assert_eq!(AgentStatus::Completed.symbol(), "ok");
-        assert_eq!(AgentStatus::Failed.symbol(), "!!");
-    }
-
-    // 4. Render doesn't panic with empty app
-    #[test]
-    fn render_doesnt_panic_empty() {
-        // Just verify the render function signature compiles and types align
-        let _app = App::new();
-        // Actual rendering requires a terminal backend, tested via integration
+fn to_crossterm_color(color: Color, depth: ColorDepth) -> CtColor {
+    let color = color.downsampled(depth);
+    match color {
+        Color::Reset => CtColor::Reset,
+        Color::Black => CtColor::Black,
+        Color::Red => CtColor::DarkRed,
+        Color::Green => CtColor::DarkGreen,
+        Color::Yellow => CtColor::DarkYellow,
+        Color::Blue => CtColor::DarkBlue,
+        Color::Magenta => CtColor::DarkMagenta,
+        Color::Cyan => CtColor::DarkCyan,
+        Color::White => CtColor::White,
+        Color::DarkGray => CtColor::DarkGrey,
+        Color::LightRed => CtColor::Red,
+        Color::LightGreen => CtColor::Green,
+        Color::LightYellow => CtColor::Yellow,
+        Color::LightBlue => CtColor::Blue,
+        Color::LightMagenta => CtColor::Magenta,
+        Color::LightCyan => CtColor::Cyan,
+        Color::LightWhite => CtColor::White,
+        Color::Rgb(r, g, b) => CtColor::Rgb { r, g, b },
+        Color::Indexed(index) => CtColor::AnsiValue(index),
     }
 }

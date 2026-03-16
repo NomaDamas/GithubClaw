@@ -1,4 +1,4 @@
-//! GithubClaw TUI — ratatui-based terminal dashboard.
+//! GithubClaw TUI — SuperLightTUI-based terminal dashboard.
 //!
 //! Two tabs:
 //! - Issue Request: Issues awaiting interactive session + embedded Claude Code session

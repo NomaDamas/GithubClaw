@@ -1,7 +1,7 @@
 //! PTY embedding for TUI interactive sessions.
 //!
 //! Spawns Claude Code / Codex in a pseudo-terminal and captures output
-//! for rendering inside a ratatui panel. Input from the TUI is forwarded
+//! for rendering inside the TUI session panel. Input from the TUI is forwarded
 //! to the PTY.
 
 use std::io::{Read, Write};

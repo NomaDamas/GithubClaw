@@ -1732,64 +1732,12 @@ fn cmd_release(repo: Option<&str>) {
 // ===========================================================================
 
 fn cmd_tui() {
-    use crossterm::execute;
-    use crossterm::terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-    };
-    use ratatui::backend::CrosstermBackend;
-    use ratatui::Terminal;
-    use std::io;
-    use std::time::Duration;
-
     crate::tui::startup::run_tui_startup_checks();
-
-    // Setup terminal
-    enable_raw_mode().unwrap_or_else(|e| {
-        eprintln!("Error: failed to enable raw mode: {}", e);
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    crate::tui::ui::run(&repo_root).unwrap_or_else(|err| {
+        eprintln!("Error: failed to run TUI: {}", err);
         std::process::exit(1);
     });
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).unwrap();
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).unwrap();
-    let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-
-    // Create app state
-    let mut app = crate::tui::App::new();
-
-    // Main loop — PTY sessions run inside the TUI (no suspend/resume)
-    loop {
-        terminal.draw(|f| crate::tui::ui::render(f, &app)).unwrap();
-
-        // Poll with shorter timeout when PTY is active (for responsive output)
-        let poll_ms = if app.interactive_session_active {
-            50
-        } else {
-            250
-        };
-        if let Some(event) = crate::tui::event::poll_event(Duration::from_millis(poll_ms)) {
-            app.handle_event(event);
-        }
-
-        if let Some(issue_number) = app.take_pending_interactive_issue() {
-            app.start_interactive_session_for_issue(issue_number, &repo_root);
-        }
-
-        if let Some(review) = app.take_pending_issue_review() {
-            if let Err(err) = app.apply_issue_review(&repo_root, review) {
-                tracing::warn!(issue = review.issue_number, error = %err, "Failed to apply issue review");
-            }
-        }
-
-        if app.should_quit {
-            break;
-        }
-    }
-
-    // Restore terminal
-    disable_raw_mode().unwrap();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).unwrap();
-    terminal.show_cursor().unwrap();
 }
 
 // ===========================================================================
