@@ -1,7 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::process::Command;
 
-pub const GITHUBCLAW_REPO: &str = "GithubClaw/githubclaw";
+pub const GITHUBCLAW_REPO: &str = "NomaDamas/GithubClaw";
 
 trait StartupBackend {
     fn current_version(&self) -> &str;
