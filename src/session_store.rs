@@ -1,0 +1,426 @@
+//! Session ID persistence for Claude Code `--resume` pattern.
+//!
+//! Each Orchestrator session is tied to a root issue and persisted at:
+//! `~/.githubclaw/sessions/<repo>/<issue-id>/session_id`
+//!
+//! This enables the fire-and-forget dispatch pattern where the Orchestrator
+//! exits after dispatching agents and resumes when a marker webhook arrives.
+
+use std::path::PathBuf;
+
+use crate::config::global_config_dir;
+use crate::errors::Result;
+use crate::runtime_state::IssueRuntimeSnapshot;
+
+// ---------------------------------------------------------------------------
+// SessionStore
+// ---------------------------------------------------------------------------
+
+/// Manages Claude Code session IDs on disk.
+///
+/// Uses a configurable base directory for testability.
+pub struct SessionStore {
+    base_dir: PathBuf,
+}
+
+impl SessionStore {
+    /// Create a store using the default global config directory.
+    pub fn new() -> Self {
+        Self {
+            base_dir: global_config_dir().join("sessions"),
+        }
+    }
+
+    /// Create a store rooted at a custom directory (for testing).
+    pub fn with_base_dir(base_dir: PathBuf) -> Self {
+        Self { base_dir }
+    }
+
+    fn repo_dir(&self, repo: &str) -> PathBuf {
+        self.base_dir.join(repo.replace('/', "_"))
+    }
+
+    fn session_dir(&self, repo: &str, issue_id: u64) -> PathBuf {
+        self.repo_dir(repo).join(issue_id.to_string())
+    }
+
+    fn session_id_path(&self, repo: &str, issue_id: u64) -> PathBuf {
+        self.session_dir(repo, issue_id).join("session_id")
+    }
+
+    fn runtime_snapshot_path(&self, repo: &str, issue_id: u64) -> PathBuf {
+        self.session_dir(repo, issue_id).join("runtime.json")
+    }
+
+    fn read_session_id(path: &std::path::Path) -> Result<Option<String>> {
+        let session_id = std::fs::read_to_string(path)?.trim().to_string();
+        if session_id.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(session_id))
+        }
+    }
+
+    /// Store a Claude Code session ID for a given repo + issue.
+    pub fn save(&self, repo: &str, issue_id: u64, session_id: &str) -> Result<()> {
+        let path = self.session_id_path(repo, issue_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, session_id)?;
+        tracing::debug!(
+            repo = repo,
+            issue_id = issue_id,
+            session_id = session_id,
+            path = %path.display(),
+            "saved session ID"
+        );
+        Ok(())
+    }
+
+    /// Load a Claude Code session ID for a given repo + issue.
+    ///
+    /// Returns `None` if no session exists.
+    pub fn load(&self, repo: &str, issue_id: u64) -> Result<Option<String>> {
+        let path = self.session_id_path(repo, issue_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Self::read_session_id(&path)
+    }
+
+    /// Persist a runtime snapshot for a given repo + issue.
+    pub fn save_runtime_snapshot(&self, repo: &str, snapshot: &IssueRuntimeSnapshot) -> Result<()> {
+        let path = self.runtime_snapshot_path(repo, snapshot.issue_number);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("json.tmp");
+        let json = serde_json::to_string_pretty(snapshot)?;
+        std::fs::write(&tmp_path, json)?;
+        std::fs::rename(&tmp_path, &path)?;
+        Ok(())
+    }
+
+    /// Load a runtime snapshot for a given repo + issue.
+    pub fn load_runtime_snapshot(
+        &self,
+        repo: &str,
+        issue_id: u64,
+    ) -> Result<Option<IssueRuntimeSnapshot>> {
+        let path = self.runtime_snapshot_path(repo, issue_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let json = std::fs::read_to_string(path)?;
+        Ok(Some(serde_json::from_str(&json)?))
+    }
+
+    /// List all runtime snapshots for a given repo.
+    pub fn list_runtime_snapshots(&self, repo: &str) -> Result<Vec<IssueRuntimeSnapshot>> {
+        let repo_dir = self.repo_dir(repo);
+        if !repo_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut snapshots = Vec::new();
+        for entry in std::fs::read_dir(&repo_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let issue_id: u64 = match entry.file_name().to_string_lossy().parse() {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            if let Some(snapshot) = self.load_runtime_snapshot(repo, issue_id)? {
+                snapshots.push(snapshot);
+            }
+        }
+
+        snapshots.sort_by_key(|snapshot| snapshot.issue_number);
+        Ok(snapshots)
+    }
+
+    /// List every runtime snapshot across all repos.
+    pub fn list_all_runtime_snapshots(&self) -> Result<Vec<IssueRuntimeSnapshot>> {
+        if !self.base_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut snapshots = Vec::new();
+        for entry in std::fs::read_dir(&self.base_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let repo = entry.file_name().to_string_lossy().to_string();
+            for issue_dir in std::fs::read_dir(entry.path())? {
+                let issue_dir = issue_dir?;
+                if !issue_dir.file_type()?.is_dir() {
+                    continue;
+                }
+                let path = issue_dir.path().join("runtime.json");
+                if !path.exists() {
+                    continue;
+                }
+                let json = std::fs::read_to_string(path)?;
+                let mut snapshot: IssueRuntimeSnapshot = serde_json::from_str(&json)?;
+                if snapshot.repo.is_empty() {
+                    snapshot.repo = repo.clone();
+                }
+                snapshots.push(snapshot);
+            }
+        }
+
+        snapshots.sort_by(|left, right| {
+            left.repo
+                .cmp(&right.repo)
+                .then(left.issue_number.cmp(&right.issue_number))
+        });
+        Ok(snapshots)
+    }
+
+    /// Delete a session ID (e.g., when an issue is closed/completed).
+    pub fn delete(&self, repo: &str, issue_id: u64) -> Result<()> {
+        let dir = self.session_dir(repo, issue_id);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+            tracing::debug!(repo = repo, issue_id = issue_id, "deleted session");
+        }
+        Ok(())
+    }
+
+    /// List all active session IDs for a given repo.
+    ///
+    /// Returns a vec of (issue_id, session_id) pairs sorted by issue_id.
+    pub fn list(&self, repo: &str) -> Result<Vec<(u64, String)>> {
+        let repo_dir = self.repo_dir(repo);
+
+        if !repo_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut sessions = Vec::new();
+        for entry in std::fs::read_dir(&repo_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                let issue_id: u64 = match entry.file_name().to_string_lossy().parse() {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                let sid_path = entry.path().join("session_id");
+                if sid_path.exists() {
+                    if let Some(sid) = Self::read_session_id(&sid_path)? {
+                        sessions.push((issue_id, sid));
+                    }
+                }
+            }
+        }
+
+        sessions.sort_by_key(|(id, _)| *id);
+        Ok(sessions)
+    }
+
+    /// Check if a session exists for a given repo + issue.
+    pub fn has_session(&self, repo: &str, issue_id: u64) -> bool {
+        self.session_id_path(repo, issue_id).exists()
+    }
+
+    /// Get the session directory path for external use.
+    pub fn get_session_dir(&self, repo: &str, issue_id: u64) -> PathBuf {
+        self.session_dir(repo, issue_id)
+    }
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_state::IssueRuntimeSnapshot;
+    use tempfile::TempDir;
+
+    fn test_store(tmp: &TempDir) -> SessionStore {
+        SessionStore::with_base_dir(tmp.path().join("sessions"))
+    }
+
+    // 1. Save and load session ID
+    #[test]
+    fn save_and_load_session_id() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+        store.save("owner/repo", 42, "session-abc-123").unwrap();
+        let loaded = store.load("owner/repo", 42).unwrap();
+        assert_eq!(loaded, Some("session-abc-123".to_string()));
+    }
+
+    // 2. Load nonexistent session returns None
+    #[test]
+    fn load_nonexistent_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+        let loaded = store.load("owner/repo", 999).unwrap();
+        assert_eq!(loaded, None);
+    }
+
+    // 3. Delete session
+    #[test]
+    fn delete_session_removes_dir() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+        store.save("owner/repo", 42, "session-xyz").unwrap();
+        assert!(store.has_session("owner/repo", 42));
+
+        store.delete("owner/repo", 42).unwrap();
+        assert!(!store.has_session("owner/repo", 42));
+        assert_eq!(store.load("owner/repo", 42).unwrap(), None);
+    }
+
+    // 4. Delete nonexistent session is no-op
+    #[test]
+    fn delete_nonexistent_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+        store.delete("owner/repo", 999).unwrap();
+    }
+
+    // 5. List sessions for repo
+    #[test]
+    fn list_sessions_for_repo() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+        store.save("owner/repo", 10, "sid-10").unwrap();
+        store.save("owner/repo", 20, "sid-20").unwrap();
+        store.save("owner/repo", 5, "sid-5").unwrap();
+
+        let sessions = store.list("owner/repo").unwrap();
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions[0], (5, "sid-5".to_string()));
+        assert_eq!(sessions[1], (10, "sid-10".to_string()));
+        assert_eq!(sessions[2], (20, "sid-20".to_string()));
+    }
+
+    // 6. List sessions for empty repo
+    #[test]
+    fn list_sessions_empty_repo() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+        let sessions = store.list("nobody/nothing").unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    // 7. has_session returns correct values
+    #[test]
+    fn has_session_check() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+        assert!(!store.has_session("owner/repo", 42));
+        store.save("owner/repo", 42, "sid").unwrap();
+        assert!(store.has_session("owner/repo", 42));
+    }
+
+    // 8. Overwrite session ID
+    #[test]
+    fn overwrite_session_id() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+        store.save("owner/repo", 42, "old-session").unwrap();
+        store.save("owner/repo", 42, "new-session").unwrap();
+        let loaded = store.load("owner/repo", 42).unwrap();
+        assert_eq!(loaded, Some("new-session".to_string()));
+    }
+
+    #[test]
+    fn save_and_load_runtime_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+        let mut snapshot = IssueRuntimeSnapshot::new("owner/repo", 42);
+        snapshot.title = "Add dark mode".into();
+
+        store
+            .save_runtime_snapshot("owner/repo", &snapshot)
+            .unwrap();
+        let loaded = store
+            .load_runtime_snapshot("owner/repo", 42)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(loaded.repo, "owner/repo");
+        assert_eq!(loaded.issue_number, 42);
+        assert_eq!(loaded.title, "Add dark mode");
+    }
+
+    #[test]
+    fn list_runtime_snapshots_for_repo() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+
+        store
+            .save_runtime_snapshot("owner/repo", &IssueRuntimeSnapshot::new("owner/repo", 20))
+            .unwrap();
+        store
+            .save_runtime_snapshot("owner/repo", &IssueRuntimeSnapshot::new("owner/repo", 10))
+            .unwrap();
+
+        let snapshots = store.list_runtime_snapshots("owner/repo").unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].issue_number, 10);
+        assert_eq!(snapshots[1].issue_number, 20);
+    }
+
+    #[test]
+    fn list_all_runtime_snapshots_across_repos() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+
+        store
+            .save_runtime_snapshot("owner/repo", &IssueRuntimeSnapshot::new("owner/repo", 10))
+            .unwrap();
+        store
+            .save_runtime_snapshot("other/repo", &IssueRuntimeSnapshot::new("other/repo", 5))
+            .unwrap();
+
+        let snapshots = store.list_all_runtime_snapshots().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].repo, "other/repo");
+        assert_eq!(snapshots[1].repo, "owner/repo");
+    }
+
+    // 9. Repo with slash is sanitized
+    #[test]
+    fn repo_slash_sanitized() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+        store.save("org/my-repo", 1, "sid").unwrap();
+        let dir = store.get_session_dir("org/my-repo", 1);
+        assert!(dir.to_string_lossy().contains("org_my-repo"));
+        assert!(!dir.to_string_lossy().contains("org/my-repo"));
+    }
+
+    // 10. Multiple repos are isolated
+    #[test]
+    fn multiple_repos_isolated() {
+        let tmp = TempDir::new().unwrap();
+        let store = test_store(&tmp);
+        store.save("org/repo-a", 1, "sid-a").unwrap();
+        store.save("org/repo-b", 1, "sid-b").unwrap();
+
+        assert_eq!(
+            store.load("org/repo-a", 1).unwrap(),
+            Some("sid-a".to_string())
+        );
+        assert_eq!(
+            store.load("org/repo-b", 1).unwrap(),
+            Some("sid-b".to_string())
+        );
+    }
+}

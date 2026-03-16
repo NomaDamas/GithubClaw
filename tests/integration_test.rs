@@ -3,21 +3,20 @@
 //! Tests the full pipeline: webhook receipt -> queue -> orchestrator -> dispatch
 //! Uses mock data (no actual GitHub API calls)
 
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::sync::Mutex;
 
-use githubclaw::config::GlobalConfig;
-use githubclaw::queue::DiskPersistedQueue;
-use githubclaw::server::{ServerState, RegistryEntry, create_router};
-use githubclaw::signature::verify_webhook_signature;
-use githubclaw::orchestrator::schema::Action;
-use githubclaw::process_manager::{ProcessManager, check_fork_pr_gate};
-use githubclaw::scheduler::ScheduledEventManager;
 use githubclaw::agents::parser::parse_agent_file;
 use githubclaw::agents::prompt_assembler::PromptAssembler;
+use githubclaw::config::GlobalConfig;
+use githubclaw::process_manager::{check_fork_pr_gate, ProcessManager};
+use githubclaw::queue::DiskPersistedQueue;
 use githubclaw::rate_limiter::RateLimiter;
+use githubclaw::scheduler::ScheduledEventManager;
+use githubclaw::server::{create_router, RegistryEntry, ServerState};
+use githubclaw::signature::verify_webhook_signature;
 
 fn sign_payload(payload: &[u8], secret: &str) -> String {
     use hmac::{Hmac, Mac};
@@ -34,10 +33,13 @@ async fn test_webhook_to_queue_roundtrip() {
     // Create a test state with a registered repo
     let secret = "test-secret-123";
     let mut registry = HashMap::new();
-    registry.insert("owner/repo".to_string(), RegistryEntry {
-        local_path: tmp.path().to_string_lossy().to_string(),
-        socket_path: String::new(),
-    });
+    registry.insert(
+        "owner/repo".to_string(),
+        RegistryEntry {
+            local_path: tmp.path().to_string_lossy().to_string(),
+            socket_path: String::new(),
+        },
+    );
 
     let state = Arc::new(ServerState {
         webhook_secret: secret.to_string(),
@@ -46,11 +48,15 @@ async fn test_webhook_to_queue_roundtrip() {
         queues: Mutex::new(HashMap::new()),
         githubclaw_home: tmp.path().to_path_buf(),
         process_manager: Arc::new(ProcessManager::new(5)),
-        scheduler: Mutex::new(ScheduledEventManager::new(tmp.path().join("scheduled.json"))),
+        scheduler: Mutex::new(ScheduledEventManager::new(
+            tmp.path().join("scheduled.json"),
+        )),
         rate_limiter: Arc::new(RateLimiter::default()),
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        orchestrator_backend: githubclaw::orchestrator::session::OrchestratorBackend::Codex,
-        orchestrators: Mutex::new(HashMap::new()),
+        issue_router: githubclaw::issue_router::IssueRouter::new(tmp.path().join("sessions")),
+        session_store: githubclaw::session_store::SessionStore::with_base_dir(
+            tmp.path().join("sessions"),
+        ),
     });
 
     let app = create_router(state.clone());
@@ -69,16 +75,19 @@ async fn test_webhook_to_queue_roundtrip() {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    let response = app.oneshot(
-        Request::builder()
-            .method("POST")
-            .uri("/webhook")
-            .header("X-Hub-Signature-256", &sig)
-            .header("X-Github-Event", "issues")
-            .header("Content-Type", "application/json")
-            .body(Body::from(body))
-            .unwrap(),
-    ).await.unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("X-Hub-Signature-256", &sig)
+                .header("X-Github-Event", "issues")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
     assert_eq!(response.status(), 202);
 
@@ -93,29 +102,6 @@ async fn test_webhook_to_queue_roundtrip() {
     assert_eq!(repo_name, "owner/repo");
 }
 
-/// Test: ActionList parsing from various model outputs
-#[test]
-fn test_action_list_parsing_variants() {
-    use githubclaw::orchestrator::session::OrchestratorSession;
-
-    // Valid JSON
-    let json = r##"{"actions":[{"type":"dispatch","agent_type":"coder","issue_ref":"#42","task_context":"Fix bug"}],"reasoning":"test"}"##;
-    let result = OrchestratorSession::extract_action_list(json);
-    assert!(result.validate().is_ok());
-    assert_eq!(result.actions.len(), 1);
-
-    // JSON in code fences
-    let fenced = format!("Here's my decision:\n```json\n{}\n```", json);
-    let result = OrchestratorSession::extract_action_list(&fenced);
-    assert!(result.validate().is_ok());
-
-    // Garbage text falls back to no_action
-    let garbage = "I'm not sure what to do about this event.";
-    let result = OrchestratorSession::extract_action_list(garbage);
-    assert!(result.validate().is_ok());
-    assert!(matches!(&result.actions[0], Action::NoAction { .. }));
-}
-
 /// Test: Agent parser -> prompt assembler -> spawner pipeline
 #[test]
 fn test_agent_pipeline() {
@@ -124,7 +110,9 @@ fn test_agent_pipeline() {
     std::fs::create_dir_all(&agents_dir).unwrap();
 
     // Write agent definition
-    std::fs::write(agents_dir.join("coder.md"), r#"---
+    std::fs::write(
+        agents_dir.join("coder.md"),
+        r#"---
 backend: claude-code
 git_author_name: GithubClaw Coder
 git_author_email: coder@githubclaw.local
@@ -137,12 +125,22 @@ tools:
 # Coder Agent
 
 You are the Coder agent.
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     // Write global-prompt.md and VALUE.md
     let gc_dir = tmp.path().join(".githubclaw");
-    std::fs::write(gc_dir.join("global-prompt.md"), "# Agent Roster\n\nCommon rules.").unwrap();
-    std::fs::write(gc_dir.join("VALUE.md"), "# Mission\n\nBuild great software.").unwrap();
+    std::fs::write(
+        gc_dir.join("global-prompt.md"),
+        "# Agent Roster\n\nCommon rules.",
+    )
+    .unwrap();
+    std::fs::write(
+        gc_dir.join("VALUE.md"),
+        "# Mission\n\nBuild great software.",
+    )
+    .unwrap();
 
     // Parse agent
     let agent = parse_agent_file(&agents_dir.join("coder.md")).unwrap();
@@ -152,7 +150,9 @@ You are the Coder agent.
 
     // Assemble prompt
     let mut assembler = PromptAssembler::new(tmp.path());
-    let prompt_file = assembler.assemble(&agent, "Fix the null check in auth.rs").unwrap();
+    let prompt_file = assembler
+        .assemble(&agent, "Fix the null check in auth.rs")
+        .unwrap();
     assert!(prompt_file.exists());
     let content = std::fs::read_to_string(&prompt_file).unwrap();
     assert!(content.contains("Agent Roster"));
@@ -162,7 +162,9 @@ You are the Coder agent.
 
     // Build command
     let spawner = githubclaw::agents::spawner::AgentSpawner::new(tmp.path(), 200);
-    let cmd = spawner.build_command(&agent, &prompt_file, "Fix the null check").unwrap();
+    let cmd = spawner
+        .build_command(&agent, &prompt_file, "Fix the null check")
+        .unwrap();
     assert!(cmd.iter().any(|a| a == "claude"));
 
     // Build env
@@ -173,6 +175,61 @@ You are the Coder agent.
     // Cleanup
     assembler.cleanup_all();
     assert!(!prompt_file.exists());
+}
+
+/// Test: Default orchestrator prompts encode contributor hospitality guidance
+#[test]
+fn test_default_orchestrator_prompts_include_contributor_hospitality() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let system_prompt = std::fs::read_to_string(root.join("defaults/orchestrator.md")).unwrap();
+    let agent_prompt =
+        std::fs::read_to_string(root.join("defaults/agents/orchestrator.md")).unwrap();
+
+    assert!(system_prompt.contains("Contributor Hospitality"));
+    assert!(system_prompt.contains("thank"));
+    assert!(system_prompt.contains("What happens next"));
+    assert!(system_prompt.contains("do not call `githubclaw dispatch` and exit successfully"));
+    assert!(!system_prompt.contains("structured output"));
+    assert!(!system_prompt.contains("choose `no_action`"));
+    assert!(!system_prompt.contains("CS triages"));
+    assert!(!system_prompt.contains("Coder implements"));
+    assert!(system_prompt.contains("Bug Reproducer investigates"));
+    assert!(system_prompt.contains("Vision-gap Analyst"));
+
+    assert!(agent_prompt.contains("Contributor Hospitality"));
+    assert!(agent_prompt.contains("warm"));
+    assert!(agent_prompt.contains("additional information"));
+    assert!(agent_prompt.contains("Use `githubclaw dispatch` for all agent invocations"));
+    assert!(agent_prompt.contains("Exit successfully without emitting fabricated JSON"));
+}
+
+#[test]
+fn test_global_prompt_uses_current_agent_roster() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let global_prompt = std::fs::read_to_string(root.join("defaults/global_prompt.md")).unwrap();
+
+    assert!(global_prompt.contains("Orchestrator"));
+    assert!(global_prompt.contains("Bug Reproducer"));
+    assert!(global_prompt.contains("Vision-gap Analyst"));
+    assert!(global_prompt.contains("Verifier"));
+    assert!(global_prompt.contains("Implementer"));
+    assert!(global_prompt.contains("Reviewer"));
+    assert!(!global_prompt.contains("| CS |"));
+    assert!(!global_prompt.contains("| Coder |"));
+    assert!(!global_prompt.contains("| QA |"));
+    assert!(!global_prompt.contains("handoff keyword"));
+}
+
+#[test]
+fn test_bug_reproducer_prompt_prefers_isolation_without_requiring_it() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let prompt = std::fs::read_to_string(root.join("defaults/agents/bug_reproducer.md")).unwrap();
+
+    assert!(prompt.contains("Prefer an isolated environment"));
+    assert!(prompt.contains("If that is not practical"));
+    assert!(prompt.contains("local fallback"));
+    assert!(!prompt.contains("always use Docker"));
+    assert!(!prompt.contains(".githubclaw/environments/"));
 }
 
 /// Test: Fork PR gate end-to-end
@@ -215,9 +272,12 @@ fn test_queue_persistence() {
     // Create queue, add events
     {
         let q = DiskPersistedQueue::new(&queue_dir, 3).unwrap();
-        q.enqueue(serde_json::json!({"event": 1}), "test_event").unwrap();
-        q.enqueue(serde_json::json!({"event": 2}), "test_event").unwrap();
-        q.enqueue(serde_json::json!({"event": 3}), "test_event").unwrap();
+        q.enqueue(serde_json::json!({"event": 1}), "test_event")
+            .unwrap();
+        q.enqueue(serde_json::json!({"event": 2}), "test_event")
+            .unwrap();
+        q.enqueue(serde_json::json!({"event": 3}), "test_event")
+            .unwrap();
     }
 
     // Reconstruct from same directory (simulates restart)

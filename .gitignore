@@ -38,6 +38,7 @@ coverage.xml
 Thumbs.db
 
 # GithubClaw runtime state (never commit)
+.omx/
 .omc/
 .githubclaw/queue/
 .githubclaw/logs/

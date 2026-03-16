@@ -1,10 +1,13 @@
 // Server
 pub const DEFAULT_MAX_CONCURRENT_AGENTS: usize = 8;
+pub const DEFAULT_MAX_CONCURRENT_ORCHESTRATORS: usize = 4;
+pub const DEFAULT_MAX_CONCURRENT_WORKERS: usize = 8;
 pub const GRACEFUL_DRAIN_TIMEOUT_SECONDS: f64 = 120.0;
 
 // Process manager
 pub const DEFAULT_PROCESS_TIMEOUT_SECONDS: u64 = 7200;
 pub const MONITOR_CHECK_INTERVAL_SECONDS: u64 = 2;
+pub const MONITOR_HISTORY_MINUTES: usize = 30;
 pub const SIGTERM_GRACE_PERIOD_SECONDS: f64 = 10.0;
 pub const GRACEFUL_DRAIN_POLL_SECONDS: f64 = 1.0;
 pub const DEFAULT_GRACEFUL_DRAIN_SECONDS: f64 = 300.0;
@@ -47,3 +50,26 @@ pub const SEARCH_RESULTS_LIMIT: u32 = 30;
 
 // Spawner
 pub const DEFAULT_AGENT_MAX_TURNS: u32 = 200;
+
+// Pipeline loop limits
+pub const IMPLEMENTER_VERIFIER_MAX_LOOP: u32 = 10;
+pub const IMPLEMENTER_REVIEWER_MAX_LOOP: u32 = 10;
+pub const BUG_REPRODUCER_MAX_INFO_REQUESTS: u32 = 3;
+
+// Agent types
+pub const AGENT_ORCHESTRATOR: &str = "orchestrator";
+pub const AGENT_IMPLEMENTER: &str = "implementer";
+pub const AGENT_VERIFIER: &str = "verifier";
+pub const AGENT_REVIEWER: &str = "reviewer";
+pub const AGENT_VISION_GAP_ANALYST: &str = "vision-gap-analyst";
+pub const AGENT_BUG_REPRODUCER: &str = "bug-reproducer";
+
+/// All valid agent types.
+pub const AGENT_TYPES: &[&str] = &[
+    AGENT_ORCHESTRATOR,
+    AGENT_IMPLEMENTER,
+    AGENT_VERIFIER,
+    AGENT_REVIEWER,
+    AGENT_VISION_GAP_ANALYST,
+    AGENT_BUG_REPRODUCER,
+];

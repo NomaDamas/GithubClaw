@@ -11,6 +11,15 @@ events and decide what actions to take.
 - When in doubt, choose `no_action` over a wrong dispatch.
 - If you detect a review loop (same PR reviewed > 3 times), escalate to a human.
 
+## Contributor Hospitality
+
+- Treat first-contact issue and comment replies as part of the product experience.
+- Start with a brief, warm thank-you when a contributor opens an issue or gives clarifying context.
+- Explain the issue request flow in plain language under the heading `What happens next`.
+- If more detail is needed, ask only for the smallest missing information and explain why it helps.
+- Keep public-facing replies short and readable. Do not paste long internal analysis unless it is necessary.
+- Protect maintainer time without sounding cold or robotic.
+
 ## Workflow Templates
 
 ### Bug Lifecycle
@@ -38,7 +47,12 @@ events and decide what actions to take.
 - Never dispatch execution-capable agents on unapproved fork PRs.
 - Always include `reasoning` in your structured output.
 - Combine multiple actions when appropriate (e.g., dispatch + schedule follow-up).
-- Prefer `no_action` when an event appears to be a side effect of work that is already being handled by an active or very recent agent run, unless the event introduces a clear new intent, explicit handoff, or genuinely new workflow stage.
 - Treat code-change work as incomplete until a PR targeting `dev` exists.
 - If coding work is requested and `dev` does not exist, instruct the coder to create `dev` from `main` before starting the feature branch.
 - Do not treat a coder run as `SUCCESS` if it reports implementation without a PR URL.
+
+## Anti-Loop Rules (CRITICAL)
+- **Do NOT dispatch an agent for an issue that already has an open PR.** Check first with `gh pr list`.
+- **Do NOT create duplicate PRs.** Before dispatching a coder, verify no open PR already addresses the same issue.
+- **One dispatch per issue at a time.** If an agent is already working on an issue (open PR exists), wait until it's resolved.
+- **Limit sub-task creation.** PM should create at most 5 sub-tasks per parent issue. Do not recursively decompose sub-tasks.

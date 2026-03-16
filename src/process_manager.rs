@@ -56,7 +56,7 @@ const READ_ONLY_AGENT_TYPES: &[&str] = &["security_reviewer"];
 
 /// Return `true` if the dispatch is allowed, `false` if it should be blocked.
 ///
-/// Enforcement rules (from SECURITY.md):
+/// Enforcement rules for fork PR execution:
 /// - Not a fork PR -> allow
 /// - Fork PR with `githubclaw-approved` label -> allow
 /// - Read-only agents (e.g. `security_reviewer`) -> always allow
@@ -97,8 +97,12 @@ pub fn check_fork_pr_gate(event_payload: &serde_json::Value, agent_type: &str) -
 ///
 /// Provides spawn, monitor, idle-timeout, concurrency throttle, graceful
 /// drain, and force kill capabilities.
+///
+/// Separate concurrency limits for orchestrators and workers.
 pub struct ProcessManager {
     pub max_concurrent_agents: usize,
+    pub max_concurrent_orchestrators: usize,
+    pub max_concurrent_workers: usize,
     processes: Arc<Mutex<HashMap<u32, ManagedProcess>>>,
 }
 
@@ -107,6 +111,18 @@ impl ProcessManager {
     pub fn new(max_concurrent_agents: usize) -> Self {
         Self {
             max_concurrent_agents,
+            max_concurrent_orchestrators: 4,
+            max_concurrent_workers: max_concurrent_agents,
+            processes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Create a new `ProcessManager` with separate limits.
+    pub fn with_limits(max_orchestrators: usize, max_workers: usize) -> Self {
+        Self {
+            max_concurrent_agents: max_orchestrators + max_workers,
+            max_concurrent_orchestrators: max_orchestrators,
+            max_concurrent_workers: max_workers,
             processes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -120,9 +136,37 @@ impl ProcessManager {
             .count()
     }
 
-    /// Whether there is at least one free concurrency slot.
+    /// Number of running orchestrators.
+    pub async fn active_orchestrator_count(&self) -> usize {
+        let procs = self.processes.lock().await;
+        procs
+            .values()
+            .filter(|p| p.state == ProcessState::Running && p.kind == ProcessKind::Orchestrator)
+            .count()
+    }
+
+    /// Number of running workers.
+    pub async fn active_worker_count(&self) -> usize {
+        let procs = self.processes.lock().await;
+        procs
+            .values()
+            .filter(|p| p.state == ProcessState::Running && p.kind == ProcessKind::Worker)
+            .count()
+    }
+
+    /// Whether there is at least one free slot across all managed processes.
     pub async fn has_capacity(&self) -> bool {
         self.active_count().await < self.max_concurrent_agents
+    }
+
+    /// Whether there is a free slot for a specific process kind.
+    pub async fn has_capacity_for(&self, kind: ProcessKind) -> bool {
+        match kind {
+            ProcessKind::Orchestrator => {
+                self.active_orchestrator_count().await < self.max_concurrent_orchestrators
+            }
+            ProcessKind::Worker => self.active_worker_count().await < self.max_concurrent_workers,
+        }
     }
 
     /// Return a snapshot of all process PIDs and their states.
@@ -132,7 +176,14 @@ impl ProcessManager {
     }
 
     /// Register a spawned process for tracking.
-    pub async fn register(&self, pid: u32, kind: ProcessKind, repo: &str, label: &str, timeout_seconds: u64) {
+    pub async fn register(
+        &self,
+        pid: u32,
+        kind: ProcessKind,
+        repo: &str,
+        label: &str,
+        timeout_seconds: u64,
+    ) {
         let managed = ManagedProcess {
             pid,
             kind,
@@ -150,7 +201,11 @@ impl ProcessManager {
     pub async fn report_exit(&self, pid: u32, exit_code: i32) {
         if let Some(proc) = self.processes.lock().await.get_mut(&pid) {
             proc.exit_code = Some(exit_code);
-            proc.state = if exit_code == 0 { ProcessState::Finished } else { ProcessState::Crashed };
+            proc.state = if exit_code == 0 {
+                ProcessState::Finished
+            } else {
+                ProcessState::Crashed
+            };
         }
     }
 
@@ -169,7 +224,9 @@ impl ProcessManager {
                             proc.state = ProcessState::TimedOut;
                             tracing::warn!(
                                 "Process [{}] pid={} timed out after {}s",
-                                proc.label, proc.pid, elapsed
+                                proc.label,
+                                proc.pid,
+                                elapsed
                             );
                         }
                     }
@@ -277,7 +334,8 @@ mod tests {
         let pm = ProcessManager::new(4);
         assert_eq!(pm.active_count().await, 0);
 
-        pm.register(1001, ProcessKind::Worker, "owner/repo", "test-worker", 3600).await;
+        pm.register(1001, ProcessKind::Worker, "owner/repo", "test-worker", 3600)
+            .await;
         assert_eq!(pm.active_count().await, 1);
 
         let procs = pm.all_processes().await;
@@ -288,7 +346,8 @@ mod tests {
     #[tokio::test]
     async fn report_exit_updates_state_success() {
         let pm = ProcessManager::new(4);
-        pm.register(2001, ProcessKind::Orchestrator, "owner/repo", "orch", 3600).await;
+        pm.register(2001, ProcessKind::Orchestrator, "owner/repo", "orch", 3600)
+            .await;
 
         pm.report_exit(2001, 0).await;
         let procs = pm.all_processes().await;
@@ -300,7 +359,8 @@ mod tests {
     #[tokio::test]
     async fn report_exit_updates_state_crash() {
         let pm = ProcessManager::new(4);
-        pm.register(3001, ProcessKind::Worker, "owner/repo", "worker", 3600).await;
+        pm.register(3001, ProcessKind::Worker, "owner/repo", "worker", 3600)
+            .await;
 
         pm.report_exit(3001, 1).await;
         let procs = pm.all_processes().await;

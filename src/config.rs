@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 
 use crate::constants::{
     DEFAULT_CONFIG_DRAIN_TIMEOUT_SECONDS, DEFAULT_CONFIG_MAX_CONCURRENT_AGENTS,
-    DEFAULT_CONFIG_MAX_RETRY, DEFAULT_GLOBAL_TIMEOUT_SECONDS,
-    DEFAULT_ORCHESTRATOR_IDLE_TIMEOUT_SECONDS, DEFAULT_RECOVERY_PROBE_INTERVAL_SECONDS,
-    DEFAULT_SERVER_PORT,
+    DEFAULT_CONFIG_MAX_RETRY, DEFAULT_GLOBAL_TIMEOUT_SECONDS, DEFAULT_MAX_CONCURRENT_ORCHESTRATORS,
+    DEFAULT_MAX_CONCURRENT_WORKERS, DEFAULT_ORCHESTRATOR_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_RECOVERY_PROBE_INTERVAL_SECONDS, DEFAULT_SERVER_PORT,
 };
 use crate::errors::{GithubClawError, Result};
 
@@ -119,6 +119,20 @@ pub struct GlobalConfig {
 
     #[serde(default = "default_event_subscription")]
     pub event_subscription: Vec<String>,
+
+    // Separate concurrency limits
+    #[serde(default = "default_max_orchestrators")]
+    pub max_concurrent_orchestrators: usize,
+
+    #[serde(default = "default_max_workers")]
+    pub max_concurrent_workers: usize,
+}
+
+fn default_max_orchestrators() -> usize {
+    DEFAULT_MAX_CONCURRENT_ORCHESTRATORS
+}
+fn default_max_workers() -> usize {
+    DEFAULT_MAX_CONCURRENT_WORKERS
 }
 
 impl Default for GlobalConfig {
@@ -133,6 +147,8 @@ impl Default for GlobalConfig {
             recovery_probe_interval: DEFAULT_RECOVERY_PROBE_INTERVAL_SECONDS,
             max_retry: DEFAULT_CONFIG_MAX_RETRY,
             event_subscription: default_event_subscription(),
+            max_concurrent_orchestrators: DEFAULT_MAX_CONCURRENT_ORCHESTRATORS,
+            max_concurrent_workers: DEFAULT_MAX_CONCURRENT_WORKERS,
         }
     }
 }
@@ -142,9 +158,7 @@ impl GlobalConfig {
     ///
     /// Supports both flat keys (`port`) and nested keys (`server.port`).
     pub fn load(path: Option<&Path>) -> Result<Self> {
-        let config_path = path
-            .map(PathBuf::from)
-            .unwrap_or_else(global_config_path);
+        let config_path = path.map(PathBuf::from).unwrap_or_else(global_config_path);
 
         if !config_path.exists() {
             let mut cfg = Self::default();
@@ -153,10 +167,8 @@ impl GlobalConfig {
         }
 
         let contents = std::fs::read_to_string(&config_path)?;
-        let raw: serde_yaml::Value =
-            serde_yaml::from_str(&contents).unwrap_or(serde_yaml::Value::Mapping(
-                serde_yaml::Mapping::new(),
-            ));
+        let raw: serde_yaml::Value = serde_yaml::from_str(&contents)
+            .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
 
         let defaults = Self::default();
 
@@ -202,6 +214,20 @@ impl GlobalConfig {
                 .unwrap_or(defaults.max_retry),
             event_subscription: get_flat_string_list(&raw, "event_subscription")
                 .unwrap_or_else(default_event_subscription),
+            max_concurrent_orchestrators: get_flat_or_nested_u64(
+                &raw,
+                "max_concurrent_orchestrators",
+                &["process", "max_concurrent_orchestrators"],
+            )
+            .map(|v| v as usize)
+            .unwrap_or(defaults.max_concurrent_orchestrators),
+            max_concurrent_workers: get_flat_or_nested_u64(
+                &raw,
+                "max_concurrent_workers",
+                &["process", "max_concurrent_workers"],
+            )
+            .map(|v| v as usize)
+            .unwrap_or(defaults.max_concurrent_workers),
         };
 
         config.validate();
@@ -264,9 +290,7 @@ impl GlobalConfig {
 
     /// Write config to disk as YAML.
     pub fn save(&self, path: Option<&Path>) -> Result<()> {
-        let config_path = path
-            .map(PathBuf::from)
-            .unwrap_or_else(global_config_path);
+        let config_path = path.map(PathBuf::from).unwrap_or_else(global_config_path);
 
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -306,6 +330,41 @@ pub struct RepoConfig {
 
     #[serde(default = "default_event_subscription")]
     pub event_subscription: Vec<String>,
+
+    // E2E test configuration for Verifier direct-use validation
+    #[serde(default)]
+    pub e2e_config: Option<E2eConfig>,
+
+    // Reviewer secondary criteria (after JTBD resolution)
+    #[serde(default)]
+    pub reviewer_priorities: Vec<String>,
+
+    // Shell command to launch the app for manual dogfooding
+    #[serde(default)]
+    pub dogfood_command: Option<String>,
+}
+
+/// E2E test configuration for Verifier direct-use validation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct E2eConfig {
+    /// Type of project: "web", "api", "cli", "library"
+    pub project_type: String,
+
+    /// Command to start the application for testing
+    #[serde(default)]
+    pub start_command: Option<String>,
+
+    /// Command to run e2e tests
+    #[serde(default)]
+    pub test_command: Option<String>,
+
+    /// Base URL for web/API projects
+    #[serde(default)]
+    pub base_url: Option<String>,
+
+    /// Additional instructions for the Verifier
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 impl Default for RepoConfig {
@@ -314,6 +373,9 @@ impl Default for RepoConfig {
             allowed_read_paths: default_allowed_read_paths(),
             excluded_read_paths: default_excluded_read_paths(),
             event_subscription: default_event_subscription(),
+            e2e_config: None,
+            reviewer_priorities: Vec::new(),
+            dogfood_command: None,
         }
     }
 }
@@ -471,11 +533,7 @@ mod tests {
     fn test_load_from_yaml_file() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.yaml");
-        fs::write(
-            &config_path,
-            "port: 9090\nhost: 127.0.0.1\nmax_retry: 5\n",
-        )
-        .unwrap();
+        fs::write(&config_path, "port: 9090\nhost: 127.0.0.1\nmax_retry: 5\n").unwrap();
 
         let cfg = GlobalConfig::load(Some(&config_path)).unwrap();
         assert_eq!(cfg.port, 9090);
@@ -548,7 +606,10 @@ mod tests {
         fs::write(&config_path, "max_concurrent_agents: 0\n").unwrap();
 
         let cfg = GlobalConfig::load(Some(&config_path)).unwrap();
-        assert_eq!(cfg.max_concurrent_agents, DEFAULT_CONFIG_MAX_CONCURRENT_AGENTS);
+        assert_eq!(
+            cfg.max_concurrent_agents,
+            DEFAULT_CONFIG_MAX_CONCURRENT_AGENTS
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -559,10 +620,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.yaml");
 
-        let mut original = GlobalConfig::default();
-        original.port = 3000;
-        original.host = "192.168.1.1".into();
-        original.max_retry = 7;
+        let original = GlobalConfig {
+            port: 3000,
+            host: "192.168.1.1".into(),
+            max_retry: 7,
+            ..GlobalConfig::default()
+        };
 
         original.save(Some(&config_path)).unwrap();
 
@@ -570,7 +633,10 @@ mod tests {
         assert_eq!(reloaded.port, 3000);
         assert_eq!(reloaded.host, "192.168.1.1");
         assert_eq!(reloaded.max_retry, 7);
-        assert_eq!(reloaded.max_concurrent_agents, original.max_concurrent_agents);
+        assert_eq!(
+            reloaded.max_concurrent_agents,
+            original.max_concurrent_agents
+        );
         assert_eq!(reloaded.global_timeout, original.global_timeout);
         assert_eq!(reloaded.event_subscription.len(), 12);
     }
@@ -585,10 +651,9 @@ mod tests {
         assert_eq!(cfg.excluded_read_paths.len(), 3);
         assert!(cfg.excluded_read_paths.contains(&"~/.ssh/".to_string()));
         assert!(cfg.excluded_read_paths.contains(&"~/.aws/".to_string()));
-        assert!(
-            cfg.excluded_read_paths
-                .contains(&"~/.githubclaw/secrets/".to_string())
-        );
+        assert!(cfg
+            .excluded_read_paths
+            .contains(&"~/.githubclaw/secrets/".to_string()));
         assert_eq!(cfg.event_subscription.len(), 12);
     }
 
@@ -644,11 +709,7 @@ mod tests {
     fn test_flat_key_precedence_over_nested() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.yaml");
-        fs::write(
-            &config_path,
-            "port: 1111\nserver:\n  port: 2222\n",
-        )
-        .unwrap();
+        fs::write(&config_path, "port: 1111\nserver:\n  port: 2222\n").unwrap();
 
         let cfg = GlobalConfig::load(Some(&config_path)).unwrap();
         // Flat key should win
@@ -674,8 +735,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let repo_root = tmp.path();
 
-        let mut original = RepoConfig::default();
-        original.allowed_read_paths = vec!["/data".into()];
+        let original = RepoConfig {
+            allowed_read_paths: vec!["/data".into()],
+            ..RepoConfig::default()
+        };
 
         original.save(Some(repo_root)).unwrap();
 
