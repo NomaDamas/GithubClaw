@@ -40,19 +40,14 @@ cat "${PROMPT_FILE}" | codex exec - \
 const DEFAULT_GITIGNORE: &str = "secrets/\nqueue/\nlogs/\nmemory.md\n";
 const DEFAULT_REPO_CONFIG_YAML: &str = "# GithubClaw per-repo configuration.\n# See https://github.com/GithubClaw/githubclaw for options.\n";
 
-// Agent definitions — embedded from defaults/agents/*.md at compile time.
-const DEFAULT_AGENT_CS: &str = include_str!("../defaults/agents/cs.md");
-const DEFAULT_AGENT_BUG_TRACKER: &str = include_str!("../defaults/agents/bug_tracker.md");
-const DEFAULT_AGENT_LIBRARIAN: &str = include_str!("../defaults/agents/librarian.md");
-const DEFAULT_AGENT_PROJECT_MANAGER: &str = include_str!("../defaults/agents/project_manager.md");
-const DEFAULT_AGENT_CODER: &str = include_str!("../defaults/agents/coder.md");
-const DEFAULT_AGENT_QA: &str = include_str!("../defaults/agents/qa.md");
+// Agent definitions embedded at compile time.
+const DEFAULT_AGENT_ORCHESTRATOR: &str = include_str!("../defaults/agents/orchestrator.md");
+const DEFAULT_AGENT_IMPLEMENTER: &str = include_str!("../defaults/agents/implementer.md");
+const DEFAULT_AGENT_VERIFIER: &str = include_str!("../defaults/agents/verifier.md");
 const DEFAULT_AGENT_REVIEWER: &str = include_str!("../defaults/agents/reviewer.md");
-const DEFAULT_AGENT_CONTENTS_MARKETER: &str =
-    include_str!("../defaults/agents/contents_marketer.md");
-const DEFAULT_AGENT_VISIONARY: &str = include_str!("../defaults/agents/visionary.md");
-const DEFAULT_AGENT_SECURITY_REVIEWER: &str =
-    include_str!("../defaults/agents/security_reviewer.md");
+const DEFAULT_AGENT_VISION_GAP_ANALYST: &str =
+    include_str!("../defaults/agents/vision_gap_analyst.md");
+const DEFAULT_AGENT_BUG_REPRODUCER: &str = include_str!("../defaults/agents/bug_reproducer.md");
 
 // ---------------------------------------------------------------------------
 // Launchd / systemd constants
@@ -107,6 +102,34 @@ enum Commands {
         #[arg(long, default_value_t = 8000)]
         port: u16,
     },
+    /// Dispatch a worker agent for a specific issue (called by Orchestrator)
+    Dispatch {
+        /// Agent type: implementer, verifier, reviewer, vision-gap-analyst, bug-reproducer
+        agent_type: String,
+        /// GitHub issue number
+        #[arg(long)]
+        issue: u64,
+        /// Prompt/instructions for the agent
+        #[arg(long)]
+        prompt: String,
+        /// Repository (owner/name). Defaults to current repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Logical event ID used for dispatch deduplication.
+        #[arg(long)]
+        event_id: Option<String>,
+        /// Optional suffix to distinguish intentionally repeated identical dispatches.
+        #[arg(long)]
+        dedupe_key: Option<String>,
+    },
+    /// Start a release pipeline: dev -> release branch + PR
+    Release {
+        /// Repository (owner/name). Defaults to current repo.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Launch the TUI dashboard
+    Tui,
 }
 
 pub fn run() {
@@ -119,6 +142,23 @@ pub fn run() {
         Commands::Status => cmd_status(),
         Commands::Logs { follow } => cmd_logs(follow),
         Commands::Serve { host, port } => cmd_serve(&host, port),
+        Commands::Dispatch {
+            agent_type,
+            issue,
+            prompt,
+            repo,
+            event_id,
+            dedupe_key,
+        } => cmd_dispatch(
+            &agent_type,
+            issue,
+            &prompt,
+            repo.as_deref(),
+            event_id.as_deref(),
+            dedupe_key.as_deref(),
+        ),
+        Commands::Release { repo } => cmd_release(repo.as_deref()),
+        Commands::Tui => cmd_tui(),
     }
 }
 
@@ -169,25 +209,21 @@ fn cmd_init() {
         (claw_dir.join("spawn_codex.sh"), DEFAULT_SPAWN_CODEX_SH),
         (claw_dir.join(".gitignore"), DEFAULT_GITIGNORE),
         (claw_dir.join("config.yaml"), DEFAULT_REPO_CONFIG_YAML),
-        // Agent definition files (all 10 agents)
-        (agents_dir.join("cs.md"), DEFAULT_AGENT_CS),
-        (agents_dir.join("bug_tracker.md"), DEFAULT_AGENT_BUG_TRACKER),
-        (agents_dir.join("librarian.md"), DEFAULT_AGENT_LIBRARIAN),
+        // Agent definition files (6 V2 agents)
         (
-            agents_dir.join("project_manager.md"),
-            DEFAULT_AGENT_PROJECT_MANAGER,
+            agents_dir.join("orchestrator.md"),
+            DEFAULT_AGENT_ORCHESTRATOR,
         ),
-        (agents_dir.join("coder.md"), DEFAULT_AGENT_CODER),
-        (agents_dir.join("qa.md"), DEFAULT_AGENT_QA),
+        (agents_dir.join("implementer.md"), DEFAULT_AGENT_IMPLEMENTER),
+        (agents_dir.join("verifier.md"), DEFAULT_AGENT_VERIFIER),
         (agents_dir.join("reviewer.md"), DEFAULT_AGENT_REVIEWER),
         (
-            agents_dir.join("contents_marketer.md"),
-            DEFAULT_AGENT_CONTENTS_MARKETER,
+            agents_dir.join("vision_gap_analyst.md"),
+            DEFAULT_AGENT_VISION_GAP_ANALYST,
         ),
-        (agents_dir.join("visionary.md"), DEFAULT_AGENT_VISIONARY),
         (
-            agents_dir.join("security_reviewer.md"),
-            DEFAULT_AGENT_SECURITY_REVIEWER,
+            agents_dir.join("bug_reproducer.md"),
+            DEFAULT_AGENT_BUG_REPRODUCER,
         ),
     ];
 
@@ -323,16 +359,6 @@ fn cmd_bootstrap() {
         let scheduler_path = global_dir.join("scheduled_events.json");
         let state = Arc::new(ServerState {
             webhook_secret: String::new(),
-            hosted_proxy_store: Mutex::new(
-                crate::hosted_proxy::HostedProxyStore::load(
-                    global_dir.join("hosted_proxy_registrations.json"),
-                    "bootstrap-only-secret",
-                )
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to initialize hosted proxy store: {e}");
-                    std::process::exit(1);
-                }),
-            ),
             registry: RwLock::new(registry),
             started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
@@ -341,8 +367,8 @@ fn cmd_bootstrap() {
             scheduler: Mutex::new(ScheduledEventManager::new(&scheduler_path)),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            orchestrator_backend: crate::orchestrator::session::OrchestratorBackend::Codex,
-            orchestrators: Mutex::new(HashMap::new()),
+            issue_router: crate::issue_router::IssueRouter::new(global_dir.join("sessions")),
+            session_store: crate::session_store::SessionStore::new(),
         });
 
         match bootstrap_repo(&state, &owner_repo, &entry, true).await {
@@ -871,26 +897,19 @@ fn cmd_serve(host: &str, port: u16) {
         // Create server state
         let state = Arc::new(ServerState {
             webhook_secret: webhook_secret.clone(),
-            hosted_proxy_store: Mutex::new(
-                crate::hosted_proxy::HostedProxyStore::load(
-                    global_dir.join("hosted_proxy_registrations.json"),
-                    webhook_secret,
-                )
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to initialize hosted proxy store: {e}");
-                    std::process::exit(1);
-                }),
-            ),
             registry: RwLock::new(registry.clone()),
             started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
             githubclaw_home: global_dir.clone(),
-            process_manager: Arc::new(ProcessManager::new(config.max_concurrent_agents)),
+            process_manager: Arc::new(ProcessManager::with_limits(
+                config.max_concurrent_orchestrators,
+                config.max_concurrent_workers,
+            )),
             scheduler: Mutex::new(scheduler),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            orchestrator_backend: crate::orchestrator::session::OrchestratorBackend::Codex,
-            orchestrators: Mutex::new(HashMap::new()),
+            issue_router: crate::issue_router::IssueRouter::new(global_dir.join("sessions")),
+            session_store: crate::session_store::SessionStore::new(),
         });
 
         // Bootstrap repos: scan existing open issues/PRs for each repo
@@ -926,7 +945,7 @@ fn cmd_serve(host: &str, port: u16) {
                             async move {
                                 let mut queues = st.queues.lock().await;
                                 let registry = st.registry.read().await;
-                                let queue = crate::server::get_or_create_queue_pub(
+                                let queue = crate::server::get_or_create_queue(
                                     &mut queues,
                                     &registry,
                                     &st.githubclaw_home,
@@ -1311,6 +1330,417 @@ fn health_check(port: u16, log_path: &Path) {
 }
 
 // ===========================================================================
+// Helpers
+// ===========================================================================
+
+/// Detect the GitHub owner/repo from the current git remote.
+fn detect_github_remote(repo_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    parse_github_remote(&url)
+}
+
+fn runtime_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+// ===========================================================================
+// cmd_dispatch — Dispatch a worker agent for a specific issue
+// ===========================================================================
+
+fn cmd_dispatch(
+    agent_type: &str,
+    issue: u64,
+    prompt: &str,
+    repo: Option<&str>,
+    event_id_arg: Option<&str>,
+    dedupe_key_arg: Option<&str>,
+) {
+    use crate::constants::AGENT_TYPES;
+    use crate::dispatch_receipts::DispatchReceiptStore;
+
+    // Validate agent type
+    if !AGENT_TYPES.contains(&agent_type) {
+        eprintln!(
+            "Error: unknown agent type '{}'. Valid types: {}",
+            agent_type,
+            AGENT_TYPES.join(", ")
+        );
+        std::process::exit(1);
+    }
+
+    // Resolve repo
+    let repo_name = match repo {
+        Some(r) => r.to_string(),
+        None => {
+            let repo_root = find_repo_root(None).unwrap_or_else(|| {
+                eprintln!("Error: not inside a git repository. Use --repo flag.");
+                std::process::exit(1);
+            });
+            detect_github_remote(&repo_root).unwrap_or_else(|| {
+                eprintln!("Error: cannot detect GitHub remote. Use --repo flag.");
+                std::process::exit(1);
+            })
+        }
+    };
+
+    let repo_root = find_repo_root(None).unwrap_or_else(|| {
+        eprintln!("Error: not inside a git repository.");
+        std::process::exit(1);
+    });
+
+    let receipt_store = DispatchReceiptStore::new(&repo_root);
+    let dispatch_event_id = event_id_arg.map(ToString::to_string).or_else(|| {
+        std::env::var("GITHUBCLAW_EVENT_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let dispatch_dedupe_suffix = dedupe_key_arg.map(ToString::to_string).or_else(|| {
+        std::env::var("GITHUBCLAW_DISPATCH_DEDUPE_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let dispatch_receipt_key = dispatch_event_id.as_ref().map(|event_id| {
+        DispatchReceiptStore::key_for(
+            event_id,
+            agent_type,
+            issue,
+            prompt,
+            dispatch_dedupe_suffix.as_deref(),
+        )
+    });
+
+    if let Some(ref receipt_key) = dispatch_receipt_key {
+        if receipt_store.has_receipt(receipt_key) {
+            println!(
+                "Skipping duplicate {} dispatch for {}#{} (receipt {}).",
+                agent_type, repo_name, issue, receipt_key
+            );
+            let started_at = runtime_timestamp();
+            let session_store = crate::session_store::SessionStore::new();
+            let mut runtime_snapshot = session_store
+                .load_runtime_snapshot(&repo_name, issue)
+                .unwrap_or(None)
+                .unwrap_or_else(|| {
+                    crate::runtime_state::IssueRuntimeSnapshot::new(&repo_name, issue)
+                });
+            runtime_snapshot.note_agent_finished(
+                agent_type,
+                &started_at,
+                true,
+                format!(
+                    "Skipped duplicate dispatch for {}#{} (event {})",
+                    repo_name,
+                    issue,
+                    dispatch_event_id.as_deref().unwrap_or_default()
+                ),
+            );
+            let _ = session_store.save_runtime_snapshot(&repo_name, &runtime_snapshot);
+            return;
+        }
+    }
+
+    println!(
+        "Dispatching {} agent for {}#{} ...",
+        agent_type, repo_name, issue
+    );
+
+    let started_at = runtime_timestamp();
+    let session_store = crate::session_store::SessionStore::new();
+    let mut runtime_snapshot = session_store
+        .load_runtime_snapshot(&repo_name, issue)
+        .unwrap_or(None)
+        .unwrap_or_else(|| crate::runtime_state::IssueRuntimeSnapshot::new(&repo_name, issue));
+    runtime_snapshot.note_agent_started(
+        agent_type,
+        &started_at,
+        format!("Dispatch started for {}#{}", repo_name, issue),
+    );
+    let _ = session_store.save_runtime_snapshot(&repo_name, &runtime_snapshot);
+
+    // Build environment with root issue tracking
+    let mut extra_env = HashMap::new();
+    if issue > 0 {
+        extra_env.insert("GITHUBCLAW_ROOT_ISSUE".into(), issue.to_string());
+    }
+    extra_env.insert("GITHUBCLAW_REPO".into(), repo_name.clone());
+
+    // Load agent definition: write to temp file, then parse
+    let agent_def_content = load_agent_definition(agent_type, &repo_root);
+    let tmp_dir = std::env::temp_dir().join("githubclaw-dispatch");
+    fs::create_dir_all(&tmp_dir).unwrap_or_default();
+    let agent_file = tmp_dir.join(format!("{}.md", agent_type));
+    fs::write(&agent_file, &agent_def_content).unwrap_or_else(|e| {
+        eprintln!("Error writing temp agent file: {}", e);
+        std::process::exit(1);
+    });
+    let agent_def = match crate::agents::parser::parse_agent_file(&agent_file) {
+        Ok(def) => def,
+        Err(e) => {
+            eprintln!("Error parsing agent definition for '{}': {}", agent_type, e);
+            std::process::exit(1);
+        }
+    };
+
+    // Assemble prompt
+    let mut prompt_assembler = crate::agents::prompt_assembler::PromptAssembler::new(&repo_root);
+    let prompt_file = match prompt_assembler.assemble(&agent_def, prompt) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("Error assembling prompt: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Build and display the command (actual spawn is handled by the webhook server)
+    let spawner = crate::agents::spawner::AgentSpawner::new(
+        &repo_root,
+        crate::constants::DEFAULT_AGENT_MAX_TURNS,
+    );
+    let env = spawner.build_env(&agent_def, &prompt_file, prompt, Some(&extra_env));
+    let cmd = match spawner.build_command(&agent_def, &prompt_file, prompt) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error building command: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Execute the agent subprocess
+    let program = &cmd[0];
+    let args = &cmd[1..];
+    let status = Command::new(program)
+        .args(args)
+        .envs(&env)
+        .current_dir(&repo_root)
+        .status();
+
+    match status {
+        Ok(s) => {
+            let code = s.code().unwrap_or(-1);
+            let mut runtime_snapshot = session_store
+                .load_runtime_snapshot(&repo_name, issue)
+                .unwrap_or(None)
+                .unwrap_or_else(|| {
+                    crate::runtime_state::IssueRuntimeSnapshot::new(&repo_name, issue)
+                });
+            let detail = if code == 0 {
+                format!("Dispatch completed for {}#{}", repo_name, issue)
+            } else {
+                format!(
+                    "Dispatch exited with code {} for {}#{}",
+                    code, repo_name, issue
+                )
+            };
+            runtime_snapshot.note_agent_finished(agent_type, &started_at, code == 0, detail);
+            let _ = session_store.save_runtime_snapshot(&repo_name, &runtime_snapshot);
+            if code == 0 {
+                if let Some(event_id) = dispatch_event_id.as_deref() {
+                    if let Err(err) = receipt_store.record_success(
+                        event_id,
+                        agent_type,
+                        issue,
+                        prompt,
+                        dispatch_dedupe_suffix.as_deref(),
+                    ) {
+                        eprintln!(
+                            "Warning: failed to persist dispatch receipt for '{}': {}",
+                            agent_type, err
+                        );
+                    }
+                }
+                println!("Agent '{}' completed successfully.", agent_type);
+            } else {
+                eprintln!("Agent '{}' exited with code {}.", agent_type, code);
+                std::process::exit(code);
+            }
+        }
+        Err(e) => {
+            let mut runtime_snapshot = session_store
+                .load_runtime_snapshot(&repo_name, issue)
+                .unwrap_or(None)
+                .unwrap_or_else(|| {
+                    crate::runtime_state::IssueRuntimeSnapshot::new(&repo_name, issue)
+                });
+            runtime_snapshot.note_agent_finished(
+                agent_type,
+                &started_at,
+                false,
+                format!(
+                    "Dispatch failed to spawn for {}#{}: {}",
+                    repo_name, issue, e
+                ),
+            );
+            let _ = session_store.save_runtime_snapshot(&repo_name, &runtime_snapshot);
+            eprintln!("Error spawning agent '{}': {}", agent_type, e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Load an agent definition, preferring repo-local over embedded defaults.
+fn load_agent_definition(agent_type: &str, repo_root: &Path) -> String {
+    // Check repo-local agents directory first
+    let local_path = repo_root
+        .join(".githubclaw")
+        .join("agents")
+        .join(format!("{}.md", agent_type));
+    if local_path.exists() {
+        return fs::read_to_string(&local_path).unwrap_or_default();
+    }
+
+    // Fall back to embedded defaults
+    match agent_type {
+        "orchestrator" => DEFAULT_AGENT_ORCHESTRATOR.to_string(),
+        "implementer" => DEFAULT_AGENT_IMPLEMENTER.to_string(),
+        "verifier" => DEFAULT_AGENT_VERIFIER.to_string(),
+        "reviewer" => DEFAULT_AGENT_REVIEWER.to_string(),
+        "vision-gap-analyst" => DEFAULT_AGENT_VISION_GAP_ANALYST.to_string(),
+        "bug-reproducer" => DEFAULT_AGENT_BUG_REPRODUCER.to_string(),
+        _ => {
+            eprintln!(
+                "Error: no embedded definition for agent type '{}'",
+                agent_type
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+// ===========================================================================
+// cmd_release — Start release pipeline
+// ===========================================================================
+
+fn cmd_release(repo: Option<&str>) {
+    let repo_root = find_repo_root(None).unwrap_or_else(|| {
+        eprintln!("Error: not inside a git repository.");
+        std::process::exit(1);
+    });
+
+    let repo_name = match repo {
+        Some(r) => r.to_string(),
+        None => detect_github_remote(&repo_root).unwrap_or_else(|| {
+            eprintln!("Error: cannot detect GitHub remote. Use --repo flag.");
+            std::process::exit(1);
+        }),
+    };
+
+    println!("Starting release pipeline for {} ...", repo_name);
+
+    // Create release branch from dev
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&repo_root)
+        .output();
+
+    let current_branch = match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(e) => {
+            eprintln!("Error getting current branch: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if current_branch != "dev" {
+        eprintln!(
+            "Error: release must be started from 'dev' branch (currently on '{}')",
+            current_branch
+        );
+        std::process::exit(1);
+    }
+
+    // Generate release branch name with timestamp
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let release_branch = format!("release/{}", timestamp);
+
+    // Create release branch
+    let status = Command::new("git")
+        .args(["checkout", "-b", &release_branch])
+        .current_dir(&repo_root)
+        .status();
+
+    if let Err(e) = status {
+        eprintln!("Error creating release branch: {}", e);
+        std::process::exit(1);
+    }
+
+    // Push release branch
+    let status = Command::new("git")
+        .args(["push", "-u", "origin", &release_branch])
+        .current_dir(&repo_root)
+        .status();
+
+    if let Err(e) = status {
+        eprintln!("Error pushing release branch: {}", e);
+        std::process::exit(1);
+    }
+
+    // Create release PR via gh CLI directly (no orchestrator dispatch needed
+    // for the initial PR — orchestrator can be dispatched separately if needed)
+    println!("Creating release PR...");
+    let pr_body = format!(
+        "## Release from `{}`\n\n\
+         Automated release PR. Review changes and complete dogfooding checklist before merging.\n\n\
+         ---\n_Generated by `githubclaw release`_",
+        release_branch
+    );
+    let status = Command::new("gh")
+        .args([
+            "pr",
+            "create",
+            "--base",
+            "main",
+            "--head",
+            &release_branch,
+            "--title",
+            &format!("Release {}", release_branch.replace("release/", "")),
+            "--body",
+            &pr_body,
+        ])
+        .current_dir(&repo_root)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("Release PR created successfully.");
+            println!("Complete the dogfooding checklist, then merge via GitHub web UI.");
+        }
+        Ok(s) => {
+            eprintln!("gh pr create exited with code {:?}", s.code());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Failed to create release PR: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ===========================================================================
+// cmd_tui — Launch TUI dashboard
+// ===========================================================================
+
+fn cmd_tui() {
+    crate::tui::startup::run_tui_startup_checks();
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    crate::tui::ui::run(&repo_root).unwrap_or_else(|err| {
+        eprintln!("Error: failed to run TUI: {}", err);
+        std::process::exit(1);
+    });
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1341,5 +1771,41 @@ mod tests {
         assert_eq!(parse_github_remote("not-a-url"), None);
         assert_eq!(parse_github_remote("https://gitlab.com/owner/repo"), None);
         assert_eq!(parse_github_remote(""), None);
+    }
+
+    #[test]
+    fn test_dispatch_command_accepts_dedupe_flags() {
+        let cli = Cli::try_parse_from([
+            "githubclaw",
+            "dispatch",
+            "implementer",
+            "--issue",
+            "42",
+            "--prompt",
+            "Fix bug",
+            "--event-id",
+            "evt-123",
+            "--dedupe-key",
+            "second-pass",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Dispatch {
+                agent_type,
+                issue,
+                prompt,
+                event_id,
+                dedupe_key,
+                ..
+            } => {
+                assert_eq!(agent_type, "implementer");
+                assert_eq!(issue, 42);
+                assert_eq!(prompt, "Fix bug");
+                assert_eq!(event_id.as_deref(), Some("evt-123"));
+                assert_eq!(dedupe_key.as_deref(), Some("second-pass"));
+            }
+            _ => panic!("expected dispatch command"),
+        }
     }
 }

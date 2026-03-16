@@ -13,7 +13,7 @@ use axum::{
     Router,
 };
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -22,11 +22,9 @@ use tracing::{debug, error, info, warn};
 use crate::agents::parser::load_agent_definition;
 use crate::agents::prompt_assembler::PromptAssembler;
 use crate::agents::spawner::AgentSpawner;
-use crate::hosted_proxy::{HostedProxyStore, RegisterRequest, RegisterSuccess};
-use crate::orchestrator::schema::Action;
-use crate::orchestrator::session::OrchestratorSession;
 use crate::process_manager::{check_fork_pr_gate, ProcessManager};
 use crate::queue::DiskPersistedQueue;
+use crate::runtime_state::IssueRuntimeSnapshot;
 use crate::scheduler::ScheduledEventManager;
 use crate::signature::verify_webhook_signature;
 
@@ -37,7 +35,6 @@ use crate::signature::verify_webhook_signature;
 /// All shared state for the running webhook server.
 pub struct ServerState {
     pub webhook_secret: String,
-    pub hosted_proxy_store: Mutex<HostedProxyStore>,
     pub registry: RwLock<HashMap<String, RegistryEntry>>,
     pub started_repos: RwLock<HashSet<String>>,
     pub queues: Mutex<HashMap<String, DiskPersistedQueue>>,
@@ -46,10 +43,11 @@ pub struct ServerState {
     pub scheduler: Mutex<ScheduledEventManager>,
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
-    /// Which CLI backend to use for the orchestrator (codex or claude-code).
-    pub orchestrator_backend: crate::orchestrator::session::OrchestratorBackend,
-    /// Per-repo orchestrator sessions (created on demand in the drain loop).
-    pub orchestrators: Mutex<HashMap<String, OrchestratorSession>>,
+    // Orchestrators run as subprocesses; session state lives on disk.
+    /// Routes GitHub events to their root issue for orchestrator session routing.
+    pub issue_router: crate::issue_router::IssueRouter,
+    /// Persists Claude Code session IDs for the `--resume` flow.
+    pub session_store: crate::session_store::SessionStore,
 }
 
 /// A single entry in `registry.json`.
@@ -178,39 +176,33 @@ fn annotate_fork_status(mut payload: Value) -> Value {
 /// Return (or create) the disk-persisted queue for a repo.
 ///
 /// Must be called with the queues mutex already locked.
-fn get_or_create_queue<'a>(
+pub(crate) fn get_or_create_queue<'a>(
     queues: &'a mut HashMap<String, DiskPersistedQueue>,
     registry: &HashMap<String, RegistryEntry>,
     githubclaw_home: &Path,
     repo_full_name: &str,
 ) -> std::io::Result<&'a mut DiskPersistedQueue> {
-    if !queues.contains_key(repo_full_name) {
-        let queue_dir = if let Some(entry) = registry.get(repo_full_name) {
-            if !entry.local_path.is_empty() {
-                PathBuf::from(&entry.local_path)
-                    .join(".githubclaw")
-                    .join("queue")
+    let key = repo_full_name.to_string();
+    match queues.entry(key) {
+        Entry::Occupied(entry) => Ok(entry.into_mut()),
+        Entry::Vacant(entry) => {
+            let queue_dir = if let Some(registry_entry) = registry.get(repo_full_name) {
+                if !registry_entry.local_path.is_empty() {
+                    PathBuf::from(&registry_entry.local_path)
+                        .join(".githubclaw")
+                        .join("queue")
+                } else {
+                    fallback_queue_dir(githubclaw_home, repo_full_name)
+                }
             } else {
                 fallback_queue_dir(githubclaw_home, repo_full_name)
-            }
-        } else {
-            fallback_queue_dir(githubclaw_home, repo_full_name)
-        };
+            };
 
-        let q = DiskPersistedQueue::new(&queue_dir, crate::constants::DEFAULT_QUEUE_MAX_RETRY)?;
-        queues.insert(repo_full_name.to_string(), q);
+            let queue =
+                DiskPersistedQueue::new(&queue_dir, crate::constants::DEFAULT_QUEUE_MAX_RETRY)?;
+            Ok(entry.insert(queue))
+        }
     }
-    Ok(queues.get_mut(repo_full_name).unwrap())
-}
-
-/// Public wrapper around `get_or_create_queue` for use by the scheduler firing loop.
-pub fn get_or_create_queue_pub<'a>(
-    queues: &'a mut HashMap<String, DiskPersistedQueue>,
-    registry: &HashMap<String, RegistryEntry>,
-    githubclaw_home: &Path,
-    repo_full_name: &str,
-) -> std::io::Result<&'a mut DiskPersistedQueue> {
-    get_or_create_queue(queues, registry, githubclaw_home, repo_full_name)
 }
 
 async fn registry_snapshot(state: &Arc<ServerState>) -> HashMap<String, RegistryEntry> {
@@ -280,6 +272,54 @@ fn fallback_queue_dir(githubclaw_home: &Path, repo_full_name: &str) -> PathBuf {
     dir
 }
 
+fn is_process_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    if result == 0 {
+        return true;
+    }
+
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(code) if code == libc::EPERM => true,
+        Some(code) if code == libc::ESRCH => false,
+        _ => false,
+    }
+}
+
+fn runtime_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn load_or_new_runtime_snapshot(
+    state: &ServerState,
+    repo_name: &str,
+    issue_id: u64,
+) -> IssueRuntimeSnapshot {
+    state
+        .session_store
+        .load_runtime_snapshot(repo_name, issue_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| IssueRuntimeSnapshot::new(repo_name, issue_id))
+}
+
+fn save_runtime_snapshot(state: &ServerState, repo_name: &str, snapshot: &IssueRuntimeSnapshot) {
+    if let Err(err) = state
+        .session_store
+        .save_runtime_snapshot(repo_name, snapshot)
+    {
+        warn!(
+            repo = repo_name,
+            issue = snapshot.issue_number,
+            error = %err,
+            "Failed to persist runtime snapshot",
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -346,6 +386,13 @@ async fn webhook_handler(
         .get("X-Github-Event")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
+    let delivery_id = headers
+        .get("X-GitHub-Delivery")
+        .or_else(|| headers.get("X-Github-Delivery"))
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let action = payload.get("action").and_then(Value::as_str).unwrap_or("");
 
@@ -360,6 +407,10 @@ async fn webhook_handler(
         obj.insert(
             "_githubclaw_event_type".to_string(),
             serde_json::Value::String(event_type.to_string()),
+        );
+        obj.insert(
+            "_githubclaw_event_id".to_string(),
+            serde_json::Value::String(delivery_id.clone()),
         );
     }
 
@@ -379,12 +430,14 @@ async fn webhook_handler(
         )
     })?;
 
-    queue.enqueue(payload, &event_label).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Enqueue error: {}", e),
-        )
-    })?;
+    queue
+        .enqueue_with_id(payload, &event_label, Some(delivery_id))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Enqueue error: {}", e),
+            )
+        })?;
 
     let queue_size = queue.size();
     info!(
@@ -400,60 +453,6 @@ async fn health_handler(State(state): State<Arc<ServerState>>) -> Json<Value> {
         "status": "ok",
         "registered_repos": state.registry.read().await.len(),
     }))
-}
-
-async fn register_handler(
-    State(state): State<Arc<ServerState>>,
-    body: axum::body::Bytes,
-) -> (StatusCode, Json<Value>) {
-    let request = match serde_json::from_slice::<RegisterRequest>(&body) {
-        Ok(request) => request,
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
-                format!("Invalid JSON payload: {e}"),
-            );
-        }
-    };
-
-    let mut store = state.hosted_proxy_store.lock().await;
-    match store.register_with_now(request, chrono::Utc::now()) {
-        Ok(success) => success_response(success),
-        Err(err) => error_response(
-            StatusCode::from_u16(err.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            err.code,
-            err.message,
-        ),
-    }
-}
-
-fn success_response(success: RegisterSuccess) -> (StatusCode, Json<Value>) {
-    let status = if success.status == "claimed" {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    (
-        status,
-        Json(serde_json::to_value(success).expect("register success is serializable")),
-    )
-}
-
-fn error_response(
-    status: StatusCode,
-    code: &'static str,
-    message: impl Into<String>,
-) -> (StatusCode, Json<Value>) {
-    (
-        status,
-        Json(serde_json::json!({
-            "error": {
-                "code": code,
-                "message": message.into(),
-            }
-        })),
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +602,6 @@ pub async fn bootstrap_repo(
 pub fn create_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/webhook", post(webhook_handler))
-        .route("/register", post(register_handler))
         .route("/health", get(health_handler))
         .with_state(state)
 }
@@ -621,6 +619,11 @@ pub struct DispatchAction {
 
 /// Execute a single dispatch action: validate agent, check fork gate, assemble
 /// prompt, build command, and spawn the agent subprocess.
+///
+/// This function is still used by the `githubclaw dispatch` CLI command
+/// for direct agent spawning. The server drain loop no longer calls it directly
+/// because the orchestrator subprocess handles dispatch via CLI.
+#[allow(dead_code)]
 async fn execute_dispatch(
     state: &Arc<ServerState>,
     dispatch: &DispatchAction,
@@ -652,10 +655,16 @@ async fn execute_dispatch(
 
     // 4. Check concurrency capacity — return a special error so the drain
     //    loop knows to wait instead of nacking.
-    if !state.process_manager.has_capacity().await {
+    if !state
+        .process_manager
+        .has_capacity_for(crate::process_manager::ProcessKind::Worker)
+        .await
+    {
         return Err(format!(
-            "CAPACITY_FULL: No concurrency capacity for agent '{}' — {} agents already running",
-            dispatch.agent_type, state.process_manager.max_concurrent_agents,
+            "CAPACITY_FULL: No worker capacity for agent '{}' — {}/{} workers running",
+            dispatch.agent_type,
+            state.process_manager.active_worker_count().await,
+            state.process_manager.max_concurrent_workers,
         ));
     }
 
@@ -868,7 +877,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             );
             break;
         }
-        // 1. Peek the queue for the next event.
+        // 1. Recover any orphaned inflight event and peek the next queued event.
         let peeked = {
             let mut queues = state.queues.lock().await;
             let registry = registry_snapshot(state).await;
@@ -885,13 +894,30 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                     continue;
                 }
             };
-            match queue.peek() {
-                Ok(Some(event)) => Some(event),
-                Ok(None) => None,
+
+            match queue.recover_orphaned_inflight(is_process_alive) {
+                Ok(recovered) if recovered > 0 => {
+                    info!(repo = %repo_name, recovered, "Recovered orphaned inflight events");
+                }
+                Ok(_) => {}
                 Err(e) => {
-                    error!(repo = %repo_name, "Failed to peek queue: {}", e);
+                    error!(repo = %repo_name, "Failed to recover inflight events: {}", e);
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     continue;
+                }
+            }
+
+            if queue.has_inflight() {
+                None
+            } else {
+                match queue.peek() {
+                    Ok(Some(event)) => Some(event),
+                    Ok(None) => None,
+                    Err(e) => {
+                        error!(repo = %repo_name, "Failed to peek queue: {}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
                 }
             }
         };
@@ -899,7 +925,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         let event = match peeked {
             Some(ev) => ev,
             None => {
-                // Queue is empty — sleep and try again.
+                // Queue is empty or another orchestrator attempt is still inflight.
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 continue;
             }
@@ -920,6 +946,111 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             continue;
         }
 
+        // 2b. Route the event to its root issue for the correct orchestrator session.
+        let root_issue = state
+            .issue_router
+            .route_event(repo_name, &event.payload)
+            .unwrap_or(None);
+        if let Some(root) = root_issue {
+            tracing::debug!(
+                repo = %repo_name,
+                root_issue = root,
+                "Routed event to root issue #{}",
+                root
+            );
+
+            let mut snapshot = load_or_new_runtime_snapshot(state, repo_name, root);
+            snapshot.apply_event(&event.payload, root);
+            save_runtime_snapshot(state, repo_name, &snapshot);
+        }
+
+        // 2c. Build the prompt for the orchestrator subprocess.
+        // Detect markers and build ResumeMessage, or use raw event for new issues.
+        let orchestrator_prompt = if let Some(comment_body) = event
+            .payload
+            .pointer("/comment/body")
+            .and_then(|v| v.as_str())
+        {
+            let markers = crate::markers::parse_markers(comment_body);
+            let summary = crate::markers::extract_summary(comment_body);
+            if let (Some(marker), Some(root)) = (markers.first(), root_issue) {
+                tracing::info!(
+                    repo = %repo_name,
+                    root_issue = root,
+                    marker = marker.marker_type.as_str(),
+                    "Marker detected, building resume message"
+                );
+                let agent_type = event
+                    .payload
+                    .pointer("/comment/user/login")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let comment_url = event
+                    .payload
+                    .pointer("/comment/html_url")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let resume_msg = crate::resume_message::ResumeMessage::from_marker(
+                    root,
+                    marker,
+                    summary,
+                    agent_type,
+                    comment_url,
+                );
+                resume_msg.to_prompt()
+            } else {
+                // Comment without markers — might be human direction or external
+                let event_type = event
+                    .payload
+                    .get("_githubclaw_event_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                if let Some(root) = root_issue {
+                    let resume_msg = crate::resume_message::ResumeMessage::from_human_comment(
+                        root,
+                        comment_body,
+                        event
+                            .payload
+                            .pointer("/comment/html_url")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                    );
+                    resume_msg.to_prompt()
+                } else {
+                    format!(
+                        "[GithubClaw Event] type={}\n\n{}",
+                        event_type,
+                        serde_json::to_string_pretty(&event.payload).unwrap_or_default()
+                    )
+                }
+            }
+        } else {
+            // Non-comment event (issues.opened, pull_request.*, check_run.*, etc.)
+            let event_type = event
+                .payload
+                .get("_githubclaw_event_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            if let Some(root) = root_issue {
+                let summary = event
+                    .payload
+                    .pointer("/issue/title")
+                    .or_else(|| event.payload.pointer("/pull_request/title"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let resume_msg = crate::resume_message::ResumeMessage::from_issue_event(
+                    root, event_type, summary,
+                );
+                resume_msg.to_prompt()
+            } else {
+                format!(
+                    "[GithubClaw Event] type={}\n\n{}",
+                    event_type,
+                    serde_json::to_string_pretty(&event.payload).unwrap_or_default()
+                )
+            }
+        };
+
         // 3. Check rate limiter before sending to orchestrator.
         if state.rate_limiter.is_orchestrator_paused() {
             tracing::warn!("Rate limited (orchestrator paused), sleeping...");
@@ -927,223 +1058,357 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             continue;
         }
 
-        // 4. Send event to orchestrator (in-process).
-        let event_json = serde_json::to_string(&event.payload).unwrap_or_default();
+        // 4. Check orchestrator capacity.
+        if !state
+            .process_manager
+            .has_capacity_for(crate::process_manager::ProcessKind::Orchestrator)
+            .await
+        {
+            tracing::info!(
+                repo = %repo_name,
+                "Orchestrator capacity full, waiting..."
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            continue;
+        }
 
-        // Get or create the orchestrator session for this repo.
-        let response_text = {
-            let mut orchestrators = state.orchestrators.lock().await;
-            let registry = state.registry.read().await;
-            let session = orchestrators
-                .entry(repo_name.to_string())
-                .or_insert_with(|| {
-                    let entry = registry.get(repo_name).unwrap();
-                    OrchestratorSession::new(
-                        repo_name,
-                        &entry.local_path,
-                        state.orchestrator_backend.clone(),
-                        None,
-                        None,
-                    )
-                });
-            match session.process_event(&event_json).await {
-                Ok(text) => text,
+        // 5. Spawn the orchestrator as a Claude Code subprocess.
+        let issue_id = root_issue.unwrap_or(0);
+
+        let registry = state.registry.read().await;
+        let repo_dir = match registry.get(repo_name) {
+            Some(entry) => entry.local_path.clone(),
+            None => {
+                error!(repo = %repo_name, "Repo not in registry");
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        drop(registry);
+
+        // Write prompt to temp file to avoid CLI arg length limits
+        let prompt_tmp_dir = std::env::temp_dir().join("githubclaw-orch-prompts");
+        let _ = std::fs::create_dir_all(&prompt_tmp_dir);
+        let prompt_file =
+            prompt_tmp_dir.join(format!("{}-{}.txt", repo_name.replace('/', "_"), issue_id));
+        if let Err(e) = std::fs::write(&prompt_file, &orchestrator_prompt) {
+            error!(repo = %repo_name, "Failed to write orchestrator prompt file: {}", e);
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let mut reserved_event = {
+            let mut queues = state.queues.lock().await;
+            let registry = registry_snapshot(state).await;
+            let queue = match get_or_create_queue(
+                &mut queues,
+                &registry,
+                &state.githubclaw_home,
+                repo_name,
+            ) {
+                Ok(q) => q,
                 Err(e) => {
-                    warn!(
-                        repo = %repo_name,
-                        seq = event.sequence,
-                        "Orchestrator failed to process event: {}. Will nack and retry.",
-                        e,
-                    );
-                    state.rate_limiter.report_orchestrator_rate_limit();
-                    // Drop the lock before sleeping.
-                    drop(orchestrators);
-                    nack_head_event(state, repo_name, &event.filename).await;
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    error!(repo = %repo_name, "Failed to get queue for reserve: {}", e);
+                    let _ = std::fs::remove_file(&prompt_file);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+
+            match queue.reserve_next() {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    let _ = std::fs::remove_file(&prompt_file);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+                Err(e) => {
+                    error!(repo = %repo_name, "Failed to reserve queue head: {}", e);
+                    let _ = std::fs::remove_file(&prompt_file);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     continue;
                 }
             }
         };
 
-        // 5. Parse the ActionList response.
-        let action_list = OrchestratorSession::extract_action_list(&response_text);
-        if let Err(e) = action_list.validate() {
-            warn!(
-                repo = %repo_name,
-                seq = event.sequence,
-                "Invalid ActionList from orchestrator: {}",
-                e,
-            );
-            nack_head_event(state, repo_name, &event.filename).await;
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            continue;
+        // Build orchestrator command
+        // Use a deterministic session name so --resume works across invocations
+        let session_name = format!("githubclaw-{}-{}", repo_name.replace('/', "-"), issue_id);
+        let mut cmd_args = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            "--max-turns".to_string(),
+            "30".to_string(),
+            "--resume".to_string(),
+            session_name.clone(),
+        ];
+        cmd_args.push("--prompt-file".to_string());
+        cmd_args.push(prompt_file.to_string_lossy().to_string());
+
+        // Build environment
+        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        if issue_id > 0 {
+            env.insert("GITHUBCLAW_ROOT_ISSUE".to_string(), issue_id.to_string());
+        }
+        env.insert("GITHUBCLAW_REPO".to_string(), repo_name.to_string());
+        env.insert(
+            "GITHUBCLAW_EVENT_ID".to_string(),
+            reserved_event.event_id.clone(),
+        );
+
+        // Inject gh wrapper PATH
+        let spawner = crate::agents::spawner::AgentSpawner::new(
+            &repo_dir,
+            crate::constants::DEFAULT_AGENT_MAX_TURNS,
+        );
+        // Load orchestrator agent def to get full env
+        let orch_def_content = std::fs::read_to_string(
+            std::path::Path::new(&repo_dir).join(".githubclaw/agents/orchestrator.md"),
+        )
+        .unwrap_or_else(|_| include_str!("../defaults/agents/orchestrator.md").to_string());
+        let tmp_agent_dir = std::env::temp_dir().join("githubclaw-orch");
+        let _ = std::fs::create_dir_all(&tmp_agent_dir);
+        let tmp_agent_file = tmp_agent_dir.join("orchestrator.md");
+        let _ = std::fs::write(&tmp_agent_file, &orch_def_content);
+        if let Ok(orch_def) = crate::agents::parser::parse_agent_file(&tmp_agent_file) {
+            // Write orchestrator prompt to temp file
+            let prompt_path = tmp_agent_dir.join("orch_prompt.md");
+            let _ = std::fs::write(&prompt_path, &orchestrator_prompt);
+            let full_env =
+                spawner.build_env(&orch_def, &prompt_path, &orchestrator_prompt, Some(&env));
+            env = full_env;
         }
 
-        // 6. Execute each action.
-        let mut all_ok = true;
-        let mut capacity_wait = false;
-        for action in &action_list.actions {
-            match action {
-                Action::Dispatch {
-                    agent_type,
-                    issue_ref,
-                    task_context,
-                } => {
-                    let dispatch = DispatchAction {
-                        agent_type: agent_type.clone(),
-                        issue_ref: issue_ref.clone(),
-                        task_context: task_context.clone(),
-                    };
-                    match execute_dispatch(state, &dispatch, &event.payload, repo_name).await {
-                        Ok(()) => {
-                            // Record in dispatch_log for orchestrator context
-                            let timestamp = chrono::Utc::now().format("%H:%M").to_string();
-                            let mut orchestrators = state.orchestrators.lock().await;
-                            if let Some(session) = orchestrators.get_mut(repo_name) {
-                                session.dispatch_log.push((
-                                    timestamp,
-                                    issue_ref.clone(),
-                                    agent_type.clone(),
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            if e.starts_with("CAPACITY_FULL:") {
-                                // Don't nack — just wait and retry later.
-                                info!(
-                                    repo = %repo_name,
-                                    agent_type = %agent_type,
-                                    "Concurrency full, will retry after slot frees up",
-                                );
-                                capacity_wait = true;
-                                break;
-                            }
-                            error!(
+        info!(
+            repo = %repo_name,
+            issue = issue_id,
+            session = %session_name,
+            "Spawning Orchestrator subprocess"
+        );
+
+        // Spawn orchestrator
+        let program = cmd_args[0].clone();
+        let args = cmd_args[1..].to_vec();
+        let started_at = runtime_timestamp();
+
+        if issue_id > 0 {
+            let mut snapshot = load_or_new_runtime_snapshot(state, repo_name, issue_id);
+            snapshot.note_agent_started(
+                "orchestrator",
+                &started_at,
+                format!("Processing queued event for issue #{}", issue_id),
+            );
+            save_runtime_snapshot(state, repo_name, &snapshot);
+        }
+
+        let spawn_result = tokio::process::Command::new(&program)
+            .args(&args)
+            .envs(&env)
+            .current_dir(&repo_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+
+        match spawn_result {
+            Ok(child) => {
+                let pid = child.id().unwrap_or(0);
+
+                // Register with process manager
+                state
+                    .process_manager
+                    .register(
+                        pid,
+                        crate::process_manager::ProcessKind::Orchestrator,
+                        repo_name,
+                        &format!("orchestrator-issue-{}", issue_id),
+                        crate::constants::DEFAULT_PROCESS_TIMEOUT_SECONDS,
+                    )
+                    .await;
+
+                {
+                    let mut queues = state.queues.lock().await;
+                    let registry = registry_snapshot(state).await;
+                    if let Ok(queue) = get_or_create_queue(
+                        &mut queues,
+                        &registry,
+                        &state.githubclaw_home,
+                        repo_name,
+                    ) {
+                        if let Err(err) = queue.attach_processor_pid(&mut reserved_event, pid) {
+                            warn!(
                                 repo = %repo_name,
-                                agent_type = %agent_type,
-                                "Dispatch failed: {}",
-                                e,
+                                pid = pid,
+                                "Failed to attach orchestrator pid to inflight reservation: {}",
+                                err
                             );
-                            all_ok = false;
                         }
                     }
                 }
-                Action::ScheduleEvent {
-                    event_id: _,
-                    trigger_at,
-                    repo,
-                    payload,
-                    context,
-                } => match chrono::DateTime::parse_from_rfc3339(trigger_at) {
-                    Ok(dt) => {
-                        let mut scheduler = state.scheduler.lock().await;
-                        let id = scheduler.create_event(
-                            repo,
-                            dt.with_timezone(&chrono::Utc),
-                            payload.clone(),
-                            true,
-                            None,
-                            context,
-                        );
-                        info!(
-                            repo = %repo_name,
-                            event_id = %id,
-                            trigger_at = %trigger_at,
-                            "Scheduled event created",
-                        );
+
+                let output = child.wait_with_output().await;
+                match output {
+                    Ok(output) => {
+                        let exit_code = output.status.code().unwrap_or(-1);
+                        state.process_manager.report_exit(pid, exit_code).await;
+
+                        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+                        if exit_code == 0 {
+                            info!(
+                                repo = %repo_name,
+                                pid = pid,
+                                event_id = %reserved_event.event_id,
+                                stdout = %stdout,
+                                "Orchestrator completed successfully"
+                            );
+                            let mut queues = state.queues.lock().await;
+                            let registry = registry_snapshot(state).await;
+                            if let Ok(queue) = get_or_create_queue(
+                                &mut queues,
+                                &registry,
+                                &state.githubclaw_home,
+                                repo_name,
+                            ) {
+                                if let Err(err) = queue.ack_reserved(&reserved_event) {
+                                    error!(
+                                        repo = %repo_name,
+                                        event_id = %reserved_event.event_id,
+                                        "Failed to ack reserved event: {}",
+                                        err
+                                    );
+                                }
+                            }
+                        } else {
+                            warn!(
+                                repo = %repo_name,
+                                pid = pid,
+                                exit_code = exit_code,
+                                event_id = %reserved_event.event_id,
+                                stdout = %stdout,
+                                stderr = %stderr,
+                                "Orchestrator exited with non-zero code"
+                            );
+                            state.rate_limiter.report_orchestrator_rate_limit();
+                            let mut queues = state.queues.lock().await;
+                            let registry = registry_snapshot(state).await;
+                            if let Ok(queue) = get_or_create_queue(
+                                &mut queues,
+                                &registry,
+                                &state.githubclaw_home,
+                                repo_name,
+                            ) {
+                                if let Err(err) = queue.nack_reserved(&mut reserved_event) {
+                                    error!(
+                                        repo = %repo_name,
+                                        event_id = %reserved_event.event_id,
+                                        "Failed to nack reserved event: {}",
+                                        err
+                                    );
+                                }
+                            }
+                        }
+
+                        if issue_id > 0 {
+                            let mut snapshot =
+                                load_or_new_runtime_snapshot(state, repo_name, issue_id);
+                            let detail = if exit_code == 0 {
+                                format!("Completed issue #{}", issue_id)
+                            } else {
+                                format!(
+                                    "Exited with status {} while processing issue #{}",
+                                    exit_code, issue_id
+                                )
+                            };
+                            snapshot.note_agent_finished(
+                                "orchestrator",
+                                &started_at,
+                                exit_code == 0,
+                                detail,
+                            );
+                            save_runtime_snapshot(state, repo_name, &snapshot);
+                        }
                     }
                     Err(e) => {
                         error!(
                             repo = %repo_name,
-                            "Invalid trigger_at '{}': {}",
-                            trigger_at,
-                            e,
+                            pid = pid,
+                            event_id = %reserved_event.event_id,
+                            "Failed to wait on orchestrator: {}",
+                            e
                         );
-                        all_ok = false;
-                    }
-                },
-                Action::CancelEvent { event_id } => {
-                    let mut scheduler = state.scheduler.lock().await;
-                    let cancelled = scheduler.cancel_event(event_id);
-                    if cancelled {
-                        info!(
-                            repo = %repo_name,
-                            event_id = %event_id,
-                            "Scheduled event cancelled",
-                        );
-                    } else {
-                        warn!(
-                            repo = %repo_name,
-                            event_id = %event_id,
-                            "Cancel requested but event not found",
-                        );
+                        state.process_manager.report_exit(pid, 1).await;
+                        state.rate_limiter.report_orchestrator_rate_limit();
+
+                        let mut queues = state.queues.lock().await;
+                        let registry = registry_snapshot(state).await;
+                        if let Ok(queue) = get_or_create_queue(
+                            &mut queues,
+                            &registry,
+                            &state.githubclaw_home,
+                            repo_name,
+                        ) {
+                            if let Err(err) = queue.nack_reserved(&mut reserved_event) {
+                                error!(
+                                    repo = %repo_name,
+                                    event_id = %reserved_event.event_id,
+                                    "Failed to nack reserved event after wait error: {}",
+                                    err
+                                );
+                            }
+                        }
+
+                        if issue_id > 0 {
+                            let mut snapshot =
+                                load_or_new_runtime_snapshot(state, repo_name, issue_id);
+                            snapshot.note_agent_finished(
+                                "orchestrator",
+                                &started_at,
+                                false,
+                                format!("Failed to wait for issue #{}: {}", issue_id, e),
+                            );
+                            save_runtime_snapshot(state, repo_name, &snapshot);
+                        }
                     }
                 }
-                Action::NoAction { reasoning } => {
-                    info!(
-                        repo = %repo_name,
-                        seq = event.sequence,
-                        "No action: {}",
-                        reasoning,
+            }
+            Err(e) => {
+                if issue_id > 0 {
+                    let mut snapshot = load_or_new_runtime_snapshot(state, repo_name, issue_id);
+                    snapshot.note_agent_finished(
+                        "orchestrator",
+                        &started_at,
+                        false,
+                        format!("Failed to spawn while processing issue #{}", issue_id),
                     );
+                    save_runtime_snapshot(state, repo_name, &snapshot);
                 }
-            }
-        }
-
-        // 7. Handle result.
-        if capacity_wait {
-            // Concurrency full — don't dequeue, don't nack. Just sleep and
-            // the event stays at the head of the queue for the next loop.
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-            continue;
-        }
-
-        if all_ok {
-            let mut queues = state.queues.lock().await;
-            let registry = registry_snapshot(state).await;
-            if let Ok(q) =
-                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
-            {
-                if let Err(e) = q.dequeue() {
-                    error!(repo = %repo_name, "Failed to dequeue after success: {}", e);
-                }
-            }
-        } else {
-            nack_head_event(state, repo_name, &event.filename).await;
-        }
-    }
-}
-
-/// Helper: dequeue the head event and nack it (re-enqueue with incremented retry
-/// or move to dead-letter if max retries exceeded).
-async fn nack_head_event(state: &Arc<ServerState>, repo_name: &str, _filename: &str) {
-    let mut queues = state.queues.lock().await;
-    let registry = registry_snapshot(state).await;
-    let queue = match get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
-    {
-        Ok(q) => q,
-        Err(e) => {
-            error!(repo = %repo_name, "Failed to get queue for nack: {}", e);
-            return;
-        }
-    };
-    match queue.dequeue() {
-        Ok(Some(mut event)) => {
-            if let Err(e) = queue.nack(&mut event, "event") {
                 error!(
                     repo = %repo_name,
-                    seq = event.sequence,
-                    "Failed to nack event: {}",
+                    "Failed to spawn orchestrator: {}",
                     e,
                 );
+                state.rate_limiter.report_orchestrator_rate_limit();
+                let mut queues = state.queues.lock().await;
+                let registry = registry_snapshot(state).await;
+                if let Ok(queue) =
+                    get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+                {
+                    if let Err(err) = queue.nack_reserved(&mut reserved_event) {
+                        error!(
+                            repo = %repo_name,
+                            event_id = %reserved_event.event_id,
+                            "Failed to nack reserved event after spawn failure: {}",
+                            err
+                        );
+                    }
+                }
+                let _ = std::fs::remove_file(&prompt_file);
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                continue;
             }
         }
-        Ok(None) => {
-            warn!(repo = %repo_name, "Tried to nack but queue was empty");
-        }
-        Err(e) => {
-            error!(repo = %repo_name, "Failed to dequeue for nack: {}", e);
-        }
+        let _ = std::fs::remove_file(&prompt_file);
     }
 }
 
@@ -1185,13 +1450,6 @@ mod tests {
         let scheduler_path = tmp.path().join(".githubclaw").join("scheduled.json");
         Arc::new(ServerState {
             webhook_secret: TEST_SECRET.to_string(),
-            hosted_proxy_store: Mutex::new(
-                HostedProxyStore::load(
-                    tmp.path().join("hosted_proxy_registrations.json"),
-                    TEST_SECRET,
-                )
-                .unwrap(),
-            ),
             registry: RwLock::new(registry),
             started_repos: RwLock::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
@@ -1202,8 +1460,10 @@ mod tests {
             scheduler: Mutex::new(ScheduledEventManager::new(scheduler_path)),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::default()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            orchestrator_backend: crate::orchestrator::session::OrchestratorBackend::Codex,
-            orchestrators: Mutex::new(HashMap::new()),
+            issue_router: crate::issue_router::IssueRouter::new(tmp.path().join("sessions")),
+            session_store: crate::session_store::SessionStore::with_base_dir(
+                tmp.path().join("sessions"),
+            ),
         })
     }
 
@@ -1370,132 +1630,6 @@ mod tests {
         assert!(text.contains("Ignored"));
     }
 
-    #[tokio::test]
-    async fn test_register_claim_and_update_flow() {
-        let tmp = TempDir::new().unwrap();
-        let state = make_test_state(&tmp);
-        let claim_proof = {
-            let store = state.hosted_proxy_store.lock().await;
-            store.mint_claim_proof_for_test(123, chrono::Utc::now())
-        };
-        let app = create_router(state.clone());
-
-        let claim_payload = serde_json::to_vec(&serde_json::json!({
-            "installation_id": 123,
-            "tunnel_url": "https://EXAMPLE.com",
-            "claim_proof": claim_proof,
-        }))
-        .unwrap();
-
-        let claim_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/register")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(claim_payload))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(claim_response.status(), StatusCode::CREATED);
-        let claim_body: Value = serde_json::from_str(&body_string(claim_response).await).unwrap();
-        assert_eq!(claim_body["status"], "claimed");
-        assert_eq!(claim_body["tunnel_url"], "https://example.com");
-        let update_secret = claim_body["update_secret"].as_str().unwrap().to_string();
-
-        let update_payload = serde_json::to_vec(&serde_json::json!({
-            "installation_id": 123,
-            "tunnel_url": "https://www.example.com",
-            "update_secret": update_secret,
-        }))
-        .unwrap();
-
-        let update_response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/register")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(update_payload))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(update_response.status(), StatusCode::OK);
-        let update_body: Value = serde_json::from_str(&body_string(update_response).await).unwrap();
-        assert_eq!(update_body["status"], "updated");
-        assert_eq!(update_body["tunnel_url"], "https://www.example.com");
-        assert_eq!(update_body["rotated"], true);
-    }
-
-    #[tokio::test]
-    async fn test_register_rejects_invalid_shapes_and_unsafe_urls() {
-        let tmp = TempDir::new().unwrap();
-        let state = make_test_state(&tmp);
-        let claim_proof = {
-            let store = state.hosted_proxy_store.lock().await;
-            store.mint_claim_proof_for_test(222, chrono::Utc::now())
-        };
-        let unsafe_claim_proof = {
-            let store = state.hosted_proxy_store.lock().await;
-            store.mint_claim_proof_for_test(222, chrono::Utc::now())
-        };
-        let app = create_router(state);
-
-        let invalid_shape = serde_json::to_vec(&serde_json::json!({
-            "installation_id": 222,
-            "tunnel_url": "https://good.example.com",
-            "claim_proof": claim_proof,
-            "update_secret": "us_fake",
-        }))
-        .unwrap();
-
-        let invalid_shape_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/register")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(invalid_shape))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(invalid_shape_response.status(), StatusCode::BAD_REQUEST);
-        let invalid_shape_body: Value =
-            serde_json::from_str(&body_string(invalid_shape_response).await).unwrap();
-        assert_eq!(invalid_shape_body["error"]["code"], "invalid_request");
-
-        let unsafe_url = serde_json::to_vec(&serde_json::json!({
-            "installation_id": 222,
-            "tunnel_url": "https://127.0.0.1",
-            "claim_proof": unsafe_claim_proof,
-        }))
-        .unwrap();
-
-        let unsafe_response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/register")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(unsafe_url))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(unsafe_response.status(), StatusCode::BAD_REQUEST);
-        let unsafe_body: Value = serde_json::from_str(&body_string(unsafe_response).await).unwrap();
-        assert_eq!(unsafe_body["error"]["code"], "unsafe_tunnel_url");
-    }
-
     // ---------------------------------------------------------------
     // 6. annotate_fork_status adds flag for unapproved fork PR
     // ---------------------------------------------------------------
@@ -1629,6 +1763,56 @@ mod tests {
         assert!(registry.is_empty());
     }
 
+    #[test]
+    fn test_get_or_create_queue_uses_repo_local_path() {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let mut registry = HashMap::new();
+        registry.insert(
+            "owner/repo".to_string(),
+            RegistryEntry {
+                local_path: repo_root.to_string_lossy().to_string(),
+                socket_path: String::new(),
+            },
+        );
+        let mut queues = HashMap::new();
+
+        let queue = get_or_create_queue(&mut queues, &registry, tmp.path(), "owner/repo").unwrap();
+        queue
+            .enqueue(serde_json::json!({"ok": true}), "test")
+            .unwrap();
+
+        assert!(repo_root.join(".githubclaw").join("queue").exists());
+        assert_eq!(queues.get("owner/repo").unwrap().size(), 1);
+    }
+
+    #[test]
+    fn test_get_or_create_queue_uses_fallback_for_empty_local_path() {
+        let tmp = TempDir::new().unwrap();
+        let mut registry = HashMap::new();
+        registry.insert(
+            "owner/repo".to_string(),
+            RegistryEntry {
+                local_path: String::new(),
+                socket_path: String::new(),
+            },
+        );
+        let mut queues = HashMap::new();
+
+        let queue = get_or_create_queue(&mut queues, &registry, tmp.path(), "owner/repo").unwrap();
+        queue
+            .enqueue(serde_json::json!({"ok": true}), "test")
+            .unwrap();
+
+        assert!(tmp
+            .path()
+            .join("queues")
+            .join("owner_repo")
+            .join("queue")
+            .exists());
+        assert_eq!(queues.get("owner/repo").unwrap().size(), 1);
+    }
+
     // ---------------------------------------------------------------
     // 10. load_webhook_secret reads and trims file
     // ---------------------------------------------------------------
@@ -1671,6 +1855,7 @@ mod tests {
                     .uri("/webhook")
                     .header("Content-Type", "application/json")
                     .header("X-Github-Event", "issues")
+                    .header("X-GitHub-Delivery", "delivery-123")
                     .header("X-Hub-Signature-256", &signature)
                     .body(Body::from(payload))
                     .unwrap(),
@@ -1684,6 +1869,9 @@ mod tests {
         let queues = state_clone.queues.lock().await;
         let queue = queues.get("owner/repo").unwrap();
         assert_eq!(queue.size(), 1);
+        let event = queue.peek().unwrap().unwrap();
+        assert_eq!(event.event_id, "delivery-123");
+        assert_eq!(event.event_type, "issues_opened");
     }
 
     // ---------------------------------------------------------------

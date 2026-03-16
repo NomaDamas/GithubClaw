@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 
 use crate::agents::parser::AgentDefinition;
 
+/// Embedded gh wrapper script (compiled into the binary).
+const GH_WRAPPER_SCRIPT: &str = include_str!("../../scripts/gh");
+
 /// Spawns agent subprocesses with the correct environment and CLI flags.
 pub struct AgentSpawner {
     repo_root: PathBuf,
@@ -45,8 +48,9 @@ impl AgentSpawner {
 
     /// Build the full set of environment variables for an agent subprocess.
     ///
-    /// Sets git identity, tool permissions, prompt/task info, and GithubClaw
-    /// metadata. Optionally merges caller-supplied `extra_env`.
+    /// Sets git identity, tool permissions, prompt/task info, GithubClaw
+    /// metadata, root issue tracking, and gh wrapper PATH injection.
+    /// Optionally merges caller-supplied `extra_env`.
     pub fn build_env(
         &self,
         agent_def: &AgentDefinition,
@@ -100,6 +104,27 @@ impl AgentSpawner {
             self.repo_root.to_string_lossy().into_owned(),
         );
 
+        // Root issue tracking for ref #N injection
+        // GITHUBCLAW_ROOT_ISSUE is injected by the caller via extra_env
+
+        // gh wrapper PATH injection
+        // Prepend the scripts/ directory (containing gh renamed to gh)
+        // to PATH so all gh CLI calls go through our wrapper.
+        if let Some(wrapper_dir) = self.gh_wrapper_dir() {
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            env.insert(
+                "PATH".into(),
+                format!("{}:{}", wrapper_dir.display(), current_path),
+            );
+            // Tell the wrapper where the real gh binary is
+            if let Ok(real_gh) = which::which("gh") {
+                env.insert(
+                    "GITHUBCLAW_REAL_GH".into(),
+                    real_gh.to_string_lossy().into_owned(),
+                );
+            }
+        }
+
         // Merge extra env (caller overrides take precedence)
         if let Some(extra) = extra_env {
             for (k, v) in extra {
@@ -108,6 +133,34 @@ impl AgentSpawner {
         }
 
         env
+    }
+
+    /// Get or create the gh wrapper directory.
+    ///
+    /// Extracts the embedded gh wrapper script to a stable temp directory
+    /// so it's always available regardless of where the binary is installed.
+    /// The wrapper is placed at `~/.githubclaw/bin/gh`.
+    fn gh_wrapper_dir(&self) -> Option<PathBuf> {
+        let wrapper_dir = crate::config::global_config_dir().join("bin");
+        let wrapper_path = wrapper_dir.join("gh");
+
+        // Only write if missing or outdated
+        if !wrapper_path.exists() {
+            if std::fs::create_dir_all(&wrapper_dir).is_err() {
+                return None;
+            }
+            if std::fs::write(&wrapper_path, GH_WRAPPER_SCRIPT).is_err() {
+                return None;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        Some(wrapper_dir)
     }
 
     /// Build the command-line arguments for launching the agent.
@@ -139,7 +192,7 @@ impl AgentSpawner {
             "claude-code" => {
                 let mut cmd = vec![
                     "claude".to_string(),
-                    "--print".to_string(),
+                    "-p".to_string(),
                     "--prompt-file".to_string(),
                     prompt_path,
                     "--max-turns".to_string(),
@@ -288,7 +341,7 @@ mod tests {
         let cmd = spawner.build_command(&def, &prompt, "fix the bug").unwrap();
 
         assert_eq!(cmd[0], "claude");
-        assert!(cmd.contains(&"--print".to_string()));
+        assert!(cmd.contains(&"-p".to_string()));
         assert!(cmd.contains(&"--prompt-file".to_string()));
         assert!(cmd.contains(&"--max-turns".to_string()));
         assert!(cmd.contains(&"200".to_string()));
@@ -312,8 +365,8 @@ mod tests {
         assert!(cmd.contains(&"--prompt-file".to_string()));
         assert!(cmd.contains(&"--task".to_string()));
         assert!(cmd.contains(&"implement feature".to_string()));
-        // codex should NOT have --print or --max-turns
-        assert!(!cmd.contains(&"--print".to_string()));
+        // codex should NOT have -p or --max-turns
+        assert!(!cmd.contains(&"-p".to_string()));
         assert!(!cmd.contains(&"--max-turns".to_string()));
     }
 

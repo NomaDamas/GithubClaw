@@ -17,6 +17,18 @@ pub enum GithubClawError {
     #[error("Queue error: {0}")]
     Queue(String),
 
+    #[error("Dispatch error: {0}")]
+    Dispatch(String),
+
+    #[error("Session error: {0}")]
+    Session(String),
+
+    #[error("Marker parse error: {0}")]
+    Marker(String),
+
+    #[error("Pipeline error: {0}")]
+    Pipeline(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

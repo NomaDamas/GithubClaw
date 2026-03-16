@@ -62,8 +62,9 @@ impl RateLimiter {
         )
     }
 
-    /// Called when a worker agent exits with a rate limit indication.
+    /// Called when a worker agent subprocess exits with non-zero exit code.
     ///
+    /// Triggered by subprocess exit code detection rather than API response parsing.
     /// Escalates to `WorkerLimited` if currently `None`, or to
     /// `FullHibernate` if already `OrchestratorLimited`.
     pub fn report_worker_rate_limit(&self) {
@@ -81,8 +82,9 @@ impl RateLimiter {
         self.paused.store(true, Ordering::Relaxed);
     }
 
-    /// Called when the orchestrator session fails to respond.
+    /// Called when the orchestrator subprocess exits with non-zero exit code.
     ///
+    /// Triggered by orchestrator subprocess exit code detection.
     /// Escalates to `OrchestratorLimited` if currently `None`, or to
     /// `FullHibernate` if already `WorkerLimited`.
     pub fn report_orchestrator_rate_limit(&self) {

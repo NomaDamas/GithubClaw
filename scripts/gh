@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# GithubClaw gh CLI wrapper script.
+#
+# Injected into PATH ahead of the real `gh` binary by spawner.rs.
+# Automatically appends `ref #N` to all GitHub write operations
+# and enforces DENIED_PATHS security boundary.
+#
+# Environment variables:
+#   GITHUBCLAW_ROOT_ISSUE  - Root issue number for ref injection
+#   GITHUBCLAW_REAL_GH     - Path to the real gh binary
+#   GITHUBCLAW_DENIED_PATHS - Colon-separated list of denied path prefixes
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+REAL_GH="${GITHUBCLAW_REAL_GH:-$(which -a gh | grep -v "$(dirname "$0")" | head -1)}"
+ROOT_ISSUE="${GITHUBCLAW_ROOT_ISSUE:-}"
+DENIED_PATHS="${GITHUBCLAW_DENIED_PATHS:-}"
+
+if [ -z "$REAL_GH" ] || [ ! -x "$REAL_GH" ]; then
+    echo "githubclaw gh-wrapper: cannot find real gh binary" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Check if this is a write command that takes --body
+is_write_command() {
+    local cmd="$1"
+    local sub="${2:-}"
+    case "$cmd" in
+        issue)
+            case "$sub" in
+                comment|create|edit) return 0 ;;
+            esac
+            ;;
+        pr)
+            case "$sub" in
+                comment|create|edit|review) return 0 ;;
+            esac
+            ;;
+    esac
+    return 1
+}
+
+# Append ref #N to a body string
+append_ref() {
+    local body="$1"
+    local issue="$2"
+    local ref_tag="ref #${issue}"
+
+    # Don't append if already present
+    if echo "$body" | grep -qF "$ref_tag"; then
+        echo "$body"
+    else
+        echo "${body}"$'\n\n'"_${ref_tag}_"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main logic
+# ---------------------------------------------------------------------------
+
+# If no root issue is set, pass through directly
+if [ -z "$ROOT_ISSUE" ]; then
+    exec "$REAL_GH" "$@"
+fi
+
+# Parse arguments to find write commands
+args=("$@")
+cmd="${args[0]:-}"
+sub="${args[1]:-}"
+
+if is_write_command "$cmd" "$sub"; then
+    # Find and modify --body argument
+    new_args=()
+    i=0
+    body_modified=false
+    while [ $i -lt ${#args[@]} ]; do
+        if [ "${args[$i]}" = "--body" ] && [ $((i + 1)) -lt ${#args[@]} ]; then
+            new_args+=("--body")
+            i=$((i + 1))
+            modified_body=$(append_ref "${args[$i]}" "$ROOT_ISSUE")
+            new_args+=("$modified_body")
+            body_modified=true
+        else
+            new_args+=("${args[$i]}")
+        fi
+        i=$((i + 1))
+    done
+
+    exec "$REAL_GH" "${new_args[@]}"
+else
+    # Not a write command, pass through
+    exec "$REAL_GH" "$@"
+fi
