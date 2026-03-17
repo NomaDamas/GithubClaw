@@ -12,16 +12,51 @@ cargo install --path .            # install from the current checkout
 # cargo install githubclaw
 
 cd /path/to/your-repo
-githubclaw init                   # scaffold .githubclaw/ directory
+githubclaw init                   # initialize ~/.githubclaw for this repo
 ```
 
 Then follow the setup steps below.
 
-### 1. Edit your project mission
+### 1. macOS only: grant Full Disk Access to your terminal app
 
-Open `.githubclaw/VALUE.md` and describe what the project is about. Every agent reads this to align decisions with your goals.
+The most reliable way to run GithubClaw on macOS is to grant **Full Disk Access** to Terminal or iTerm, then use `githubclaw start`.
 
-### 2. Set up a public tunnel
+On macOS, `githubclaw start` uses a tmux-backed `githubclaw serve` session behind the scenes instead of relying on `launchd` as the default runtime.
+
+Recommended setup:
+
+1. In `System Settings -> Privacy & Security -> Full Disk Access`, enable access for Terminal or iTerm.
+2. Keep managed repositories and worktrees in an unprotected path such as `~/Projects` when possible.
+3. Start the server:
+
+```bash
+githubclaw start
+```
+
+If you use the project `Makefile`, the equivalent is still:
+
+```bash
+make start
+```
+
+Useful tmux commands:
+
+```bash
+tmux attach -t githubclaw
+tmux ls
+```
+
+If you want to start the tmux session explicitly yourself, you can still run:
+
+```bash
+make serve-tmux
+```
+
+### 2. Edit your project mission
+
+Open `~/.githubclaw/repos/<owner_repo>/VALUE.md` and describe what the project is about. Every agent reads this to align decisions with your goals.
+
+### 3. Set up a public tunnel
 
 GithubClaw needs a public URL so GitHub can deliver webhooks to your local machine. Pick any tunnel service:
 
@@ -35,7 +70,7 @@ ngrok http 8000
 
 Note the public URL (e.g. `https://your-tunnel.trycloudflare.com`).
 
-### 3. Create a GitHub App
+### 4. Create a GitHub App
 
 1. Go to **GitHub Settings > Developer settings > GitHub Apps > New GitHub App**.
 2. Fill in:
@@ -62,13 +97,27 @@ Note the public URL (e.g. `https://your-tunnel.trycloudflare.com`).
 5. Set **Where can this GitHub App be installed?** to "Only on this account".
 6. Click **Create GitHub App**.
 
-### 4. Install the GitHub App
+### 5. Install the GitHub App
 
 1. After creation, click **Install App** in the sidebar.
 2. Choose **Only select repositories** and pick the repo(s) you want GithubClaw to manage.
 3. Click **Install**.
 
-### 5. Start the server
+### 6. Start the server
+
+On macOS:
+
+```bash
+githubclaw start
+```
+
+Or with `make`:
+
+```bash
+make start
+```
+
+On Linux, use the background daemon:
 
 ```bash
 githubclaw start
@@ -77,7 +126,8 @@ githubclaw start
 Verify it's running:
 
 ```bash
-githubclaw status          # show server status + registered repos
+tmux ls                    # macOS: confirm the githubclaw session exists
+githubclaw status          # macOS tmux mode or Linux daemon mode
 curl http://localhost:8000/health   # should return {"status":"ok"}
 ```
 
@@ -146,42 +196,46 @@ Events flow in a loop: GitHub fires a webhook, the server routes it to a per-rep
 
 | Command | Description |
 |---------|-------------|
-| `githubclaw init` | Scaffold `.githubclaw/` in the current repo |
-| `githubclaw start` | Start the webhook server (daemonized) |
-| `githubclaw stop` | Graceful drain shutdown |
+| `githubclaw init` | Initialize global profile/repo/runtime layout in `~/.githubclaw` |
+| `githubclaw start` | Start the webhook server using the recommended runtime for this OS; on macOS this starts a tmux-backed session |
+| `githubclaw serve` | Run the webhook server inline in the current shell |
+| `githubclaw stop` | Stop the webhook server in daemon mode or stop the recommended tmux-backed macOS runtime |
 | `githubclaw stop --force` | Immediate kill |
-| `githubclaw status` | Show running processes |
-| `githubclaw logs` | Tail webhook server and orchestrator logs |
+| `githubclaw status` | Show server status and registered repos for daemon or tmux mode |
+| `githubclaw logs` | Tail daemon logs or attach to tmux-backed inline output |
 
 ## Directory Layout
 
 ```
-.githubclaw/
-├── orchestrator.md          # Orchestrator system prompt
-├── global-prompt.md         # Common rules, agent roster, handoff conventions
-├── VALUE.md                 # Project mission / north star
-├── agents/                  # One prompt file per agent (YAML frontmatter + markdown)
-│   ├── orchestrator.md
-│   ├── bug_reproducer.md
-│   ├── vision_gap_analyst.md
-│   ├── verifier.md
-│   ├── implementer.md
-│   ├── reviewer.md
-│   └── ...
-├── ai_instructions/         # Shared skill modules (Playwright, GitHub Projects, etc.)
-├── config.yaml              # Per-repo overrides
-├── memory.md                # Orchestrator long-term memory
-├── logs/                    # Decision logs (JSONL)
-└── queue/                   # Disk-persisted event queue
+~/.githubclaw/
+├── config.yaml
+├── registry.json
+├── profiles/
+│   └── default/
+│       ├── orchestrator.md
+│       ├── global-prompt.md
+│       └── agents/
+├── repos/
+│   └── owner_repo/
+│       ├── VALUE.md
+│       ├── memory.md
+│       ├── config.yaml
+│       └── agents/
+└── runtime/
+    └── owner_repo/
+        ├── queue/
+        ├── logs/
+        └── dispatch_receipts/
 ```
 
-Global config lives at `~/.githubclaw/` (webhook server settings, repo registry, secrets, scheduled events).
+GithubClaw now keeps both configuration and runtime state under `~/.githubclaw/`.
 
 ## Configuration
 
-- **VALUE.md** -- Your project's mission statement. Every agent reads this to align decisions with your goals.
-- **Agent prompts** -- Fully customizable in `.githubclaw/agents/`. Each file has YAML frontmatter (backend, git author, allowed tools) and a markdown instruction body. Your edits are never overwritten by upgrades.
-- **config.yaml** -- Per-repo overrides (allowed read paths, timeouts, etc.) in `.githubclaw/config.yaml`. Global settings in `~/.githubclaw/config.yaml`.
+- **Profiles** -- Shared prompts and agent definitions live under `~/.githubclaw/profiles/<profile>/`.
+- **Repo overrides** -- Per-repo VALUE, memory, config, and agent overrides live under `~/.githubclaw/repos/<owner_repo>/`.
+- **Runtime data** -- Queue, logs, receipts, and other operational artifacts live under `~/.githubclaw/runtime/<owner_repo>/`.
+- **Agent spawning** -- `claude-code` and `codex` use built-in Rust launch paths in the MVP. Repo-local spawn script overrides are not part of the runtime contract.
 
 ## Architecture
 
@@ -201,3 +255,22 @@ For detailed specs, see:
 ## License
 
 MIT
+
+
+## Maintainer Product E2E
+
+GithubClaw now includes a **maintainer-only** product E2E harness for the sandbox repo `git@github.com:vkehfdl1/GithubClaw-Sandbox.git`.
+
+This is **not** a user-facing `githubclaw` CLI feature. Run it through `make` only:
+
+```bash
+make e2e-product-smoke
+make e2e-product-live BACKEND=claude-code
+make e2e-product-live BACKEND=codex
+make e2e-product-release
+```
+
+Notes:
+- The harness creates sandbox issues from fixed fixtures with unique run IDs.
+- Heavy live validation is intended for **release-stage verification**, not every PR.
+- Artifacts are written under `~/.githubclaw/runtime/<owner_repo>/product-e2e/`.

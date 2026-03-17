@@ -96,6 +96,20 @@ impl IssueRouter {
     ///
     /// Returns `None` if the event cannot be routed.
     pub fn route_event(&self, repo: &str, event: &serde_json::Value) -> Result<Option<u64>> {
+        if event.get("type").and_then(|v| v.as_str()) == Some("virtual_bootstrap") {
+            let item_type = event
+                .get("item_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let number = event.pointer("/data/number").and_then(|v| v.as_u64());
+
+            return match item_type {
+                "issue" => Ok(number),
+                "pull_request" => Ok(number),
+                _ => Ok(None),
+            };
+        }
+
         let event_type = event
             .get("_githubclaw_event_type")
             .and_then(|v| v.as_str())
@@ -405,6 +419,42 @@ mod tests {
         });
         let root = router.route_event("org/repo", &event).unwrap();
         assert_eq!(root, None);
+    }
+
+    // 11b. Bootstrap issue events route to the issue number in data.number
+    #[test]
+    fn route_virtual_bootstrap_issue_to_issue_number() {
+        let tmp = TempDir::new().unwrap();
+        let router = test_router(&tmp);
+        let event = json!({
+            "type": "virtual_bootstrap",
+            "item_type": "issue",
+            "data": {
+                "number": 56,
+                "title": "[BUG] orchestrator exited with non-zero code",
+                "labels": []
+            }
+        });
+        let root = router.route_event("org/repo", &event).unwrap();
+        assert_eq!(root, Some(56));
+    }
+
+    // 11c. Bootstrap PR events fall back to the PR number when no ref is available
+    #[test]
+    fn route_virtual_bootstrap_pr_falls_back_to_pr_number() {
+        let tmp = TempDir::new().unwrap();
+        let router = test_router(&tmp);
+        let event = json!({
+            "type": "virtual_bootstrap",
+            "item_type": "pull_request",
+            "data": {
+                "number": 77,
+                "title": "Fix flaky orchestrator resume",
+                "labels": []
+            }
+        });
+        let root = router.route_event("org/repo", &event).unwrap();
+        assert_eq!(root, Some(77));
     }
 
     // 12. PR map persistence roundtrip

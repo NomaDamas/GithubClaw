@@ -106,7 +106,8 @@ async fn test_webhook_to_queue_roundtrip() {
 #[test]
 fn test_agent_pipeline() {
     let tmp = TempDir::new().unwrap();
-    let agents_dir = tmp.path().join(".githubclaw").join("agents");
+    let repo_name = "owner/repo";
+    let agents_dir = githubclaw::config::repo_agents_dir_from_home(tmp.path(), repo_name);
     std::fs::create_dir_all(&agents_dir).unwrap();
 
     // Write agent definition
@@ -130,14 +131,18 @@ You are the Coder agent.
     .unwrap();
 
     // Write global-prompt.md and VALUE.md
-    let gc_dir = tmp.path().join(".githubclaw");
+    let profile_dir = githubclaw::config::profile_dir_from_home(
+        tmp.path(),
+        githubclaw::config::DEFAULT_PROFILE_NAME,
+    );
+    std::fs::create_dir_all(&profile_dir).unwrap();
     std::fs::write(
-        gc_dir.join("global-prompt.md"),
+        profile_dir.join("global-prompt.md"),
         "# Agent Roster\n\nCommon rules.",
     )
     .unwrap();
     std::fs::write(
-        gc_dir.join("VALUE.md"),
+        githubclaw::config::repo_value_path_from_home(tmp.path(), repo_name),
         "# Mission\n\nBuild great software.",
     )
     .unwrap();
@@ -149,7 +154,7 @@ You are the Coder agent.
     assert_eq!(agent.git_author_name, "GithubClaw Coder");
 
     // Assemble prompt
-    let mut assembler = PromptAssembler::new(tmp.path());
+    let mut assembler = PromptAssembler::with_home(repo_name, tmp.path());
     let prompt_file = assembler
         .assemble(&agent, "Fix the null check in auth.rs")
         .unwrap();
@@ -165,7 +170,9 @@ You are the Coder agent.
     let cmd = spawner
         .build_command(&agent, &prompt_file, "Fix the null check")
         .unwrap();
-    assert!(cmd.iter().any(|a| a == "claude"));
+    assert_eq!(cmd[0], "bash");
+    assert_eq!(cmd[1], "-lc");
+    assert!(cmd[2].contains("cat \"$PROMPT_FILE\" | claude -p"));
 
     // Build env
     let env = spawner.build_env(&agent, &prompt_file, "Fix the null check", None);
@@ -230,6 +237,24 @@ fn test_bug_reproducer_prompt_prefers_isolation_without_requiring_it() {
     assert!(prompt.contains("local fallback"));
     assert!(!prompt.contains("always use Docker"));
     assert!(!prompt.contains(".githubclaw/environments/"));
+}
+
+#[test]
+fn test_default_agent_prompts_reference_global_control_plane() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let verifier = std::fs::read_to_string(root.join("defaults/agents/verifier.md")).unwrap();
+    let reviewer = std::fs::read_to_string(root.join("defaults/agents/reviewer.md")).unwrap();
+    let vision_gap =
+        std::fs::read_to_string(root.join("defaults/agents/vision_gap_analyst.md")).unwrap();
+
+    assert!(verifier.contains("~/.githubclaw/repos/<owner_repo>/config.yaml"));
+    assert!(!verifier.contains("`.githubclaw/config.yaml`"));
+
+    assert!(reviewer.contains("~/.githubclaw/repos/<owner_repo>/config.yaml"));
+    assert!(!reviewer.contains("`.githubclaw/config.yaml`"));
+
+    assert!(vision_gap.contains("~/.githubclaw/repos/<owner_repo>/VALUE.md"));
+    assert!(!vision_gap.contains("`.githubclaw/VALUE.md`"));
 }
 
 /// Test: Fork PR gate end-to-end

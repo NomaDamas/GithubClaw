@@ -131,12 +131,10 @@ impl StartupBackend for SystemStartupBackend {
 }
 
 fn maybe_prompt_for_update<B: StartupBackend>(backend: &mut B) -> io::Result<()> {
-    let latest_version = match backend.fetch_latest_version() {
-        Ok(version) => version,
-        Err(err) => {
-            backend.print_line(&format!("Skipping update check: {err}"));
-            return Ok(());
-        }
+    let latest_version_result = backend.fetch_latest_version();
+    let latest_version = match check_or_skip(backend, latest_version_result, "update check") {
+        Some(version) => version,
+        None => return Ok(()),
     };
 
     let Some(latest_version) = latest_version else {
@@ -152,23 +150,20 @@ fn maybe_prompt_for_update<B: StartupBackend>(backend: &mut B) -> io::Result<()>
         backend.current_version(),
         latest_version
     );
-    if backend.prompt_yes_no(&prompt)? {
-        match backend.install_update() {
-            Ok(()) => backend.print_line("githubclaw update installed successfully."),
-            Err(err) => backend.print_line(&format!("githubclaw update failed: {err}")),
-        }
-    }
-
-    Ok(())
+    maybe_run_prompted_action(
+        backend,
+        &prompt,
+        |backend| backend.install_update(),
+        "githubclaw update installed successfully.",
+        "githubclaw update failed",
+    )
 }
 
 fn maybe_prompt_for_star<B: StartupBackend>(backend: &mut B) -> io::Result<()> {
-    let has_starred = match backend.has_starred_repo(GITHUBCLAW_REPO) {
-        Ok(value) => value,
-        Err(err) => {
-            backend.print_line(&format!("Skipping GitHub star check: {err}"));
-            return Ok(());
-        }
+    let has_starred_result = backend.has_starred_repo(GITHUBCLAW_REPO);
+    let has_starred = match check_or_skip(backend, has_starred_result, "GitHub star check") {
+        Some(value) => value,
+        None => return Ok(()),
     };
 
     if has_starred {
@@ -176,11 +171,43 @@ fn maybe_prompt_for_star<B: StartupBackend>(backend: &mut B) -> io::Result<()> {
     }
 
     let prompt = format!("Would you like to star {GITHUBCLAW_REPO}? [Y/n]");
-    if backend.prompt_yes_no(&prompt)? {
-        match backend.star_repo(GITHUBCLAW_REPO) {
-            Ok(()) => backend.print_line("Thanks. GithubClaw has been starred."),
-            Err(err) => backend.print_line(&format!("Failed to star GithubClaw: {err}")),
+    maybe_run_prompted_action(
+        backend,
+        &prompt,
+        |backend| backend.star_repo(GITHUBCLAW_REPO),
+        "Thanks. GithubClaw has been starred.",
+        "Failed to star GithubClaw",
+    )
+}
+
+fn check_or_skip<B: StartupBackend, T>(
+    backend: &mut B,
+    result: Result<T, String>,
+    check_name: &str,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(err) => {
+            backend.print_line(&format!("Skipping {check_name}: {err}"));
+            None
         }
+    }
+}
+
+fn maybe_run_prompted_action<B: StartupBackend>(
+    backend: &mut B,
+    prompt: &str,
+    action: impl FnOnce(&mut B) -> Result<(), String>,
+    success_message: &str,
+    failure_prefix: &str,
+) -> io::Result<()> {
+    if !backend.prompt_yes_no(prompt)? {
+        return Ok(());
+    }
+
+    match action(backend) {
+        Ok(()) => backend.print_line(success_message),
+        Err(err) => backend.print_line(&format!("{failure_prefix}: {err}")),
     }
 
     Ok(())
@@ -361,6 +388,72 @@ mod tests {
         assert_eq!(backend.star_calls, 0);
         assert_eq!(backend.prompts.len(), 1);
         assert!(backend.prompts[0].contains("update"));
+    }
+
+    #[test]
+    fn skips_update_prompt_when_update_check_fails() {
+        let mut backend = MockBackend::new("0.1.0");
+        backend.latest_version_error = Some("offline".to_string());
+        backend.star_answer = false;
+
+        run_tui_startup_checks_with(&mut backend).unwrap();
+
+        assert!(backend
+            .prompts
+            .iter()
+            .all(|prompt| !prompt.contains("update")));
+        assert_eq!(backend.prompts.len(), 1);
+        assert!(backend.prompts[0].contains("star"));
+        assert!(backend
+            .lines
+            .contains(&"Skipping update check: offline".to_string()));
+    }
+
+    #[test]
+    fn skips_star_prompt_when_star_check_fails() {
+        let mut backend = MockBackend::new("0.1.0");
+        backend.latest_version = Some("0.1.0".to_string());
+        backend.star_check_error = Some("gh unavailable".to_string());
+
+        run_tui_startup_checks_with(&mut backend).unwrap();
+
+        assert!(backend
+            .prompts
+            .iter()
+            .all(|prompt| !prompt.contains("star")));
+        assert_eq!(backend.prompts.len(), 0);
+        assert!(backend
+            .lines
+            .contains(&"Skipping GitHub star check: gh unavailable".to_string()));
+    }
+
+    #[test]
+    fn reports_update_install_failure() {
+        let mut backend = MockBackend::new("0.1.0");
+        backend.latest_version = Some("0.2.0".to_string());
+        backend.update_error = Some("install failed".to_string());
+        backend.star_answer = false;
+
+        run_tui_startup_checks_with(&mut backend).unwrap();
+
+        assert_eq!(backend.update_calls, 1);
+        assert!(backend
+            .lines
+            .contains(&"githubclaw update failed: install failed".to_string()));
+    }
+
+    #[test]
+    fn reports_star_failure() {
+        let mut backend = MockBackend::new("0.1.0");
+        backend.latest_version = Some("0.1.0".to_string());
+        backend.star_error = Some("permission denied".to_string());
+
+        run_tui_startup_checks_with(&mut backend).unwrap();
+
+        assert_eq!(backend.star_calls, 1);
+        assert!(backend
+            .lines
+            .contains(&"Failed to star GithubClaw: permission denied".to_string()));
     }
 
     #[test]

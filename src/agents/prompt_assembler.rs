@@ -1,10 +1,10 @@
 //! 4-layer prompt assembly for GithubClaw agents.
 //!
 //! Layers:
-//!   1. `.githubclaw/global-prompt.md`   -- agent roster, common rules
-//!   2. `.githubclaw/VALUE.md`           -- project north star (read fresh every time)
-//!   3. Agent instruction body            -- from parsed definition (minus frontmatter)
-//!   4. `task_context`                    -- from orchestrator dispatch output
+//!   1. `~/.githubclaw/profiles/<profile>/global-prompt.md`
+//!   2. `~/.githubclaw/repos/<repo>/VALUE.md`
+//!   3. Agent instruction body
+//!   4. `task_context`
 //!
 //! The assembled prompt is written to a temp file and the path is returned.
 //! Cleanup removes the temp file after the agent exits.
@@ -19,14 +19,20 @@ const LAYER_SEPARATOR: &str = "\n\n---\n\n";
 
 /// Assembles the 4-layer agent prompt and manages temp file lifecycle.
 pub struct PromptAssembler {
-    repo_root: PathBuf,
+    repo_name: String,
+    githubclaw_home: PathBuf,
     temp_files: Vec<PathBuf>,
 }
 
 impl PromptAssembler {
-    pub fn new(repo_root: impl AsRef<Path>) -> Self {
+    pub fn new(repo_name: impl Into<String>) -> Self {
+        Self::with_home(repo_name, crate::config::global_config_dir())
+    }
+
+    pub fn with_home(repo_name: impl Into<String>, githubclaw_home: impl AsRef<Path>) -> Self {
         Self {
-            repo_root: repo_root.as_ref().to_path_buf(),
+            repo_name: repo_name.into(),
+            githubclaw_home: githubclaw_home.as_ref().to_path_buf(),
             temp_files: Vec::new(),
         }
     }
@@ -42,11 +48,16 @@ impl PromptAssembler {
         }
     }
 
-    /// Layer 1: Read `.githubclaw/global-prompt.md` with fallback to defaults.
+    /// Layer 1: Read profile global prompt with fallback to built-in defaults.
     fn read_global_prompt(&self) -> Result<String, std::io::Error> {
-        let repo_path = self.repo_root.join(".githubclaw").join("global-prompt.md");
-        if repo_path.exists() {
-            let content = Self::read_layer_file(&repo_path);
+        let repo_config =
+            crate::config::RepoConfig::load_for_repo(&self.repo_name, Some(&self.githubclaw_home))
+                .unwrap_or_default();
+        let profile_path =
+            crate::config::profile_dir_from_home(&self.githubclaw_home, &repo_config.profile)
+                .join("global-prompt.md");
+        if profile_path.exists() {
+            let content = Self::read_layer_file(&profile_path);
             if !content.is_empty() {
                 return Ok(content);
             }
@@ -67,15 +78,18 @@ impl PromptAssembler {
                 "global-prompt.md not found in {} or built-in defaults ({}). \
                  This file is critical -- it contains the agent roster and common rules. \
                  Run `githubclaw init` to generate it.",
-                repo_path.display(),
+                profile_path.display(),
                 default_path.display(),
             ),
         ))
     }
 
-    /// Layer 2: Read `.githubclaw/VALUE.md` fresh every time.
+    /// Layer 2: Read repo VALUE.md fresh every time.
     fn read_value(&self) -> String {
-        Self::read_layer_file(&self.repo_root.join(".githubclaw").join("VALUE.md"))
+        Self::read_layer_file(&crate::config::repo_value_path_from_home(
+            &self.githubclaw_home,
+            &self.repo_name,
+        ))
     }
 
     /// Assemble the 4-layer prompt and write to a temp file.
@@ -176,11 +190,17 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    fn setup_repo(tmp: &TempDir) -> PathBuf {
-        let root = tmp.path().to_path_buf();
-        let gc_dir = root.join(".githubclaw");
-        fs::create_dir_all(&gc_dir).unwrap();
-        root
+    const TEST_REPO: &str = "owner/repo";
+
+    fn setup_home(tmp: &TempDir) -> PathBuf {
+        let home = tmp.path().to_path_buf();
+        fs::create_dir_all(crate::config::profile_dir_from_home(
+            &home,
+            crate::config::DEFAULT_PROFILE_NAME,
+        ))
+        .unwrap();
+        fs::create_dir_all(crate::config::repo_dir_from_home(&home, TEST_REPO)).unwrap();
+        home
     }
 
     fn make_agent_def(instruction_body: &str) -> AgentDefinition {
@@ -198,21 +218,22 @@ mod tests {
     #[test]
     fn assemble_with_all_4_layers_present() {
         let tmp = TempDir::new().unwrap();
-        let root = setup_repo(&tmp);
+        let home = setup_home(&tmp);
 
         fs::write(
-            root.join(".githubclaw").join("global-prompt.md"),
+            crate::config::profile_dir_from_home(&home, crate::config::DEFAULT_PROFILE_NAME)
+                .join("global-prompt.md"),
             "Global rules here.",
         )
         .unwrap();
         fs::write(
-            root.join(".githubclaw").join("VALUE.md"),
+            crate::config::repo_value_path_from_home(&home, TEST_REPO),
             "Ship fast, ship safe.",
         )
         .unwrap();
 
         let agent_def = make_agent_def("You are a coder agent.");
-        let mut assembler = PromptAssembler::new(&root);
+        let mut assembler = PromptAssembler::with_home(TEST_REPO, &home);
 
         let path = assembler.assemble(&agent_def, "Fix bug #42").unwrap();
         assert!(path.exists());
@@ -229,17 +250,18 @@ mod tests {
     #[test]
     fn assemble_with_missing_value_md() {
         let tmp = TempDir::new().unwrap();
-        let root = setup_repo(&tmp);
+        let home = setup_home(&tmp);
 
         fs::write(
-            root.join(".githubclaw").join("global-prompt.md"),
+            crate::config::profile_dir_from_home(&home, crate::config::DEFAULT_PROFILE_NAME)
+                .join("global-prompt.md"),
             "Global rules.",
         )
         .unwrap();
         // No VALUE.md created.
 
         let agent_def = make_agent_def("Instructions.");
-        let mut assembler = PromptAssembler::new(&root);
+        let mut assembler = PromptAssembler::with_home(TEST_REPO, &home);
 
         let path = assembler.assemble(&agent_def, "Task context").unwrap();
         let content = fs::read_to_string(&path).unwrap();
@@ -253,12 +275,17 @@ mod tests {
     #[test]
     fn assemble_with_empty_task_context() {
         let tmp = TempDir::new().unwrap();
-        let root = setup_repo(&tmp);
+        let home = setup_home(&tmp);
 
-        fs::write(root.join(".githubclaw").join("global-prompt.md"), "Global.").unwrap();
+        fs::write(
+            crate::config::profile_dir_from_home(&home, crate::config::DEFAULT_PROFILE_NAME)
+                .join("global-prompt.md"),
+            "Global.",
+        )
+        .unwrap();
 
         let agent_def = make_agent_def("Agent body.");
-        let mut assembler = PromptAssembler::new(&root);
+        let mut assembler = PromptAssembler::with_home(TEST_REPO, &home);
 
         let path = assembler.assemble(&agent_def, "").unwrap();
         let content = fs::read_to_string(&path).unwrap();
@@ -269,11 +296,11 @@ mod tests {
     #[test]
     fn global_prompt_missing_is_non_fatal() {
         let tmp = TempDir::new().unwrap();
-        let root = setup_repo(&tmp);
+        let home = setup_home(&tmp);
         // No global-prompt.md, no defaults dir.
 
         let agent_def = make_agent_def("Just instructions.");
-        let mut assembler = PromptAssembler::new(&root);
+        let mut assembler = PromptAssembler::with_home(TEST_REPO, &home);
 
         // Should still succeed -- global prompt missing is a warning, not fatal.
         let path = assembler.assemble(&agent_def, "Do it").unwrap();
@@ -285,10 +312,10 @@ mod tests {
     #[test]
     fn temp_file_created_and_cleaned_up() {
         let tmp = TempDir::new().unwrap();
-        let root = setup_repo(&tmp);
+        let home = setup_home(&tmp);
 
         let agent_def = make_agent_def("Body.");
-        let mut assembler = PromptAssembler::new(&root);
+        let mut assembler = PromptAssembler::with_home(TEST_REPO, &home);
 
         let path = assembler.assemble(&agent_def, "").unwrap();
         assert!(path.exists());
@@ -300,10 +327,10 @@ mod tests {
     #[test]
     fn cleanup_all_removes_all_tracked_temp_files() {
         let tmp = TempDir::new().unwrap();
-        let root = setup_repo(&tmp);
+        let home = setup_home(&tmp);
 
         let agent_def = make_agent_def("Body.");
-        let mut assembler = PromptAssembler::new(&root);
+        let mut assembler = PromptAssembler::with_home(TEST_REPO, &home);
 
         let path1 = assembler.assemble(&agent_def, "Task 1").unwrap();
         let path2 = assembler.assemble(&agent_def, "Task 2").unwrap();

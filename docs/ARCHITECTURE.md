@@ -63,7 +63,7 @@ webhook server (axum, persistent)
 └── ...
 ```
 
-- **Webhook server**: Always-on, daemonized via launchd (macOS) / systemd (Linux)
+- **Webhook server**: Always-on. In practice, the recommended runtime is `githubclaw start` on both platforms. On macOS, `start` launches a tmux-backed `serve` session; on Linux, it starts the systemd-managed daemon
 - **Orchestrators**: Hybrid lifecycle — start on first event, stay alive while processing, idle timeout shutdown, session persistence for resume
 - **Worker agents**: Stateless, fresh CLI spawn per task, exit after completion
 
@@ -102,13 +102,23 @@ feature/#42 ─── PR ──→ dev ─── PR ──→ main
 | Orchestrator | Claude Code / Codex CLI |
 | Worker agents | Claude Code CLI / Codex CLI |
 | Scheduling | tokio timers + `~/.githubclaw/scheduled.json` |
-| Daemonization | launchd (macOS) / systemd (Linux) |
+| Process supervision | `githubclaw start` as the top-level entry point; tmux-backed `serve` on macOS, systemd on Linux |
 | Browser testing | Playwright + VLM (Vision Language Model) |
 | GitHub API | `gh` CLI with PAT |
 | Webhook delivery | GitHub App (webhook only, not for API auth) |
 | Tunneling | User's choice (Cloudflare Tunnel, ngrok, etc.) |
 | Serialization | serde + serde_yaml + serde_json |
 | Config | config (YAML) via serde_yaml |
+
+## Global Layout
+
+GithubClaw uses a global control plane under `~/.githubclaw`:
+
+- `profiles/<profile>/...` for shared prompts and agent definitions
+- `repos/<owner_repo>/...` for repo-specific overrides such as `VALUE.md`
+- `runtime/<owner_repo>/...` for queue, logs, receipts, and other operational state
+
+Managed repositories are no longer expected to contain a repo-local `.githubclaw/` directory.
 
 ## Key Decisions
 

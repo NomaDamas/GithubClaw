@@ -20,25 +20,7 @@ const DEFAULT_ORCHESTRATOR_MD: &str = include_str!("../defaults/orchestrator.md"
 const DEFAULT_GLOBAL_PROMPT_MD: &str = include_str!("../defaults/global_prompt.md");
 const DEFAULT_VALUE_MD: &str = include_str!("../defaults/value.md");
 const DEFAULT_MEMORY_MD: &str = include_str!("../defaults/memory.md");
-const DEFAULT_SPAWN_CLAUDE_SH: &str = r#"#!/usr/bin/env bash
-# GithubClaw spawn template for Claude Code.
-set -euo pipefail
-exec claude -p \
-  --dangerously-skip-permissions \
-  --allowedTools "${ALLOWED_TOOLS}" \
-  --disallowedTools "${DISALLOWED_TOOLS}" \
-  --max-turns "${MAX_TURNS:-200}" \
-  --append-system-prompt-file "${PROMPT_FILE}" \
-  "$TASK_PROMPT"
-"#;
-const DEFAULT_SPAWN_CODEX_SH: &str = r#"#!/usr/bin/env bash
-# GithubClaw spawn template for Codex CLI.
-set -euo pipefail
-cat "${PROMPT_FILE}" | codex exec - \
-  --dangerously-bypass-approvals-and-sandbox
-"#;
-const DEFAULT_GITIGNORE: &str = "secrets/\nqueue/\nlogs/\nmemory.md\n";
-const DEFAULT_REPO_CONFIG_YAML: &str = "# GithubClaw per-repo configuration.\n# See https://github.com/GithubClaw/githubclaw for options.\n";
+const DEFAULT_REPO_CONFIG_YAML: &str = "# GithubClaw per-repo configuration.\nprofile: default\n";
 
 // Agent definitions embedded at compile time.
 const DEFAULT_AGENT_ORCHESTRATOR: &str = include_str!("../defaults/agents/orchestrator.md");
@@ -55,6 +37,7 @@ const DEFAULT_AGENT_BUG_REPRODUCER: &str = include_str!("../defaults/agents/bug_
 
 const LAUNCHD_LABEL: &str = "com.githubclaw.webhook-server";
 const SYSTEMD_UNIT: &str = "githubclaw-webhook-server";
+const TMUX_SESSION_NAME: &str = "githubclaw";
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -73,11 +56,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Scaffold the .githubclaw/ directory in the current repository
+    /// Initialize ~/.githubclaw profile/repo/runtime layout for the current repository
     Init,
     /// Re-scan the current repository's open issues and PRs into the bootstrap queue
     Bootstrap,
-    /// Start the webhook server as a background daemon
+    /// Start the webhook server using the recommended runtime for this OS
     Start,
     /// Stop the webhook server
     Stop {
@@ -85,15 +68,15 @@ enum Commands {
         #[arg(long, short)]
         force: bool,
     },
-    /// Show the status of the webhook server and registered repos
+    /// Show server status and registered repos
     Status,
-    /// Show webhook server logs
+    /// Show server log output
     Logs {
         /// Follow log output (like tail -f)
         #[arg(long, short)]
         follow: bool,
     },
-    /// Run the webhook server inline (used by launchd/systemd)
+    /// Run the webhook server inline in the current shell
     Serve {
         /// Host to bind to
         #[arg(long, default_value = "0.0.0.0")]
@@ -175,71 +158,79 @@ fn cmd_init() {
         }
     };
 
-    let claw_dir = repo_root.join(".githubclaw");
+    let owner_repo = detect_github_remote(&repo_root).unwrap_or_else(|| {
+        eprintln!("Error: cannot detect GitHub remote. Configure origin before running init.");
+        std::process::exit(1);
+    });
 
-    if claw_dir.exists() {
-        println!(
-            "Directory {} already exists. Skipping existing files.",
-            claw_dir.display()
-        );
-    }
+    let global_dir = global_config_dir();
+    let profile_dir =
+        crate::config::profile_dir_from_home(&global_dir, crate::config::DEFAULT_PROFILE_NAME);
+    let profile_agents_dir = crate::config::profile_agents_dir_from_home(
+        &global_dir,
+        crate::config::DEFAULT_PROFILE_NAME,
+    );
+    let repo_dir = crate::config::repo_dir_from_home(&global_dir, &owner_repo);
+    let repo_agents_dir = crate::config::repo_agents_dir_from_home(&global_dir, &owner_repo);
+    let runtime_dir = crate::config::repo_runtime_dir_from_home(&global_dir, &owner_repo);
+    let queue_dir = runtime_dir.join("queue").join("dead");
+    let logs_dir = runtime_dir.join("logs");
 
-    // Create directory structure
-    let agents_dir = claw_dir.join("agents");
-    let ai_dir = claw_dir.join("ai_instructions");
-    let logs_dir = claw_dir.join("logs");
-    let queue_dir = claw_dir.join("queue").join("dead");
-
-    for d in [&agents_dir, &ai_dir, &logs_dir, &queue_dir] {
+    for d in [
+        &profile_dir,
+        &profile_agents_dir,
+        &repo_dir,
+        &repo_agents_dir,
+        &queue_dir,
+        &logs_dir,
+    ] {
         fs::create_dir_all(d).unwrap_or_else(|e| {
             eprintln!("Error creating directory {}: {e}", d.display());
             std::process::exit(1);
         });
     }
 
-    // Files to write (path -> content). Prompt/config files are user-owned and
-    // are never overwritten. Runtime spawn scripts are refreshed so existing
-    // repos pick up compatible launcher behavior after upgrades.
+    // Files to write (path -> content). User-owned files are never overwritten.
     let files: Vec<(PathBuf, &str)> = vec![
-        (claw_dir.join("orchestrator.md"), DEFAULT_ORCHESTRATOR_MD),
-        (claw_dir.join("global-prompt.md"), DEFAULT_GLOBAL_PROMPT_MD),
-        (claw_dir.join("VALUE.md"), DEFAULT_VALUE_MD),
-        (claw_dir.join("memory.md"), DEFAULT_MEMORY_MD),
-        (claw_dir.join("spawn_claude.sh"), DEFAULT_SPAWN_CLAUDE_SH),
-        (claw_dir.join("spawn_codex.sh"), DEFAULT_SPAWN_CODEX_SH),
-        (claw_dir.join(".gitignore"), DEFAULT_GITIGNORE),
-        (claw_dir.join("config.yaml"), DEFAULT_REPO_CONFIG_YAML),
-        // Agent definition files (6 V2 agents)
+        (profile_dir.join("orchestrator.md"), DEFAULT_ORCHESTRATOR_MD),
         (
-            agents_dir.join("orchestrator.md"),
+            profile_dir.join("global-prompt.md"),
+            DEFAULT_GLOBAL_PROMPT_MD,
+        ),
+        (repo_dir.join("VALUE.md"), DEFAULT_VALUE_MD),
+        (repo_dir.join("memory.md"), DEFAULT_MEMORY_MD),
+        (repo_dir.join("config.yaml"), DEFAULT_REPO_CONFIG_YAML),
+        (
+            profile_agents_dir.join("orchestrator.md"),
             DEFAULT_AGENT_ORCHESTRATOR,
         ),
-        (agents_dir.join("implementer.md"), DEFAULT_AGENT_IMPLEMENTER),
-        (agents_dir.join("verifier.md"), DEFAULT_AGENT_VERIFIER),
-        (agents_dir.join("reviewer.md"), DEFAULT_AGENT_REVIEWER),
         (
-            agents_dir.join("vision_gap_analyst.md"),
+            profile_agents_dir.join("implementer.md"),
+            DEFAULT_AGENT_IMPLEMENTER,
+        ),
+        (
+            profile_agents_dir.join("verifier.md"),
+            DEFAULT_AGENT_VERIFIER,
+        ),
+        (
+            profile_agents_dir.join("reviewer.md"),
+            DEFAULT_AGENT_REVIEWER,
+        ),
+        (
+            profile_agents_dir.join("vision_gap_analyst.md"),
             DEFAULT_AGENT_VISION_GAP_ANALYST,
         ),
         (
-            agents_dir.join("bug_reproducer.md"),
+            profile_agents_dir.join("bug_reproducer.md"),
             DEFAULT_AGENT_BUG_REPRODUCER,
         ),
     ];
 
     let mut created: usize = 0;
     let mut skipped: usize = 0;
-    let mut refreshed: usize = 0;
 
     for (filepath, content) in &files {
-        let existed = filepath.exists();
-        let is_spawn_script = filepath
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n == "spawn_claude.sh" || n == "spawn_codex.sh")
-            .unwrap_or(false);
-
-        if existed && !is_spawn_script {
+        if filepath.exists() {
             skipped += 1;
             continue;
         }
@@ -249,26 +240,13 @@ fn cmd_init() {
         if let Err(e) = fs::write(filepath, content) {
             eprintln!("Error writing {}: {e}", filepath.display());
         } else {
-            if existed && is_spawn_script {
-                refreshed += 1;
-            } else {
-                created += 1;
-            }
+            created += 1;
         }
     }
 
-    // Make spawn scripts executable (chmod 755)
-    for script_name in &["spawn_claude.sh", "spawn_codex.sh"] {
-        let script = claw_dir.join(script_name);
-        if script.exists() {
-            let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o755));
-        }
-    }
-
-    println!("Initialized .githubclaw/ in {}", repo_root.display());
-    println!(
-        "  Created {created} files, refreshed {refreshed} runtime scripts, skipped {skipped} existing files."
-    );
+    println!("Initialized GithubClaw global layout for {}", owner_repo);
+    println!("  Global home: {}", global_dir.display());
+    println!("  Created {created} files, skipped {skipped} existing files.");
     println!();
 
     // (a) Auto-register the repo
@@ -283,21 +261,19 @@ fn cmd_init() {
     // (d) Pre-flight check for gh CLI
     preflight_gh();
 
-    // (e) Guidance on what to git add
-    println!();
-    println!("To track agent configs in git:");
-    println!(
-        "  git add .githubclaw/agents/ .githubclaw/VALUE.md \
-         .githubclaw/global-prompt.md .githubclaw/orchestrator.md"
-    );
-
-    // (f) Next steps
+    // (e) Next steps
     println!();
     println!("Next steps:");
-    println!("  1. Edit .githubclaw/VALUE.md with your project mission");
+    println!(
+        "  1. Edit {} with your project mission",
+        crate::config::repo_value_path_from_home(&global_dir, &owner_repo).display()
+    );
     println!("  2. Create a GitHub App and set webhook URL + secret");
     println!("  3. Set up a tunnel (cloudflare tunnel, ngrok, etc.)");
-    println!("  4. githubclaw start");
+    println!(
+        "  4. On macOS: grant Full Disk Access to Terminal/iTerm, then run `githubclaw start`"
+    );
+    println!("     On Linux: `githubclaw start`");
 }
 
 fn cmd_bootstrap() {
@@ -386,11 +362,6 @@ fn cmd_bootstrap() {
 // ===========================================================================
 
 fn cmd_start() {
-    if let Some(pid) = read_pid() {
-        eprintln!("Webhook server already running (PID {pid}).");
-        std::process::exit(1);
-    }
-
     // Ensure global directories exist
     let global_dir = global_config_dir();
     let _ = fs::create_dir_all(global_dir.join("logs"));
@@ -415,67 +386,36 @@ fn cmd_start() {
 
     match system {
         "macos" => {
-            let plist_path = write_launchd_plist(LAUNCHD_LABEL, config.port, &log_path);
-            let uid = unsafe { libc::getuid() };
-
-            // Unload stale definition first
-            let _ = Command::new("launchctl")
-                .args([
-                    "bootout",
-                    &format!("gui/{uid}"),
-                    &plist_path.to_string_lossy(),
-                ])
-                .output();
-
-            let result = Command::new("launchctl")
-                .args([
-                    "bootstrap",
-                    &format!("gui/{uid}"),
-                    &plist_path.to_string_lossy(),
-                ])
-                .output();
-
-            match result {
-                Ok(output) if !output.status.success() => {
-                    eprintln!(
-                        "Failed to start via launchd: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Failed to run launchctl: {e}");
-                    std::process::exit(1);
-                }
-                _ => {}
+            if let Some(session) = find_tmux_session() {
+                eprintln!(
+                    "Webhook server already running in tmux session `{}`.",
+                    session.name
+                );
+                std::process::exit(1);
             }
 
-            // Find PID from launchctl print
-            if let Ok(info) = Command::new("launchctl")
-                .args(["print", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
-                .output()
-            {
-                let stdout = String::from_utf8_lossy(&info.stdout);
-                for line in stdout.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.starts_with("pid =") {
-                        if let Some(val) = trimmed.split('=').nth(1) {
-                            if let Ok(pid) = val.trim().parse::<u32>() {
-                                let _ = fs::write(get_pid_file(), pid.to_string());
-                            }
-                        }
-                    }
-                }
+            if let Some(pid) = read_pid() {
+                eprintln!("Webhook server already running (PID {pid}).");
+                std::process::exit(1);
             }
+
+            start_tmux_session(config.port).unwrap_or_else(|err| {
+                eprintln!("Failed to start via tmux: {err}");
+                std::process::exit(1);
+            });
 
             println!(
-                "Webhook server started via launchd on port {}.",
-                config.port
+                "Webhook server started in tmux session `{}` on port {}.",
+                TMUX_SESSION_NAME, config.port
             );
-            println!("  Logs: {}", log_path.display());
-            println!("  Plist: {}", plist_path.display());
+            println!("  Attach: tmux attach -t {TMUX_SESSION_NAME}");
         }
         "linux" => {
+            if let Some(pid) = read_pid() {
+                eprintln!("Webhook server already running (PID {pid}).");
+                std::process::exit(1);
+            }
+
             let unit_path = write_systemd_unit(SYSTEMD_UNIT, config.port, &log_path);
 
             let _ = Command::new("systemctl")
@@ -556,46 +496,11 @@ fn stop_graceful(system: &str) {
 
     match system {
         "macos" => {
-            let plist_path = home_dir()
-                .join("Library")
-                .join("LaunchAgents")
-                .join(format!("{LAUNCHD_LABEL}.plist"));
-            if plist_path.exists() {
-                // Send SIGTERM for graceful drain
-                if let Some(pid) = pid {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
-                    }
-                }
-                let uid = unsafe { libc::getuid() };
-                let result = Command::new("launchctl")
-                    .args([
-                        "bootout",
-                        &format!("gui/{uid}"),
-                        &plist_path.to_string_lossy(),
-                    ])
-                    .output();
+            let tmux_stopped = stop_tmux_session();
+            let launchd_stopped = stop_legacy_launchd_job(pid, false);
 
-                let _ = fs::remove_file(get_pid_file());
-
-                match result {
-                    Ok(output)
-                        if output.status.success()
-                            || String::from_utf8_lossy(&output.stderr)
-                                .contains("No such process") =>
-                    {
-                        println!("Webhook server stopped (graceful drain).");
-                    }
-                    Ok(output) => {
-                        println!(
-                            "launchctl bootout warning: {}",
-                            String::from_utf8_lossy(&output.stderr).trim()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to run launchctl: {e}");
-                    }
-                }
+            if let Some(message) = stop_completion_message(tmux_stopped, launchd_stopped, false) {
+                println!("{message}");
                 return;
             }
         }
@@ -635,6 +540,10 @@ fn stop_graceful(system: &str) {
             println!("Webhook server stopped (graceful drain).");
         }
         None => {
+            if stop_tmux_session() {
+                println!("Webhook server stopped (tmux session `{TMUX_SESSION_NAME}`).");
+                return;
+            }
             eprintln!("Webhook server is not running.");
             std::process::exit(1);
         }
@@ -646,27 +555,15 @@ fn stop_force(system: &str) {
 
     match system {
         "macos" => {
-            if let Some(pid) = pid {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
+            let tmux_stopped = stop_tmux_session();
+            let launchd_stopped = stop_legacy_launchd_job(pid, true);
+
+            if let Some(message) = stop_completion_message(tmux_stopped, launchd_stopped, true) {
+                println!("{message}");
+            } else {
+                eprintln!("Webhook server is not running.");
+                std::process::exit(1);
             }
-            let plist_path = home_dir()
-                .join("Library")
-                .join("LaunchAgents")
-                .join(format!("{LAUNCHD_LABEL}.plist"));
-            if plist_path.exists() {
-                let uid = unsafe { libc::getuid() };
-                let _ = Command::new("launchctl")
-                    .args([
-                        "bootout",
-                        &format!("gui/{uid}"),
-                        &plist_path.to_string_lossy(),
-                    ])
-                    .output();
-            }
-            let _ = fs::remove_file(get_pid_file());
-            println!("Webhook server killed (force).");
         }
         "linux" => {
             let result = Command::new("systemctl")
@@ -705,6 +602,10 @@ fn stop_force(system: &str) {
                     println!("Webhook server killed (force).");
                 }
                 None => {
+                    if stop_tmux_session() {
+                        println!("Webhook server killed (tmux session `{TMUX_SESSION_NAME}`).");
+                        return;
+                    }
                     eprintln!("Webhook server is not running.");
                     std::process::exit(1);
                 }
@@ -727,7 +628,18 @@ fn cmd_status() {
             }
         }
         None => {
-            println!("Webhook server is not running.");
+            if let Some(session) = find_tmux_session() {
+                println!(
+                    "Webhook server is running via tmux session `{}`{}.",
+                    session.name,
+                    if session.attached { " (attached)" } else { "" }
+                );
+                if let Ok(config) = GlobalConfig::load(None) {
+                    println!("  Port: {}", config.port);
+                }
+            } else {
+                println!("Webhook server is not running.");
+            }
         }
     }
 
@@ -776,8 +688,8 @@ fn cmd_status() {
         println!("  {repo_name}");
         println!("    Path: {local_path}");
 
-        // Show queue size if queue dir exists
-        let queue_dir = Path::new(local_path).join(".githubclaw").join("queue");
+        // Show queue size from global runtime
+        let queue_dir = crate::config::queue_dir_for_repo(repo_name);
         if queue_dir.exists() {
             let queue_count = fs::read_dir(&queue_dir)
                 .map(|entries| {
@@ -801,6 +713,37 @@ fn cmd_status() {
 
 fn cmd_logs(follow: bool) {
     let log_path = get_log_file();
+    let tmux_session = find_tmux_session();
+
+    match preferred_log_source(tmux_session.is_some(), log_path.exists()) {
+        LogSource::Tmux => {
+            let session = tmux_session.expect("tmux session presence already checked");
+            if follow {
+                // Replace process with tmux attach for inline mode.
+                use std::os::unix::process::CommandExt;
+                let err = Command::new("tmux")
+                    .args(["attach", "-t", &session.name])
+                    .exec();
+                eprintln!("Failed to exec tmux attach: {err}");
+                std::process::exit(1);
+            } else if let Some(output) = capture_tmux_session_output(&session.name) {
+                print!("{output}");
+                return;
+            } else {
+                println!(
+                    "tmux session `{}` is running, but output capture failed. Try `tmux attach -t {}`.",
+                    session.name, session.name
+                );
+                return;
+            }
+        }
+        LogSource::None => {
+            println!("No logs found.");
+            return;
+        }
+        LogSource::File => {}
+    }
+
     if !log_path.exists() {
         println!("No logs found.");
         return;
@@ -834,6 +777,183 @@ fn cmd_logs(follow: bool) {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogSource {
+    Tmux,
+    File,
+    None,
+}
+
+fn preferred_log_source(has_tmux_session: bool, has_log_file: bool) -> LogSource {
+    if has_tmux_session {
+        LogSource::Tmux
+    } else if has_log_file {
+        LogSource::File
+    } else {
+        LogSource::None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmuxSessionInfo {
+    name: String,
+    attached: bool,
+}
+
+fn parse_tmux_sessions(output: &str) -> Vec<TmuxSessionInfo> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let name = parts.next()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let attached = parts.next().unwrap_or("0").trim() == "1";
+            Some(TmuxSessionInfo {
+                name: name.to_string(),
+                attached,
+            })
+        })
+        .collect()
+}
+
+fn find_tmux_session() -> Option<TmuxSessionInfo> {
+    let output = Command::new("tmux")
+        .args([
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_attached}",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_tmux_sessions(&stdout)
+        .into_iter()
+        .find(|session| session.name == TMUX_SESSION_NAME)
+}
+
+fn stop_tmux_session() -> bool {
+    Command::new("tmux")
+        .args(["kill-session", "-t", TMUX_SESSION_NAME])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn stop_legacy_launchd_job(pid: Option<u32>, force: bool) -> bool {
+    let plist_path = home_dir()
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"));
+
+    if !plist_path.exists() && pid.is_none() {
+        return false;
+    }
+
+    if let Some(pid) = pid {
+        unsafe {
+            libc::kill(
+                pid as i32,
+                if force { libc::SIGKILL } else { libc::SIGTERM },
+            );
+        }
+    }
+
+    let uid = unsafe { libc::getuid() };
+    let result = Command::new("launchctl")
+        .args([
+            "bootout",
+            &format!("gui/{uid}"),
+            &plist_path.to_string_lossy(),
+        ])
+        .output();
+
+    let _ = fs::remove_file(get_pid_file());
+
+    match result {
+        Ok(output)
+            if output.status.success()
+                || String::from_utf8_lossy(&output.stderr).contains("No such process") =>
+        {
+            true
+        }
+        Ok(output) => {
+            println!(
+                "launchctl bootout warning: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("Failed to run launchctl: {e}");
+            false
+        }
+    }
+}
+
+fn stop_completion_message(
+    tmux_stopped: bool,
+    launchd_stopped: bool,
+    force: bool,
+) -> Option<String> {
+    let action = if force { "killed" } else { "stopped" };
+
+    match (tmux_stopped, launchd_stopped) {
+        (true, true) => Some(format!(
+            "Webhook server {action} (tmux session `{TMUX_SESSION_NAME}` and legacy launchd job)."
+        )),
+        (true, false) => Some(format!(
+            "Webhook server {action} (tmux session `{TMUX_SESSION_NAME}`)."
+        )),
+        (false, true) => Some(format!("Webhook server {action} (legacy launchd job).")),
+        (false, false) => None,
+    }
+}
+
+fn capture_tmux_session_output(session_name: &str) -> Option<String> {
+    let output = Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", session_name, "-S", "-50"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn start_tmux_session(port: u16) -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("could not resolve current executable: {e}"))?;
+    let shell_command = format!(
+        "{} serve --host 0.0.0.0 --port {}",
+        shell_single_quote(&exe.to_string_lossy()),
+        port
+    );
+
+    let output = Command::new("tmux")
+        .args(["new-session", "-d", "-s", TMUX_SESSION_NAME, &shell_command])
+        .output()
+        .map_err(|e| format!("could not run tmux: {e}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 // ===========================================================================
@@ -944,10 +1064,8 @@ fn cmd_serve(host: &str, port: u16) {
                             let st = Arc::clone(&sched_state_inner);
                             async move {
                                 let mut queues = st.queues.lock().await;
-                                let registry = st.registry.read().await;
                                 let queue = crate::server::get_or_create_queue(
                                     &mut queues,
-                                    &registry,
                                     &st.githubclaw_home,
                                     &repo,
                                 )
@@ -1040,17 +1158,7 @@ fn home_dir() -> PathBuf {
 ///   - `https://github.com/owner/repo.git`
 ///   - `https://github.com/owner/repo`
 fn parse_github_remote(url: &str) -> Option<String> {
-    let re_ssh = regex::Regex::new(r"^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$").ok()?;
-    if let Some(caps) = re_ssh.captures(url) {
-        return Some(format!("{}/{}", &caps[1], &caps[2]));
-    }
-
-    let re_https = regex::Regex::new(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?$").ok()?;
-    if let Some(caps) = re_https.captures(url) {
-        return Some(format!("{}/{}", &caps[1], &caps[2]));
-    }
-
-    None
+    crate::config::parse_github_remote(url)
 }
 
 /// Auto-register the repo in `~/.githubclaw/registry.json`.
@@ -1211,57 +1319,6 @@ fn read_pid() -> Option<u32> {
     }
 }
 
-/// Write a macOS launchd plist and return its path.
-fn write_launchd_plist(label: &str, port: u16, log_path: &Path) -> PathBuf {
-    let plist_dir = home_dir().join("Library").join("LaunchAgents");
-    let _ = fs::create_dir_all(&plist_dir);
-    let plist_path = plist_dir.join(format!("{label}.plist"));
-
-    let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("githubclaw"));
-    let path_env = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
-
-    let plist_content = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{exe}</string>
-        <string>serve</string>
-        <string>--host</string>
-        <string>0.0.0.0</string>
-        <string>--port</string>
-        <string>{port}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{log}</string>
-    <key>StandardErrorPath</key>
-    <string>{log}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>{path}</string>
-    </dict>
-</dict>
-</plist>
-"#,
-        exe = exe_path.display(),
-        log = log_path.display(),
-        path = path_env,
-    );
-
-    let _ = fs::write(&plist_path, plist_content);
-    plist_path
-}
-
 /// Write a Linux systemd user unit file and return its path.
 fn write_systemd_unit(unit_name: &str, port: u16, log_path: &Path) -> PathBuf {
     let unit_dir = home_dir().join(".config").join("systemd").join("user");
@@ -1335,16 +1392,7 @@ fn health_check(port: u16, log_path: &Path) {
 
 /// Detect the GitHub owner/repo from the current git remote.
 fn detect_github_remote(repo_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    parse_github_remote(&url)
+    crate::config::detect_repo_name(repo_root)
 }
 
 fn runtime_timestamp() -> String {
@@ -1400,7 +1448,7 @@ fn cmd_dispatch(
         std::process::exit(1);
     });
 
-    let receipt_store = DispatchReceiptStore::new(&repo_root);
+    let receipt_store = DispatchReceiptStore::new(&repo_name);
     let dispatch_event_id = event_id_arg.map(ToString::to_string).or_else(|| {
         std::env::var("GITHUBCLAW_EVENT_ID")
             .ok()
@@ -1476,25 +1524,17 @@ fn cmd_dispatch(
     }
     extra_env.insert("GITHUBCLAW_REPO".into(), repo_name.clone());
 
-    // Load agent definition: write to temp file, then parse
-    let agent_def_content = load_agent_definition(agent_type, &repo_root);
-    let tmp_dir = std::env::temp_dir().join("githubclaw-dispatch");
-    fs::create_dir_all(&tmp_dir).unwrap_or_default();
-    let agent_file = tmp_dir.join(format!("{}.md", agent_type));
-    fs::write(&agent_file, &agent_def_content).unwrap_or_else(|e| {
-        eprintln!("Error writing temp agent file: {}", e);
-        std::process::exit(1);
-    });
-    let agent_def = match crate::agents::parser::parse_agent_file(&agent_file) {
+    let agent_def = match crate::agents::parser::load_agent_definition(&repo_name, agent_type, None)
+    {
         Ok(def) => def,
         Err(e) => {
-            eprintln!("Error parsing agent definition for '{}': {}", agent_type, e);
+            eprintln!("Error loading agent definition for '{}': {}", agent_type, e);
             std::process::exit(1);
         }
     };
 
     // Assemble prompt
-    let mut prompt_assembler = crate::agents::prompt_assembler::PromptAssembler::new(&repo_root);
+    let mut prompt_assembler = crate::agents::prompt_assembler::PromptAssembler::new(&repo_name);
     let prompt_file = match prompt_assembler.assemble(&agent_def, prompt) {
         Ok(path) => path,
         Err(e) => {
@@ -1584,35 +1624,6 @@ fn cmd_dispatch(
             );
             let _ = session_store.save_runtime_snapshot(&repo_name, &runtime_snapshot);
             eprintln!("Error spawning agent '{}': {}", agent_type, e);
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Load an agent definition, preferring repo-local over embedded defaults.
-fn load_agent_definition(agent_type: &str, repo_root: &Path) -> String {
-    // Check repo-local agents directory first
-    let local_path = repo_root
-        .join(".githubclaw")
-        .join("agents")
-        .join(format!("{}.md", agent_type));
-    if local_path.exists() {
-        return fs::read_to_string(&local_path).unwrap_or_default();
-    }
-
-    // Fall back to embedded defaults
-    match agent_type {
-        "orchestrator" => DEFAULT_AGENT_ORCHESTRATOR.to_string(),
-        "implementer" => DEFAULT_AGENT_IMPLEMENTER.to_string(),
-        "verifier" => DEFAULT_AGENT_VERIFIER.to_string(),
-        "reviewer" => DEFAULT_AGENT_REVIEWER.to_string(),
-        "vision-gap-analyst" => DEFAULT_AGENT_VISION_GAP_ANALYST.to_string(),
-        "bug-reproducer" => DEFAULT_AGENT_BUG_REPRODUCER.to_string(),
-        _ => {
-            eprintln!(
-                "Error: no embedded definition for agent type '{}'",
-                agent_type
-            );
             std::process::exit(1);
         }
     }
@@ -1807,5 +1818,71 @@ mod tests {
             }
             _ => panic!("expected dispatch command"),
         }
+    }
+
+    #[test]
+    fn test_parse_tmux_sessions_reads_name_and_attachment_state() {
+        let sessions = parse_tmux_sessions("githubclaw\t1\nother\t0\n");
+
+        assert_eq!(
+            sessions,
+            vec![
+                TmuxSessionInfo {
+                    name: "githubclaw".to_string(),
+                    attached: true,
+                },
+                TmuxSessionInfo {
+                    name: "other".to_string(),
+                    attached: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_tmux_sessions_ignores_empty_lines() {
+        let sessions = parse_tmux_sessions("\n  \ngithubclaw\t0\n");
+
+        assert_eq!(
+            sessions,
+            vec![TmuxSessionInfo {
+                name: "githubclaw".to_string(),
+                attached: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_shell_single_quote_escapes_single_quotes() {
+        assert_eq!(shell_single_quote("/tmp/githubclaw"), "'/tmp/githubclaw'");
+        assert_eq!(
+            shell_single_quote("/tmp/it's/githubclaw"),
+            "'/tmp/it'\"'\"'s/githubclaw'"
+        );
+    }
+
+    #[test]
+    fn test_preferred_log_source_prefers_tmux_over_file() {
+        assert_eq!(preferred_log_source(true, true), LogSource::Tmux);
+        assert_eq!(preferred_log_source(true, false), LogSource::Tmux);
+        assert_eq!(preferred_log_source(false, true), LogSource::File);
+        assert_eq!(preferred_log_source(false, false), LogSource::None);
+    }
+
+    #[test]
+    fn test_stop_completion_message_describes_tmux_and_legacy_launchd() {
+        assert_eq!(
+            stop_completion_message(true, false, false).as_deref(),
+            Some("Webhook server stopped (tmux session `githubclaw`).")
+        );
+        assert_eq!(
+            stop_completion_message(false, true, false).as_deref(),
+            Some("Webhook server stopped (legacy launchd job).")
+        );
+        assert_eq!(
+            stop_completion_message(true, true, true).as_deref(),
+            Some("Webhook server killed (tmux session `githubclaw` and legacy launchd job).")
+        );
+        assert_eq!(stop_completion_message(false, false, false), None);
     }
 }

@@ -1,13 +1,13 @@
 //! Disk-persisted FIFO event queue with dead-letter support.
 //!
 //! Queue directory layout per repo:
-//!     .githubclaw/queue/
+//!     ~/.githubclaw/runtime/<repo>/queue/
 //!         000001_issues_opened.json
 //!         000002_issue_comment_created.json
 //!         ...
-//!     .githubclaw/queue/inflight/
+//!     ~/.githubclaw/runtime/<repo>/queue/inflight/
 //!         000001_issues_opened.json
-//!     .githubclaw/queue/dead/
+//!     ~/.githubclaw/runtime/<repo>/queue/dead/
 //!         000001_issues_opened_dead.json
 //!         ...
 

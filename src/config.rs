@@ -1,11 +1,15 @@
-//! Configuration loading for GithubClaw.
+//! Configuration loading and path resolution for GithubClaw.
 //!
-//! Loads from two sources:
-//! - Global: ~/.githubclaw/config.yaml (shared across all repos)
-//! - Per-repo: .githubclaw/config.yaml (repo-specific overrides)
+//! Global control-plane layout:
+//! - `~/.githubclaw/config.yaml`                   -- shared server config
+//! - `~/.githubclaw/profiles/<profile>/...`       -- shared prompts/agent defs
+//! - `~/.githubclaw/repos/<owner_repo>/...`       -- repo-specific overrides
+//! - `~/.githubclaw/runtime/<owner_repo>/...`     -- runtime state and artifacts
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::constants::{
     DEFAULT_CONFIG_DRAIN_TIMEOUT_SECONDS, DEFAULT_CONFIG_MAX_CONCURRENT_AGENTS,
@@ -25,16 +29,161 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
+fn githubclaw_home_override() -> Option<PathBuf> {
+    std::env::var("GITHUBCLAW_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
 pub fn global_config_dir() -> PathBuf {
-    home_dir().join(".githubclaw")
+    githubclaw_home_override().unwrap_or_else(|| home_dir().join(".githubclaw"))
 }
 
 pub fn global_config_path() -> PathBuf {
     global_config_dir().join("config.yaml")
 }
 
-pub const REPO_CONFIG_DIR_NAME: &str = ".githubclaw";
 pub const REPO_CONFIG_FILENAME: &str = "config.yaml";
+pub const DEFAULT_PROFILE_NAME: &str = "default";
+
+pub fn parse_github_remote(url: &str) -> Option<String> {
+    let re_ssh = Regex::new(r"^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$").ok()?;
+    if let Some(caps) = re_ssh.captures(url) {
+        return Some(format!("{}/{}", &caps[1], &caps[2]));
+    }
+
+    let re_https = Regex::new(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?$").ok()?;
+    if let Some(caps) = re_https.captures(url) {
+        return Some(format!("{}/{}", &caps[1], &caps[2]));
+    }
+
+    None
+}
+
+pub fn detect_repo_name(repo_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    parse_github_remote(&url)
+}
+
+pub fn repo_key(repo_name: &str) -> String {
+    repo_name.replace('/', "_")
+}
+
+pub fn profiles_dir() -> PathBuf {
+    profiles_dir_from_home(&global_config_dir())
+}
+
+pub fn profiles_dir_from_home(githubclaw_home: &Path) -> PathBuf {
+    githubclaw_home.join("profiles")
+}
+
+pub fn profile_dir(profile_name: &str) -> PathBuf {
+    profile_dir_from_home(&global_config_dir(), profile_name)
+}
+
+pub fn profile_dir_from_home(githubclaw_home: &Path, profile_name: &str) -> PathBuf {
+    profiles_dir_from_home(githubclaw_home).join(profile_name)
+}
+
+pub fn profile_agents_dir(profile_name: &str) -> PathBuf {
+    profile_agents_dir_from_home(&global_config_dir(), profile_name)
+}
+
+pub fn profile_agents_dir_from_home(githubclaw_home: &Path, profile_name: &str) -> PathBuf {
+    profile_dir_from_home(githubclaw_home, profile_name).join("agents")
+}
+
+pub fn repos_dir() -> PathBuf {
+    repos_dir_from_home(&global_config_dir())
+}
+
+pub fn repos_dir_from_home(githubclaw_home: &Path) -> PathBuf {
+    githubclaw_home.join("repos")
+}
+
+pub fn repo_dir(repo_name: &str) -> PathBuf {
+    repo_dir_from_home(&global_config_dir(), repo_name)
+}
+
+pub fn repo_dir_from_home(githubclaw_home: &Path, repo_name: &str) -> PathBuf {
+    repos_dir_from_home(githubclaw_home).join(repo_key(repo_name))
+}
+
+pub fn repo_agents_dir(repo_name: &str) -> PathBuf {
+    repo_agents_dir_from_home(&global_config_dir(), repo_name)
+}
+
+pub fn repo_agents_dir_from_home(githubclaw_home: &Path, repo_name: &str) -> PathBuf {
+    repo_dir_from_home(githubclaw_home, repo_name).join("agents")
+}
+
+pub fn repo_value_path(repo_name: &str) -> PathBuf {
+    repo_value_path_from_home(&global_config_dir(), repo_name)
+}
+
+pub fn repo_value_path_from_home(githubclaw_home: &Path, repo_name: &str) -> PathBuf {
+    repo_dir_from_home(githubclaw_home, repo_name).join("VALUE.md")
+}
+
+pub fn repo_memory_path(repo_name: &str) -> PathBuf {
+    repo_memory_path_from_home(&global_config_dir(), repo_name)
+}
+
+pub fn repo_memory_path_from_home(githubclaw_home: &Path, repo_name: &str) -> PathBuf {
+    repo_dir_from_home(githubclaw_home, repo_name).join("memory.md")
+}
+
+pub fn repo_config_path(repo_name: &str) -> PathBuf {
+    repo_config_path_from_home(&global_config_dir(), repo_name)
+}
+
+pub fn repo_config_path_from_home(githubclaw_home: &Path, repo_name: &str) -> PathBuf {
+    repo_dir_from_home(githubclaw_home, repo_name).join(REPO_CONFIG_FILENAME)
+}
+
+pub fn runtime_dir() -> PathBuf {
+    runtime_dir_from_home(&global_config_dir())
+}
+
+pub fn runtime_dir_from_home(githubclaw_home: &Path) -> PathBuf {
+    githubclaw_home.join("runtime")
+}
+
+pub fn repo_runtime_dir(repo_name: &str) -> PathBuf {
+    repo_runtime_dir_from_home(&global_config_dir(), repo_name)
+}
+
+pub fn repo_runtime_dir_from_home(githubclaw_home: &Path, repo_name: &str) -> PathBuf {
+    runtime_dir_from_home(githubclaw_home).join(repo_key(repo_name))
+}
+
+pub fn queue_dir_for_repo(repo_name: &str) -> PathBuf {
+    queue_dir_for_repo_from_home(&global_config_dir(), repo_name)
+}
+
+pub fn queue_dir_for_repo_from_home(githubclaw_home: &Path, repo_name: &str) -> PathBuf {
+    repo_runtime_dir_from_home(githubclaw_home, repo_name).join("queue")
+}
+
+pub fn dispatch_receipts_dir_for_repo(repo_name: &str) -> PathBuf {
+    dispatch_receipts_dir_for_repo_from_home(&global_config_dir(), repo_name)
+}
+
+pub fn dispatch_receipts_dir_for_repo_from_home(
+    githubclaw_home: &Path,
+    repo_name: &str,
+) -> PathBuf {
+    repo_runtime_dir_from_home(githubclaw_home, repo_name).join("dispatch_receipts")
+}
 
 // ---------------------------------------------------------------------------
 // Default event subscription
@@ -319,9 +468,16 @@ fn default_excluded_read_paths() -> Vec<String> {
     ]
 }
 
-/// Per-repo configuration loaded from `.githubclaw/config.yaml`.
+fn default_profile_name() -> String {
+    DEFAULT_PROFILE_NAME.to_string()
+}
+
+/// Per-repo configuration loaded from `~/.githubclaw/repos/<repo>/config.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
+    #[serde(default = "default_profile_name")]
+    pub profile: String,
+
     #[serde(default = "default_allowed_read_paths")]
     pub allowed_read_paths: Vec<String>,
 
@@ -370,6 +526,7 @@ pub struct E2eConfig {
 impl Default for RepoConfig {
     fn default() -> Self {
         Self {
+            profile: default_profile_name(),
             allowed_read_paths: default_allowed_read_paths(),
             excluded_read_paths: default_excluded_read_paths(),
             event_subscription: default_event_subscription(),
@@ -381,12 +538,12 @@ impl Default for RepoConfig {
 }
 
 impl RepoConfig {
-    /// Load per-repo config, falling back to defaults for missing keys.
-    pub fn load(repo_root: Option<&Path>) -> Result<Self> {
-        let root = repo_root
+    /// Load per-repo override config, falling back to defaults for missing keys.
+    pub fn load_for_repo(repo_name: &str, githubclaw_home: Option<&Path>) -> Result<Self> {
+        let home = githubclaw_home
             .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let config_path = root.join(REPO_CONFIG_DIR_NAME).join(REPO_CONFIG_FILENAME);
+            .unwrap_or_else(global_config_dir);
+        let config_path = repo_config_path_from_home(&home, repo_name);
 
         if !config_path.exists() {
             return Ok(Self::default());
@@ -397,12 +554,22 @@ impl RepoConfig {
         Ok(config)
     }
 
+    pub fn load_for_repo_root(repo_root: &Path, githubclaw_home: Option<&Path>) -> Result<Self> {
+        let repo_name = detect_repo_name(repo_root).ok_or_else(|| {
+            GithubClawError::Config(format!(
+                "Failed to detect GitHub remote for repo root {}",
+                repo_root.display()
+            ))
+        })?;
+        Self::load_for_repo(&repo_name, githubclaw_home)
+    }
+
     /// Write per-repo config to disk as YAML.
-    pub fn save(&self, repo_root: Option<&Path>) -> Result<()> {
-        let root = repo_root
+    pub fn save_for_repo(&self, repo_name: &str, githubclaw_home: Option<&Path>) -> Result<()> {
+        let home = githubclaw_home
             .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let config_path = root.join(REPO_CONFIG_DIR_NAME).join(REPO_CONFIG_FILENAME);
+            .unwrap_or_else(global_config_dir);
+        let config_path = repo_config_path_from_home(&home, repo_name);
 
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -412,6 +579,20 @@ impl RepoConfig {
             .map_err(|e| GithubClawError::Config(format!("Failed to serialize config: {e}")))?;
         std::fs::write(&config_path, yaml)?;
         Ok(())
+    }
+
+    pub fn save_for_repo_root(
+        &self,
+        repo_root: &Path,
+        githubclaw_home: Option<&Path>,
+    ) -> Result<()> {
+        let repo_name = detect_repo_name(repo_root).ok_or_else(|| {
+            GithubClawError::Config(format!(
+                "Failed to detect GitHub remote for repo root {}",
+                repo_root.display()
+            ))
+        })?;
+        self.save_for_repo(&repo_name, githubclaw_home)
     }
 }
 
@@ -647,6 +828,7 @@ mod tests {
     #[test]
     fn test_repo_config_defaults() {
         let cfg = RepoConfig::default();
+        assert_eq!(cfg.profile, DEFAULT_PROFILE_NAME);
         assert!(cfg.allowed_read_paths.is_empty());
         assert_eq!(cfg.excluded_read_paths.len(), 3);
         assert!(cfg.excluded_read_paths.contains(&"~/.ssh/".to_string()));
@@ -695,6 +877,22 @@ mod tests {
     }
 
     #[test]
+    fn test_global_config_dir_uses_githubclaw_home_override() {
+        let tmp = TempDir::new().unwrap();
+        let original = std::env::var_os("GITHUBCLAW_HOME");
+        std::env::set_var("GITHUBCLAW_HOME", tmp.path());
+
+        let path = global_config_dir();
+
+        match original {
+            Some(value) => std::env::set_var("GITHUBCLAW_HOME", value),
+            None => std::env::remove_var("GITHUBCLAW_HOME"),
+        }
+
+        assert_eq!(path, tmp.path());
+    }
+
+    #[test]
     fn test_get_log_file() {
         let log = get_log_file();
         assert!(log.ends_with("webhook_server.log"));
@@ -733,16 +931,18 @@ mod tests {
     #[test]
     fn test_repo_config_save_and_load() {
         let tmp = TempDir::new().unwrap();
-        let repo_root = tmp.path();
+        let repo_name = "owner/repo";
 
         let original = RepoConfig {
+            profile: "custom".into(),
             allowed_read_paths: vec!["/data".into()],
             ..RepoConfig::default()
         };
 
-        original.save(Some(repo_root)).unwrap();
+        original.save_for_repo(repo_name, Some(tmp.path())).unwrap();
 
-        let reloaded = RepoConfig::load(Some(repo_root)).unwrap();
+        let reloaded = RepoConfig::load_for_repo(repo_name, Some(tmp.path())).unwrap();
+        assert_eq!(reloaded.profile, "custom");
         assert_eq!(reloaded.allowed_read_paths, vec!["/data".to_string()]);
         assert_eq!(reloaded.excluded_read_paths.len(), 3);
     }
