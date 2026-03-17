@@ -234,30 +234,51 @@ pub fn load_agent_definition(
         .unwrap_or_else(crate::config::global_config_dir);
     let repo_config = crate::config::RepoConfig::load_for_repo(repo_name, Some(&home))
         .map_err(|e| format!("Failed to load repo config for '{}': {}", repo_name, e))?;
-    let repo_path = crate::config::repo_agents_dir_from_home(&home, repo_name)
-        .join(format!("{}.md", agent_type));
-    if repo_path.exists() {
-        return parse_agent_file(&repo_path);
+    let repo_dir = crate::config::repo_agents_dir_from_home(&home, repo_name);
+    if let Some(path) = resolve_agent_definition_path(&repo_dir, agent_type) {
+        let mut def = parse_agent_file(&path)?;
+        def.name = agent_type.to_string();
+        return Ok(def);
     }
 
-    let profile_path = crate::config::profile_agents_dir_from_home(&home, &repo_config.profile)
-        .join(format!("{}.md", agent_type));
-    if profile_path.exists() {
-        return parse_agent_file(&profile_path);
+    let profile_dir = crate::config::profile_agents_dir_from_home(&home, &repo_config.profile);
+    if let Some(path) = resolve_agent_definition_path(&profile_dir, agent_type) {
+        let mut def = parse_agent_file(&path)?;
+        def.name = agent_type.to_string();
+        return Ok(def);
     }
 
     // Fall back to built-in default.
-    let default_path = defaults_dir().join(format!("{}.md", agent_type));
-    if default_path.exists() {
-        return parse_agent_file(&default_path);
+    let default_dir = defaults_dir();
+    if let Some(path) = resolve_agent_definition_path(&default_dir, agent_type) {
+        let mut def = parse_agent_file(&path)?;
+        def.name = agent_type.to_string();
+        return Ok(def);
     }
 
     Err(format!(
         "No agent definition found for '{}' in {}, {}, or built-in defaults",
         agent_type,
-        repo_path.display(),
-        profile_path.display(),
+        repo_dir.join(format!("{}.md", agent_type)).display(),
+        profile_dir.join(format!("{}.md", agent_type)).display(),
     ))
+}
+
+fn resolve_agent_definition_path(base_dir: &Path, agent_type: &str) -> Option<PathBuf> {
+    let direct = base_dir.join(format!("{}.md", agent_type));
+    if direct.exists() {
+        return Some(direct);
+    }
+
+    let normalized = agent_type.replace('-', "_");
+    if normalized != agent_type {
+        let normalized_path = base_dir.join(format!("{}.md", normalized));
+        if normalized_path.exists() {
+            return Some(normalized_path);
+        }
+    }
+
+    None
 }
 
 /// Return the path to the built-in defaults directory.
@@ -419,6 +440,50 @@ Instructions.
         let def = load_agent_definition(repo_name, "coder", Some(tmp.path())).unwrap();
         assert_eq!(def.name, "coder");
         assert_eq!(def.backend, "claude-code");
+    }
+
+    #[test]
+    fn load_agent_definition_accepts_hyphenated_alias_for_underscored_file() {
+        let tmp = TempDir::new().unwrap();
+        let repo_name = "owner/repo";
+        let content = "---\nbackend: codex\n---\n\nAnalyze vision.\n";
+        let profile_agents = crate::config::profile_agents_dir_from_home(tmp.path(), "default");
+        let repo_dir = crate::config::repo_dir_from_home(tmp.path(), repo_name);
+        std::fs::create_dir_all(&profile_agents).unwrap();
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(
+            crate::config::repo_config_path_from_home(tmp.path(), repo_name),
+            "profile: default\n",
+        )
+        .unwrap();
+        write_agent_file(&profile_agents, "vision_gap_analyst", content);
+
+        let def = load_agent_definition(repo_name, "vision-gap-analyst", Some(tmp.path())).unwrap();
+        assert_eq!(def.name, "vision-gap-analyst");
+        assert_eq!(def.backend, "codex");
+        assert!(def.instruction_body.contains("Analyze vision."));
+    }
+
+    #[test]
+    fn load_agent_definition_accepts_hyphenated_bug_reproducer_alias() {
+        let tmp = TempDir::new().unwrap();
+        let repo_name = "owner/repo";
+        let content = "---\nbackend: codex\n---\n\nReproduce bug.\n";
+        let profile_agents = crate::config::profile_agents_dir_from_home(tmp.path(), "default");
+        let repo_dir = crate::config::repo_dir_from_home(tmp.path(), repo_name);
+        std::fs::create_dir_all(&profile_agents).unwrap();
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(
+            crate::config::repo_config_path_from_home(tmp.path(), repo_name),
+            "profile: default\n",
+        )
+        .unwrap();
+        write_agent_file(&profile_agents, "bug_reproducer", content);
+
+        let def = load_agent_definition(repo_name, "bug-reproducer", Some(tmp.path())).unwrap();
+        assert_eq!(def.name, "bug-reproducer");
+        assert_eq!(def.backend, "codex");
+        assert!(def.instruction_body.contains("Reproduce bug."));
     }
 
     #[test]
