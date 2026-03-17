@@ -496,46 +496,11 @@ fn stop_graceful(system: &str) {
 
     match system {
         "macos" => {
-            let plist_path = home_dir()
-                .join("Library")
-                .join("LaunchAgents")
-                .join(format!("{LAUNCHD_LABEL}.plist"));
-            if plist_path.exists() {
-                // Send SIGTERM for graceful drain
-                if let Some(pid) = pid {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
-                    }
-                }
-                let uid = unsafe { libc::getuid() };
-                let result = Command::new("launchctl")
-                    .args([
-                        "bootout",
-                        &format!("gui/{uid}"),
-                        &plist_path.to_string_lossy(),
-                    ])
-                    .output();
+            let tmux_stopped = stop_tmux_session();
+            let launchd_stopped = stop_legacy_launchd_job(pid, false);
 
-                let _ = fs::remove_file(get_pid_file());
-
-                match result {
-                    Ok(output)
-                        if output.status.success()
-                            || String::from_utf8_lossy(&output.stderr)
-                                .contains("No such process") =>
-                    {
-                        println!("Webhook server stopped (graceful drain).");
-                    }
-                    Ok(output) => {
-                        println!(
-                            "launchctl bootout warning: {}",
-                            String::from_utf8_lossy(&output.stderr).trim()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to run launchctl: {e}");
-                    }
-                }
+            if let Some(message) = stop_completion_message(tmux_stopped, launchd_stopped, false) {
+                println!("{message}");
                 return;
             }
         }
@@ -590,27 +555,15 @@ fn stop_force(system: &str) {
 
     match system {
         "macos" => {
-            if let Some(pid) = pid {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
+            let tmux_stopped = stop_tmux_session();
+            let launchd_stopped = stop_legacy_launchd_job(pid, true);
+
+            if let Some(message) = stop_completion_message(tmux_stopped, launchd_stopped, true) {
+                println!("{message}");
+            } else {
+                eprintln!("Webhook server is not running.");
+                std::process::exit(1);
             }
-            let plist_path = home_dir()
-                .join("Library")
-                .join("LaunchAgents")
-                .join(format!("{LAUNCHD_LABEL}.plist"));
-            if plist_path.exists() {
-                let uid = unsafe { libc::getuid() };
-                let _ = Command::new("launchctl")
-                    .args([
-                        "bootout",
-                        &format!("gui/{uid}"),
-                        &plist_path.to_string_lossy(),
-                    ])
-                    .output();
-            }
-            let _ = fs::remove_file(get_pid_file());
-            println!("Webhook server killed (force).");
         }
         "linux" => {
             let result = Command::new("systemctl")
@@ -760,8 +713,11 @@ fn cmd_status() {
 
 fn cmd_logs(follow: bool) {
     let log_path = get_log_file();
-    if !log_path.exists() {
-        if let Some(session) = find_tmux_session() {
+    let tmux_session = find_tmux_session();
+
+    match preferred_log_source(tmux_session.is_some(), log_path.exists()) {
+        LogSource::Tmux => {
+            let session = tmux_session.expect("tmux session presence already checked");
             if follow {
                 // Replace process with tmux attach for inline mode.
                 use std::os::unix::process::CommandExt;
@@ -781,6 +737,14 @@ fn cmd_logs(follow: bool) {
                 return;
             }
         }
+        LogSource::None => {
+            println!("No logs found.");
+            return;
+        }
+        LogSource::File => {}
+    }
+
+    if !log_path.exists() {
         println!("No logs found.");
         return;
     }
@@ -812,6 +776,23 @@ fn cmd_logs(follow: bool) {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogSource {
+    Tmux,
+    File,
+    None,
+}
+
+fn preferred_log_source(has_tmux_session: bool, has_log_file: bool) -> LogSource {
+    if has_tmux_session {
+        LogSource::Tmux
+    } else if has_log_file {
+        LogSource::File
+    } else {
+        LogSource::None
     }
 }
 
@@ -865,6 +846,76 @@ fn stop_tmux_session() -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+fn stop_legacy_launchd_job(pid: Option<u32>, force: bool) -> bool {
+    let plist_path = home_dir()
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"));
+
+    if !plist_path.exists() && pid.is_none() {
+        return false;
+    }
+
+    if let Some(pid) = pid {
+        unsafe {
+            libc::kill(
+                pid as i32,
+                if force { libc::SIGKILL } else { libc::SIGTERM },
+            );
+        }
+    }
+
+    let uid = unsafe { libc::getuid() };
+    let result = Command::new("launchctl")
+        .args([
+            "bootout",
+            &format!("gui/{uid}"),
+            &plist_path.to_string_lossy(),
+        ])
+        .output();
+
+    let _ = fs::remove_file(get_pid_file());
+
+    match result {
+        Ok(output)
+            if output.status.success()
+                || String::from_utf8_lossy(&output.stderr).contains("No such process") =>
+        {
+            true
+        }
+        Ok(output) => {
+            println!(
+                "launchctl bootout warning: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("Failed to run launchctl: {e}");
+            false
+        }
+    }
+}
+
+fn stop_completion_message(
+    tmux_stopped: bool,
+    launchd_stopped: bool,
+    force: bool,
+) -> Option<String> {
+    let action = if force { "killed" } else { "stopped" };
+
+    match (tmux_stopped, launchd_stopped) {
+        (true, true) => Some(format!(
+            "Webhook server {action} (tmux session `{TMUX_SESSION_NAME}` and legacy launchd job)."
+        )),
+        (true, false) => Some(format!(
+            "Webhook server {action} (tmux session `{TMUX_SESSION_NAME}`)."
+        )),
+        (false, true) => Some(format!("Webhook server {action} (legacy launchd job).")),
+        (false, false) => None,
+    }
 }
 
 fn capture_tmux_session_output(session_name: &str) -> Option<String> {
@@ -1808,5 +1859,30 @@ mod tests {
             shell_single_quote("/tmp/it's/githubclaw"),
             "'/tmp/it'\"'\"'s/githubclaw'"
         );
+    }
+
+    #[test]
+    fn test_preferred_log_source_prefers_tmux_over_file() {
+        assert_eq!(preferred_log_source(true, true), LogSource::Tmux);
+        assert_eq!(preferred_log_source(true, false), LogSource::Tmux);
+        assert_eq!(preferred_log_source(false, true), LogSource::File);
+        assert_eq!(preferred_log_source(false, false), LogSource::None);
+    }
+
+    #[test]
+    fn test_stop_completion_message_describes_tmux_and_legacy_launchd() {
+        assert_eq!(
+            stop_completion_message(true, false, false).as_deref(),
+            Some("Webhook server stopped (tmux session `githubclaw`).")
+        );
+        assert_eq!(
+            stop_completion_message(false, true, false).as_deref(),
+            Some("Webhook server stopped (legacy launchd job).")
+        );
+        assert_eq!(
+            stop_completion_message(true, true, true).as_deref(),
+            Some("Webhook server killed (tmux session `githubclaw` and legacy launchd job).")
+        );
+        assert_eq!(stop_completion_message(false, false, false), None);
     }
 }
