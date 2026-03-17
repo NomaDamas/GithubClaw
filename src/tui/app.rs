@@ -98,16 +98,36 @@ impl App {
 
     fn refresh_from_disk_root(&mut self, home: &Path) {
         // Read queue depths
-        let queue_dir = home.join("queue");
-        if queue_dir.exists() {
-            self.queue_depth = std::fs::read_dir(&queue_dir)
-                .map(|entries| entries.filter_map(|e| e.ok()).count())
-                .unwrap_or(0);
-            self.oldest_queue_age_seconds = oldest_entry_age_seconds(&queue_dir, SystemTime::now());
-        } else {
-            self.queue_depth = 0;
-            self.oldest_queue_age_seconds = None;
+        let runtime_dir = crate::config::runtime_dir_from_home(home);
+        let mut queue_depth = 0usize;
+        let mut oldest_queue_age_seconds: Option<u64> = None;
+        if let Ok(repo_dirs) = std::fs::read_dir(&runtime_dir) {
+            for repo_dir in repo_dirs.flatten().map(|entry| entry.path()) {
+                let queue_dir = repo_dir.join("queue");
+                if !queue_dir.is_dir() {
+                    continue;
+                }
+                queue_depth += std::fs::read_dir(&queue_dir)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .filter(|entry| {
+                                entry.path().is_file()
+                                    && entry.path().extension().is_some_and(|ext| ext == "json")
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                if let Some(age) = oldest_entry_age_seconds(&queue_dir, SystemTime::now()) {
+                    oldest_queue_age_seconds = Some(match oldest_queue_age_seconds {
+                        Some(current) => current.max(age),
+                        None => age,
+                    });
+                }
+            }
         }
+        self.queue_depth = queue_depth;
+        self.oldest_queue_age_seconds = oldest_queue_age_seconds;
 
         // Read registry for repo list
         let registry_path = home.join("registry.json");
@@ -649,33 +669,8 @@ fn run_gh_command(repo_root: &Path, args: &[String]) -> Result<(), String> {
 }
 
 fn detect_repo_slug(repo_root: &Path) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(repo_root)
-        .output()
-        .map_err(|err| format!("failed to detect git remote: {err}"))?;
-
-    if !output.status.success() {
-        return Err("git remote get-url origin failed".to_string());
-    }
-
-    let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    parse_github_remote(&remote_url)
-        .ok_or_else(|| format!("could not parse GitHub owner/repo from remote: {remote_url}"))
-}
-
-fn parse_github_remote(url: &str) -> Option<String> {
-    let re_ssh = regex::Regex::new(r"^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$").ok()?;
-    if let Some(caps) = re_ssh.captures(url) {
-        return Some(format!("{}/{}", &caps[1], &caps[2]));
-    }
-
-    let re_https = regex::Regex::new(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?$").ok()?;
-    if let Some(caps) = re_https.captures(url) {
-        return Some(format!("{}/{}", &caps[1], &caps[2]));
-    }
-
-    None
+    crate::config::detect_repo_name(repo_root)
+        .ok_or_else(|| "could not detect GitHub owner/repo from repo remote".to_string())
 }
 
 #[cfg(test)]
@@ -856,14 +851,8 @@ mod tests {
 
     #[test]
     fn start_interactive_session_uses_resolved_backend() {
-        let temp = TempDir::new().unwrap();
+        let temp = init_git_repo();
         let repo_root = temp.path();
-        std::fs::create_dir_all(repo_root.join(".githubclaw/agents")).unwrap();
-        std::fs::write(
-            repo_root.join(".githubclaw/agents/coder.md"),
-            "---\nbackend: codex\n---\n\n# Coder\n",
-        )
-        .unwrap();
 
         let mut app = App::new();
         let mut seen_backend = None;

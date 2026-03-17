@@ -110,6 +110,16 @@ feature/#42 ─── PR ──→ dev ─── PR ──→ main
 | Serialization | serde + serde_yaml + serde_json |
 | Config | config (YAML) via serde_yaml |
 
+## Global Layout
+
+GithubClaw uses a global control plane under `~/.githubclaw`:
+
+- `profiles/<profile>/...` for shared prompts and agent definitions
+- `repos/<owner_repo>/...` for repo-specific overrides such as `VALUE.md`
+- `runtime/<owner_repo>/...` for queue, logs, receipts, and other operational state
+
+Managed repositories are no longer expected to contain a repo-local `.githubclaw/` directory.
+
 ## Key Decisions
 
 | Decision | Choice | Rationale |

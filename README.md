@@ -12,14 +12,14 @@ cargo install --path .            # install from the current checkout
 # cargo install githubclaw
 
 cd /path/to/your-repo
-githubclaw init                   # scaffold .githubclaw/ directory
+githubclaw init                   # initialize ~/.githubclaw for this repo
 ```
 
 Then follow the setup steps below.
 
 ### 1. Edit your project mission
 
-Open `.githubclaw/VALUE.md` and describe what the project is about. Every agent reads this to align decisions with your goals.
+Open `~/.githubclaw/repos/<owner_repo>/VALUE.md` and describe what the project is about. Every agent reads this to align decisions with your goals.
 
 ### 2. Set up a public tunnel
 
@@ -146,7 +146,7 @@ Events flow in a loop: GitHub fires a webhook, the server routes it to a per-rep
 
 | Command | Description |
 |---------|-------------|
-| `githubclaw init` | Scaffold `.githubclaw/` in the current repo |
+| `githubclaw init` | Initialize global profile/repo/runtime layout in `~/.githubclaw` |
 | `githubclaw start` | Start the webhook server (daemonized) |
 | `githubclaw stop` | Graceful drain shutdown |
 | `githubclaw stop --force` | Immediate kill |
@@ -156,32 +156,34 @@ Events flow in a loop: GitHub fires a webhook, the server routes it to a per-rep
 ## Directory Layout
 
 ```
-.githubclaw/
-├── orchestrator.md          # Orchestrator system prompt
-├── global-prompt.md         # Common rules, agent roster, handoff conventions
-├── VALUE.md                 # Project mission / north star
-├── agents/                  # One prompt file per agent (YAML frontmatter + markdown)
-│   ├── orchestrator.md
-│   ├── bug_reproducer.md
-│   ├── vision_gap_analyst.md
-│   ├── verifier.md
-│   ├── implementer.md
-│   ├── reviewer.md
-│   └── ...
-├── ai_instructions/         # Shared skill modules (Playwright, GitHub Projects, etc.)
-├── config.yaml              # Per-repo overrides
-├── memory.md                # Orchestrator long-term memory
-├── logs/                    # Decision logs (JSONL)
-└── queue/                   # Disk-persisted event queue
+~/.githubclaw/
+├── config.yaml
+├── registry.json
+├── profiles/
+│   └── default/
+│       ├── orchestrator.md
+│       ├── global-prompt.md
+│       └── agents/
+├── repos/
+│   └── owner_repo/
+│       ├── VALUE.md
+│       ├── memory.md
+│       ├── config.yaml
+│       └── agents/
+└── runtime/
+    └── owner_repo/
+        ├── queue/
+        ├── logs/
+        └── dispatch_receipts/
 ```
 
-Global config lives at `~/.githubclaw/` (webhook server settings, repo registry, secrets, scheduled events).
+GithubClaw now keeps both configuration and runtime state under `~/.githubclaw/`.
 
 ## Configuration
 
-- **VALUE.md** -- Your project's mission statement. Every agent reads this to align decisions with your goals.
-- **Agent prompts** -- Fully customizable in `.githubclaw/agents/`. Each file has YAML frontmatter (backend, git author, allowed tools) and a markdown instruction body. Your edits are never overwritten by upgrades.
-- **config.yaml** -- Per-repo overrides (allowed read paths, timeouts, etc.) in `.githubclaw/config.yaml`. Global settings in `~/.githubclaw/config.yaml`.
+- **Profiles** -- Shared prompts and agent definitions live under `~/.githubclaw/profiles/<profile>/`.
+- **Repo overrides** -- Per-repo VALUE, memory, config, and agent overrides live under `~/.githubclaw/repos/<owner_repo>/`.
+- **Runtime data** -- Queue, logs, receipts, and other operational artifacts live under `~/.githubclaw/runtime/<owner_repo>/`.
 - **Agent spawning** -- `claude-code` and `codex` use built-in Rust launch paths in the MVP. Repo-local spawn script overrides are not part of the runtime contract.
 
 ## Architecture

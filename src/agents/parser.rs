@@ -1,6 +1,6 @@
 //! Agent definition file parser.
 //!
-//! Parses YAML frontmatter from `.githubclaw/agents/*.md` files and extracts
+//! Parses YAML frontmatter from agent definition files and extracts
 //! configuration (backend, git author, tool permissions, timeout) plus the
 //! instruction body (markdown minus frontmatter).
 
@@ -86,7 +86,7 @@ struct RawToolPermissions {
 ///
 /// # Arguments
 ///
-/// * `path` - Path to the agent definition file (e.g. `.githubclaw/agents/coder.md`).
+/// * `path` - Path to the agent definition file.
 ///
 /// # Errors
 ///
@@ -177,54 +177,73 @@ fn parse_tools(
         .collect()
 }
 
-/// List all available agent type names by scanning `.githubclaw/agents/` directory.
+/// List all available agent type names by scanning repo override and profile agent directories.
 ///
 /// Returns stem names of all `.md` files found (e.g. `["coder", "qa", "reviewer"]`).
-pub fn list_agent_types(repo_root: &Path) -> Vec<String> {
-    let agents_dir = repo_root.join(".githubclaw").join("agents");
-    if !agents_dir.is_dir() {
-        return Vec::new();
-    }
+pub fn list_agent_types(
+    repo_name: &str,
+    githubclaw_home: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    let home = githubclaw_home
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::config::global_config_dir);
+    let repo_config = crate::config::RepoConfig::load_for_repo(repo_name, Some(&home))
+        .map_err(|e| format!("Failed to load repo config for '{}': {}", repo_name, e))?;
+    let profile_name = repo_config.profile;
+    let agent_dirs = [
+        crate::config::repo_agents_dir_from_home(&home, repo_name),
+        crate::config::profile_agents_dir_from_home(&home, &profile_name),
+    ];
 
-    let mut names: Vec<String> = std::fs::read_dir(&agents_dir)
-        .ok()
-        .into_iter()
-        .flatten()
+    let mut names: Vec<String> = agent_dirs
+        .iter()
+        .filter(|dir| dir.is_dir())
+        .flat_map(|dir| std::fs::read_dir(dir).ok().into_iter().flatten())
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-            } else {
-                None
-            }
+            (path.extension().and_then(|e| e.to_str()) == Some("md"))
+                .then_some(path)
+                .and_then(|path| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                })
         })
         .collect();
 
     names.sort();
-    names
+    names.dedup();
+    Ok(names)
 }
 
-/// Load an agent definition by type name from the repo's `.githubclaw/agents/` directory.
+/// Load an agent definition by type name from repo overrides or the selected profile.
 ///
-/// Falls back to built-in defaults if the repo doesn't have a custom definition.
+/// Falls back to built-in defaults if neither repo nor profile overrides exist.
 ///
 /// # Errors
 ///
-/// Returns an error if neither repo-local nor default definition exists.
+/// Returns an error if the repo cannot be resolved or no matching definition exists.
 pub fn load_agent_definition(
-    repo_root: &Path,
+    repo_name: &str,
     agent_type: &str,
+    githubclaw_home: Option<&Path>,
 ) -> Result<AgentDefinition, String> {
-    // Try repo-local first.
-    let repo_path = repo_root
-        .join(".githubclaw")
-        .join("agents")
+    let home = githubclaw_home
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::config::global_config_dir);
+    let repo_config = crate::config::RepoConfig::load_for_repo(repo_name, Some(&home))
+        .map_err(|e| format!("Failed to load repo config for '{}': {}", repo_name, e))?;
+    let repo_path = crate::config::repo_agents_dir_from_home(&home, repo_name)
         .join(format!("{}.md", agent_type));
     if repo_path.exists() {
         return parse_agent_file(&repo_path);
+    }
+
+    let profile_path = crate::config::profile_agents_dir_from_home(&home, &repo_config.profile)
+        .join(format!("{}.md", agent_type));
+    if profile_path.exists() {
+        return parse_agent_file(&profile_path);
     }
 
     // Fall back to built-in default.
@@ -234,9 +253,10 @@ pub fn load_agent_definition(
     }
 
     Err(format!(
-        "No agent definition found for '{}' in {} or built-in defaults",
+        "No agent definition found for '{}' in {}, {}, or built-in defaults",
         agent_type,
-        repo_path.display()
+        repo_path.display(),
+        profile_path.display(),
     ))
 }
 
@@ -255,7 +275,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn write_agent_file(dir: &Path, name: &str, content: &str) -> PathBuf {
-        let agents_dir = dir.join(".githubclaw").join("agents");
+        let agents_dir = dir.to_path_buf();
         fs::create_dir_all(&agents_dir).unwrap();
         let file_path = agents_dir.join(format!("{}.md", name));
         fs::write(&file_path, content).unwrap();
@@ -378,21 +398,25 @@ Instructions.
     #[test]
     fn list_agent_types_scans_directory() {
         let tmp = TempDir::new().unwrap();
-        write_agent_file(tmp.path(), "coder", "---\n---\nBody");
-        write_agent_file(tmp.path(), "reviewer", "---\n---\nBody");
-        write_agent_file(tmp.path(), "qa", "---\n---\nBody");
+        let repo_name = "owner/repo";
+        let repo_agents = crate::config::repo_agents_dir_from_home(tmp.path(), repo_name);
+        write_agent_file(&repo_agents, "coder", "---\n---\nBody");
+        write_agent_file(&repo_agents, "reviewer", "---\n---\nBody");
+        write_agent_file(&repo_agents, "qa", "---\n---\nBody");
 
-        let types = list_agent_types(tmp.path());
+        let types = list_agent_types(repo_name, Some(tmp.path())).unwrap();
         assert_eq!(types, vec!["coder", "qa", "reviewer"]);
     }
 
     #[test]
     fn load_agent_definition_from_repo_path() {
         let tmp = TempDir::new().unwrap();
+        let repo_name = "owner/repo";
         let content = "---\nbackend: claude-code\n---\n\nDo stuff.\n";
-        write_agent_file(tmp.path(), "coder", content);
+        let repo_agents = crate::config::repo_agents_dir_from_home(tmp.path(), repo_name);
+        write_agent_file(&repo_agents, "coder", content);
 
-        let def = load_agent_definition(tmp.path(), "coder").unwrap();
+        let def = load_agent_definition(repo_name, "coder", Some(tmp.path())).unwrap();
         assert_eq!(def.name, "coder");
         assert_eq!(def.backend, "claude-code");
     }
@@ -400,7 +424,7 @@ Instructions.
     #[test]
     fn missing_agent_file_returns_error() {
         let tmp = TempDir::new().unwrap();
-        let result = load_agent_definition(tmp.path(), "nonexistent");
+        let result = load_agent_definition("owner/repo", "nonexistent", Some(tmp.path()));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No agent definition found"));
     }

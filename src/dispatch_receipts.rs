@@ -28,9 +28,16 @@ pub struct DispatchReceiptStore {
 }
 
 impl DispatchReceiptStore {
-    pub fn new(repo_root: &Path) -> Self {
+    pub fn new(repo_name: &str) -> Self {
+        Self::with_home(repo_name, &crate::config::global_config_dir())
+    }
+
+    pub fn with_home(repo_name: &str, githubclaw_home: &Path) -> Self {
         Self {
-            dir: repo_root.join(".githubclaw").join("dispatch_receipts"),
+            dir: crate::config::dispatch_receipts_dir_for_repo_from_home(
+                githubclaw_home,
+                repo_name,
+            ),
         }
     }
 
@@ -127,7 +134,7 @@ mod tests {
     #[test]
     fn record_success_writes_receipt() {
         let tmp = TempDir::new().unwrap();
-        let store = DispatchReceiptStore::new(tmp.path());
+        let store = DispatchReceiptStore::with_home("owner/repo", tmp.path());
         let receipt = store
             .record_success("evt-1", "implementer", 42, "Fix it", None)
             .unwrap();

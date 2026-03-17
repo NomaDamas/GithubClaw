@@ -18,16 +18,35 @@ pub enum InteractiveBackend {
 }
 
 impl InteractiveBackend {
-    /// Resolve the interactive backend from repo-local agent definitions.
+    /// Resolve the interactive backend from global profile/repo config.
     ///
     /// Order of precedence:
-    /// 1. `.githubclaw/agents/orchestrator.md`
-    /// 2. `defaults/agents/orchestrator.md`
+    /// 1. `~/.githubclaw/repos/<repo>/config.yaml` -> selected profile
+    /// 2. `~/.githubclaw/profiles/<profile>/agents/orchestrator.md`
+    /// 3. built-in defaults
     /// 3. `codex`
     pub fn for_repo(repo_root: &Path) -> Self {
-        backend_from_agent_file(&repo_root.join(".githubclaw/agents/orchestrator.md"))
-            .or_else(|| backend_from_agent_file(&repo_root.join("defaults/agents/orchestrator.md")))
-            .unwrap_or(Self::Codex)
+        let Some(repo_name) = crate::config::detect_repo_name(repo_root) else {
+            return Self::Codex;
+        };
+        Self::for_repo_name(&repo_name, None)
+    }
+
+    pub fn for_repo_name(repo_name: &str, githubclaw_home: Option<&Path>) -> Self {
+        let home = githubclaw_home
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(crate::config::global_config_dir);
+        let profile = crate::config::RepoConfig::load_for_repo(repo_name, Some(&home))
+            .map(|cfg| cfg.profile)
+            .unwrap_or_else(|_| crate::config::DEFAULT_PROFILE_NAME.to_string());
+
+        backend_from_agent_file(
+            &crate::config::profile_agents_dir_from_home(&home, &profile).join("orchestrator.md"),
+        )
+        .or_else(|| {
+            backend_from_agent_file(&crate::agents::parser::defaults_dir().join("orchestrator.md"))
+        })
+        .unwrap_or(Self::Codex)
     }
 
     pub fn display_name(&self) -> &'static str {
@@ -236,10 +255,10 @@ mod tests {
     }
 
     #[test]
-    fn repo_local_orchestrator_backend_takes_precedence() {
+    fn repo_profile_orchestrator_backend_is_used() {
         let temp = TempDir::new().unwrap();
-        let repo_root = temp.path();
-        let agent_dir = repo_root.join(".githubclaw/agents");
+        let home = temp.path();
+        let agent_dir = crate::config::profile_agents_dir_from_home(home, "default");
         fs::create_dir_all(&agent_dir).unwrap();
         fs::write(
             agent_dir.join("orchestrator.md"),
@@ -248,51 +267,38 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            InteractiveBackend::for_repo(repo_root),
+            InteractiveBackend::for_repo_name("octocat/Hello-World", Some(home)),
             InteractiveBackend::Codex
         );
     }
 
     #[test]
-    fn default_orchestrator_backend_is_used_when_repo_has_no_local_orchestrator() {
+    fn repo_config_profile_selects_matching_orchestrator_backend() {
         let temp = TempDir::new().unwrap();
-        let repo_root = temp.path();
-        let agent_dir = repo_root.join(".githubclaw/agents");
-        let default_dir = repo_root.join("defaults/agents");
-        fs::create_dir_all(&agent_dir).unwrap();
-        fs::create_dir_all(&default_dir).unwrap();
+        let home = temp.path();
+        let repo_dir = crate::config::repo_dir_from_home(home, "octocat/Hello-World");
+        let profile_dir = crate::config::profile_agents_dir_from_home(home, "custom");
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(repo_dir.join("config.yaml"), "profile: custom\n").unwrap();
         fs::write(
-            agent_dir.join("coder.md"),
-            "---\nbackend: codex\n---\n\n# Coder\n",
-        )
-        .unwrap();
-        fs::write(
-            default_dir.join("orchestrator.md"),
+            profile_dir.join("orchestrator.md"),
             "---\nbackend: claude-code\n---\n\n# Orchestrator\n",
         )
         .unwrap();
 
         assert_eq!(
-            InteractiveBackend::for_repo(repo_root),
+            InteractiveBackend::for_repo_name("octocat/Hello-World", Some(home)),
             InteractiveBackend::ClaudeCode
         );
     }
 
     #[test]
-    fn default_orchestrator_backend_is_used_when_repo_has_no_agent_overrides() {
+    fn codex_is_used_when_profile_or_default_is_missing() {
         let temp = TempDir::new().unwrap();
-        let repo_root = temp.path();
-        let default_dir = repo_root.join("defaults/agents");
-        fs::create_dir_all(&default_dir).unwrap();
-        fs::write(
-            default_dir.join("orchestrator.md"),
-            "---\nbackend: claude-code\n---\n\n# Orchestrator\n",
-        )
-        .unwrap();
-
         assert_eq!(
-            InteractiveBackend::for_repo(repo_root),
-            InteractiveBackend::ClaudeCode
+            InteractiveBackend::for_repo_name("octocat/Hello-World", Some(temp.path())),
+            InteractiveBackend::Codex
         );
     }
 }

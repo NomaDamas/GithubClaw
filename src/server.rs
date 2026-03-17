@@ -178,7 +178,6 @@ fn annotate_fork_status(mut payload: Value) -> Value {
 /// Must be called with the queues mutex already locked.
 pub(crate) fn get_or_create_queue<'a>(
     queues: &'a mut HashMap<String, DiskPersistedQueue>,
-    registry: &HashMap<String, RegistryEntry>,
     githubclaw_home: &Path,
     repo_full_name: &str,
 ) -> std::io::Result<&'a mut DiskPersistedQueue> {
@@ -186,18 +185,8 @@ pub(crate) fn get_or_create_queue<'a>(
     match queues.entry(key) {
         Entry::Occupied(entry) => Ok(entry.into_mut()),
         Entry::Vacant(entry) => {
-            let queue_dir = if let Some(registry_entry) = registry.get(repo_full_name) {
-                if !registry_entry.local_path.is_empty() {
-                    PathBuf::from(&registry_entry.local_path)
-                        .join(".githubclaw")
-                        .join("queue")
-                } else {
-                    fallback_queue_dir(githubclaw_home, repo_full_name)
-                }
-            } else {
-                fallback_queue_dir(githubclaw_home, repo_full_name)
-            };
-
+            let queue_dir =
+                crate::config::queue_dir_for_repo_from_home(githubclaw_home, repo_full_name);
             let queue =
                 DiskPersistedQueue::new(&queue_dir, crate::constants::DEFAULT_QUEUE_MAX_RETRY)?;
             Ok(entry.insert(queue))
@@ -259,17 +248,6 @@ async fn ensure_repo_registered(
     );
 
     Some(entry)
-}
-
-fn fallback_queue_dir(githubclaw_home: &Path, repo_full_name: &str) -> PathBuf {
-    let slug = repo_full_name.replace('/', "_");
-    let dir = githubclaw_home.join("queues").join(slug).join("queue");
-    warn!(
-        "No local_path in registry for {}, falling back to {}",
-        repo_full_name,
-        dir.display()
-    );
-    dir
 }
 
 fn is_process_alive(pid: u32) -> bool {
@@ -416,19 +394,13 @@ async fn webhook_handler(
 
     // 6. Enqueue
     let mut queues = state.queues.lock().await;
-    let registry = registry_snapshot(&state).await;
-    let queue = get_or_create_queue(
-        &mut queues,
-        &registry,
-        &state.githubclaw_home,
-        &repo_full_name,
-    )
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Queue error: {}", e),
-        )
-    })?;
+    let queue =
+        get_or_create_queue(&mut queues, &state.githubclaw_home, &repo_full_name).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Queue error: {}", e),
+            )
+        })?;
 
     queue
         .enqueue_with_id(payload, &event_label, Some(delivery_id))
@@ -471,8 +443,7 @@ pub async fn bootstrap_repo(
     // Check if queue already has events
     if !force {
         let mut queues = state.queues.lock().await;
-        let registry = registry_snapshot(state).await;
-        let queue = get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+        let queue = get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name)
             .map_err(|e| format!("Queue creation error: {}", e))?;
 
         if queue.size() > 0 {
@@ -508,10 +479,8 @@ pub async fn bootstrap_repo(
             serde_json::from_slice(&issue_output.stdout).unwrap_or_default();
         if !issues.is_empty() {
             let mut queues = state.queues.lock().await;
-            let registry = registry_snapshot(state).await;
-            let queue =
-                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
-                    .map_err(|e| format!("Queue creation error: {}", e))?;
+            let queue = get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name)
+                .map_err(|e| format!("Queue creation error: {}", e))?;
 
             for issue in &issues {
                 queue
@@ -563,10 +532,8 @@ pub async fn bootstrap_repo(
             serde_json::from_slice(&pr_output.stdout).unwrap_or_default();
         if !prs.is_empty() {
             let mut queues = state.queues.lock().await;
-            let registry = registry_snapshot(state).await;
-            let queue =
-                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
-                    .map_err(|e| format!("Queue creation error: {}", e))?;
+            let queue = get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name)
+                .map_err(|e| format!("Queue creation error: {}", e))?;
 
             for pr in &prs {
                 queue
@@ -642,8 +609,12 @@ async fn execute_dispatch(
         .ok_or_else(|| format!("Repo {} not in registry", repo_full_name))?;
     let repo_root = Path::new(&entry.local_path);
 
-    // 2. Validate agent_type against .githubclaw/agents/ (or built-in defaults).
-    let agent_def = load_agent_definition(repo_root, &dispatch.agent_type)?;
+    // 2. Validate agent_type against repo overrides / global profiles (or built-in defaults).
+    let agent_def = load_agent_definition(
+        repo_full_name,
+        &dispatch.agent_type,
+        Some(&state.githubclaw_home),
+    )?;
 
     // 3. Check the fork PR gate — block execution-capable agents on unapproved fork PRs.
     if !check_fork_pr_gate(event_payload, &dispatch.agent_type) {
@@ -673,7 +644,7 @@ async fn execute_dispatch(
     //    deletes the temp file. The agent subprocess reads the file asynchronously
     //    after we spawn it. We leak the assembler and schedule cleanup after the
     //    agent process exits.
-    let mut assembler = PromptAssembler::new(repo_root);
+    let mut assembler = PromptAssembler::with_home(repo_full_name, &state.githubclaw_home);
     let prompt_file = assembler
         .assemble(&agent_def, &dispatch.task_context)
         .map_err(|e| format!("Prompt assembly failed: {}", e))?;
@@ -880,13 +851,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         // 1. Recover any orphaned inflight event and peek the next queued event.
         let peeked = {
             let mut queues = state.queues.lock().await;
-            let registry = registry_snapshot(state).await;
-            let queue = match get_or_create_queue(
-                &mut queues,
-                &registry,
-                &state.githubclaw_home,
-                repo_name,
-            ) {
+            let queue = match get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name) {
                 Ok(q) => q,
                 Err(e) => {
                     error!(repo = %repo_name, "Failed to get queue: {}", e);
@@ -937,10 +902,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         {
             // Silently dequeue and skip
             let mut queues = state.queues.lock().await;
-            let registry = registry_snapshot(state).await;
-            if let Ok(q) =
-                get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
-            {
+            if let Ok(q) = get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name) {
                 let _ = q.dequeue();
             }
             continue;
@@ -1099,13 +1061,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 
         let mut reserved_event = {
             let mut queues = state.queues.lock().await;
-            let registry = registry_snapshot(state).await;
-            let queue = match get_or_create_queue(
-                &mut queues,
-                &registry,
-                &state.githubclaw_home,
-                repo_name,
-            ) {
+            let queue = match get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name) {
                 Ok(q) => q,
                 Err(e) => {
                     error!(repo = %repo_name, "Failed to get queue for reserve: {}", e);
@@ -1150,20 +1106,18 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             crate::constants::DEFAULT_AGENT_MAX_TURNS,
         );
         // Load orchestrator agent def to get full env
-        let orch_def_content = std::fs::read_to_string(
-            std::path::Path::new(&repo_dir).join(".githubclaw/agents/orchestrator.md"),
-        )
-        .unwrap_or_else(|_| include_str!("../defaults/agents/orchestrator.md").to_string());
         let tmp_agent_dir = std::env::temp_dir().join("githubclaw-orch");
         let _ = std::fs::create_dir_all(&tmp_agent_dir);
-        let tmp_agent_file = tmp_agent_dir.join("orchestrator.md");
-        let _ = std::fs::write(&tmp_agent_file, &orch_def_content);
-        let orch_def = match crate::agents::parser::parse_agent_file(&tmp_agent_file) {
+        let orch_def = match crate::agents::parser::load_agent_definition(
+            repo_name,
+            "orchestrator",
+            Some(&state.githubclaw_home),
+        ) {
             Ok(def) => def,
             Err(err) => {
                 error!(
                     repo = %repo_name,
-                    "Failed to parse orchestrator agent definition: {}",
+                    "Failed to load orchestrator agent definition: {}",
                     err
                 );
                 let _ = std::fs::remove_file(&prompt_file);
@@ -1235,13 +1189,9 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 
                 {
                     let mut queues = state.queues.lock().await;
-                    let registry = registry_snapshot(state).await;
-                    if let Ok(queue) = get_or_create_queue(
-                        &mut queues,
-                        &registry,
-                        &state.githubclaw_home,
-                        repo_name,
-                    ) {
+                    if let Ok(queue) =
+                        get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name)
+                    {
                         if let Err(err) = queue.attach_processor_pid(&mut reserved_event, pid) {
                             warn!(
                                 repo = %repo_name,
@@ -1271,13 +1221,9 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                                 "Orchestrator completed successfully"
                             );
                             let mut queues = state.queues.lock().await;
-                            let registry = registry_snapshot(state).await;
-                            if let Ok(queue) = get_or_create_queue(
-                                &mut queues,
-                                &registry,
-                                &state.githubclaw_home,
-                                repo_name,
-                            ) {
+                            if let Ok(queue) =
+                                get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name)
+                            {
                                 if let Err(err) = queue.ack_reserved(&reserved_event) {
                                     error!(
                                         repo = %repo_name,
@@ -1299,13 +1245,9 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                             );
                             state.rate_limiter.report_orchestrator_rate_limit();
                             let mut queues = state.queues.lock().await;
-                            let registry = registry_snapshot(state).await;
-                            if let Ok(queue) = get_or_create_queue(
-                                &mut queues,
-                                &registry,
-                                &state.githubclaw_home,
-                                repo_name,
-                            ) {
+                            if let Ok(queue) =
+                                get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name)
+                            {
                                 if let Err(err) = queue.nack_reserved(&mut reserved_event) {
                                     error!(
                                         repo = %repo_name,
@@ -1349,13 +1291,9 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                         state.rate_limiter.report_orchestrator_rate_limit();
 
                         let mut queues = state.queues.lock().await;
-                        let registry = registry_snapshot(state).await;
-                        if let Ok(queue) = get_or_create_queue(
-                            &mut queues,
-                            &registry,
-                            &state.githubclaw_home,
-                            repo_name,
-                        ) {
+                        if let Ok(queue) =
+                            get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name)
+                        {
                             if let Err(err) = queue.nack_reserved(&mut reserved_event) {
                                 error!(
                                     repo = %repo_name,
@@ -1398,9 +1336,8 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                 );
                 state.rate_limiter.report_orchestrator_rate_limit();
                 let mut queues = state.queues.lock().await;
-                let registry = registry_snapshot(state).await;
                 if let Ok(queue) =
-                    get_or_create_queue(&mut queues, &registry, &state.githubclaw_home, repo_name)
+                    get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name)
                 {
                     if let Err(err) = queue.nack_reserved(&mut reserved_event) {
                         error!(
@@ -1455,7 +1392,7 @@ mod tests {
                 socket_path: String::new(),
             },
         );
-        let scheduler_path = tmp.path().join(".githubclaw").join("scheduled.json");
+        let scheduler_path = tmp.path().join("scheduled.json");
         Arc::new(ServerState {
             webhook_secret: TEST_SECRET.to_string(),
             registry: RwLock::new(registry),
@@ -1785,12 +1722,12 @@ mod tests {
         );
         let mut queues = HashMap::new();
 
-        let queue = get_or_create_queue(&mut queues, &registry, tmp.path(), "owner/repo").unwrap();
+        let queue = get_or_create_queue(&mut queues, tmp.path(), "owner/repo").unwrap();
         queue
             .enqueue(serde_json::json!({"ok": true}), "test")
             .unwrap();
 
-        assert!(repo_root.join(".githubclaw").join("queue").exists());
+        assert!(crate::config::queue_dir_for_repo_from_home(tmp.path(), "owner/repo").exists());
         assert_eq!(queues.get("owner/repo").unwrap().size(), 1);
     }
 
@@ -1807,17 +1744,12 @@ mod tests {
         );
         let mut queues = HashMap::new();
 
-        let queue = get_or_create_queue(&mut queues, &registry, tmp.path(), "owner/repo").unwrap();
+        let queue = get_or_create_queue(&mut queues, tmp.path(), "owner/repo").unwrap();
         queue
             .enqueue(serde_json::json!({"ok": true}), "test")
             .unwrap();
 
-        assert!(tmp
-            .path()
-            .join("queues")
-            .join("owner_repo")
-            .join("queue")
-            .exists());
+        assert!(crate::config::queue_dir_for_repo_from_home(tmp.path(), "owner/repo").exists());
         assert_eq!(queues.get("owner/repo").unwrap().size(), 1);
     }
 
@@ -1903,8 +1835,11 @@ mod tests {
     #[tokio::test]
     async fn test_execute_dispatch_rejects_unknown_agent_type() {
         let tmp = TempDir::new().unwrap();
-        // Create the .githubclaw/agents dir but don't add agent defs.
-        std::fs::create_dir_all(tmp.path().join(".githubclaw").join("agents")).unwrap();
+        std::fs::create_dir_all(crate::config::profile_agents_dir_from_home(
+            tmp.path(),
+            crate::config::DEFAULT_PROFILE_NAME,
+        ))
+        .unwrap();
 
         let state = make_test_state(&tmp);
         let dispatch = DispatchAction {
@@ -1936,7 +1871,10 @@ mod tests {
     async fn test_execute_dispatch_blocks_unapproved_fork_pr() {
         let tmp = TempDir::new().unwrap();
         // Create a valid agent definition so we get past the agent validation step.
-        let agents_dir = tmp.path().join(".githubclaw").join("agents");
+        let agents_dir = crate::config::profile_agents_dir_from_home(
+            tmp.path(),
+            crate::config::DEFAULT_PROFILE_NAME,
+        );
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(
             agents_dir.join("coder.md"),

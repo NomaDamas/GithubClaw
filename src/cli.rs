@@ -20,8 +20,7 @@ const DEFAULT_ORCHESTRATOR_MD: &str = include_str!("../defaults/orchestrator.md"
 const DEFAULT_GLOBAL_PROMPT_MD: &str = include_str!("../defaults/global_prompt.md");
 const DEFAULT_VALUE_MD: &str = include_str!("../defaults/value.md");
 const DEFAULT_MEMORY_MD: &str = include_str!("../defaults/memory.md");
-const DEFAULT_GITIGNORE: &str = "secrets/\nqueue/\nlogs/\nmemory.md\n";
-const DEFAULT_REPO_CONFIG_YAML: &str = "# GithubClaw per-repo configuration.\n# See https://github.com/GithubClaw/githubclaw for options.\n";
+const DEFAULT_REPO_CONFIG_YAML: &str = "# GithubClaw per-repo configuration.\nprofile: default\n";
 
 // Agent definitions embedded at compile time.
 const DEFAULT_AGENT_ORCHESTRATOR: &str = include_str!("../defaults/agents/orchestrator.md");
@@ -56,7 +55,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Scaffold the .githubclaw/ directory in the current repository
+    /// Initialize ~/.githubclaw profile/repo/runtime layout for the current repository
     Init,
     /// Re-scan the current repository's open issues and PRs into the bootstrap queue
     Bootstrap,
@@ -158,51 +157,70 @@ fn cmd_init() {
         }
     };
 
-    let claw_dir = repo_root.join(".githubclaw");
+    let owner_repo = detect_github_remote(&repo_root).unwrap_or_else(|| {
+        eprintln!("Error: cannot detect GitHub remote. Configure origin before running init.");
+        std::process::exit(1);
+    });
 
-    if claw_dir.exists() {
-        println!(
-            "Directory {} already exists. Skipping existing files.",
-            claw_dir.display()
-        );
-    }
+    let global_dir = global_config_dir();
+    let profile_dir =
+        crate::config::profile_dir_from_home(&global_dir, crate::config::DEFAULT_PROFILE_NAME);
+    let profile_agents_dir = crate::config::profile_agents_dir_from_home(
+        &global_dir,
+        crate::config::DEFAULT_PROFILE_NAME,
+    );
+    let repo_dir = crate::config::repo_dir_from_home(&global_dir, &owner_repo);
+    let repo_agents_dir = crate::config::repo_agents_dir_from_home(&global_dir, &owner_repo);
+    let runtime_dir = crate::config::repo_runtime_dir_from_home(&global_dir, &owner_repo);
+    let queue_dir = runtime_dir.join("queue").join("dead");
+    let logs_dir = runtime_dir.join("logs");
 
-    // Create directory structure
-    let agents_dir = claw_dir.join("agents");
-    let ai_dir = claw_dir.join("ai_instructions");
-    let logs_dir = claw_dir.join("logs");
-    let queue_dir = claw_dir.join("queue").join("dead");
-
-    for d in [&agents_dir, &ai_dir, &logs_dir, &queue_dir] {
+    for d in [
+        &profile_dir,
+        &profile_agents_dir,
+        &repo_dir,
+        &repo_agents_dir,
+        &queue_dir,
+        &logs_dir,
+    ] {
         fs::create_dir_all(d).unwrap_or_else(|e| {
             eprintln!("Error creating directory {}: {e}", d.display());
             std::process::exit(1);
         });
     }
 
-    // Files to write (path -> content). Prompt/config files are user-owned and
-    // are never overwritten.
+    // Files to write (path -> content). User-owned files are never overwritten.
     let files: Vec<(PathBuf, &str)> = vec![
-        (claw_dir.join("orchestrator.md"), DEFAULT_ORCHESTRATOR_MD),
-        (claw_dir.join("global-prompt.md"), DEFAULT_GLOBAL_PROMPT_MD),
-        (claw_dir.join("VALUE.md"), DEFAULT_VALUE_MD),
-        (claw_dir.join("memory.md"), DEFAULT_MEMORY_MD),
-        (claw_dir.join(".gitignore"), DEFAULT_GITIGNORE),
-        (claw_dir.join("config.yaml"), DEFAULT_REPO_CONFIG_YAML),
-        // Agent definition files (6 V2 agents)
+        (profile_dir.join("orchestrator.md"), DEFAULT_ORCHESTRATOR_MD),
         (
-            agents_dir.join("orchestrator.md"),
+            profile_dir.join("global-prompt.md"),
+            DEFAULT_GLOBAL_PROMPT_MD,
+        ),
+        (repo_dir.join("VALUE.md"), DEFAULT_VALUE_MD),
+        (repo_dir.join("memory.md"), DEFAULT_MEMORY_MD),
+        (repo_dir.join("config.yaml"), DEFAULT_REPO_CONFIG_YAML),
+        (
+            profile_agents_dir.join("orchestrator.md"),
             DEFAULT_AGENT_ORCHESTRATOR,
         ),
-        (agents_dir.join("implementer.md"), DEFAULT_AGENT_IMPLEMENTER),
-        (agents_dir.join("verifier.md"), DEFAULT_AGENT_VERIFIER),
-        (agents_dir.join("reviewer.md"), DEFAULT_AGENT_REVIEWER),
         (
-            agents_dir.join("vision_gap_analyst.md"),
+            profile_agents_dir.join("implementer.md"),
+            DEFAULT_AGENT_IMPLEMENTER,
+        ),
+        (
+            profile_agents_dir.join("verifier.md"),
+            DEFAULT_AGENT_VERIFIER,
+        ),
+        (
+            profile_agents_dir.join("reviewer.md"),
+            DEFAULT_AGENT_REVIEWER,
+        ),
+        (
+            profile_agents_dir.join("vision_gap_analyst.md"),
             DEFAULT_AGENT_VISION_GAP_ANALYST,
         ),
         (
-            agents_dir.join("bug_reproducer.md"),
+            profile_agents_dir.join("bug_reproducer.md"),
             DEFAULT_AGENT_BUG_REPRODUCER,
         ),
     ];
@@ -225,7 +243,8 @@ fn cmd_init() {
         }
     }
 
-    println!("Initialized .githubclaw/ in {}", repo_root.display());
+    println!("Initialized GithubClaw global layout for {}", owner_repo);
+    println!("  Global home: {}", global_dir.display());
     println!("  Created {created} files, skipped {skipped} existing files.");
     println!();
 
@@ -241,18 +260,13 @@ fn cmd_init() {
     // (d) Pre-flight check for gh CLI
     preflight_gh();
 
-    // (e) Guidance on what to git add
-    println!();
-    println!("To track agent configs in git:");
-    println!(
-        "  git add .githubclaw/agents/ .githubclaw/VALUE.md \
-         .githubclaw/global-prompt.md .githubclaw/orchestrator.md"
-    );
-
-    // (f) Next steps
+    // (e) Next steps
     println!();
     println!("Next steps:");
-    println!("  1. Edit .githubclaw/VALUE.md with your project mission");
+    println!(
+        "  1. Edit {} with your project mission",
+        crate::config::repo_value_path_from_home(&global_dir, &owner_repo).display()
+    );
     println!("  2. Create a GitHub App and set webhook URL + secret");
     println!("  3. Set up a tunnel (cloudflare tunnel, ngrok, etc.)");
     println!("  4. githubclaw start");
@@ -734,8 +748,8 @@ fn cmd_status() {
         println!("  {repo_name}");
         println!("    Path: {local_path}");
 
-        // Show queue size if queue dir exists
-        let queue_dir = Path::new(local_path).join(".githubclaw").join("queue");
+        // Show queue size from global runtime
+        let queue_dir = crate::config::queue_dir_for_repo(repo_name);
         if queue_dir.exists() {
             let queue_count = fs::read_dir(&queue_dir)
                 .map(|entries| {
@@ -902,10 +916,8 @@ fn cmd_serve(host: &str, port: u16) {
                             let st = Arc::clone(&sched_state_inner);
                             async move {
                                 let mut queues = st.queues.lock().await;
-                                let registry = st.registry.read().await;
                                 let queue = crate::server::get_or_create_queue(
                                     &mut queues,
-                                    &registry,
                                     &st.githubclaw_home,
                                     &repo,
                                 )
@@ -998,17 +1010,7 @@ fn home_dir() -> PathBuf {
 ///   - `https://github.com/owner/repo.git`
 ///   - `https://github.com/owner/repo`
 fn parse_github_remote(url: &str) -> Option<String> {
-    let re_ssh = regex::Regex::new(r"^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$").ok()?;
-    if let Some(caps) = re_ssh.captures(url) {
-        return Some(format!("{}/{}", &caps[1], &caps[2]));
-    }
-
-    let re_https = regex::Regex::new(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?$").ok()?;
-    if let Some(caps) = re_https.captures(url) {
-        return Some(format!("{}/{}", &caps[1], &caps[2]));
-    }
-
-    None
+    crate::config::parse_github_remote(url)
 }
 
 /// Auto-register the repo in `~/.githubclaw/registry.json`.
@@ -1293,16 +1295,7 @@ fn health_check(port: u16, log_path: &Path) {
 
 /// Detect the GitHub owner/repo from the current git remote.
 fn detect_github_remote(repo_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    parse_github_remote(&url)
+    crate::config::detect_repo_name(repo_root)
 }
 
 fn runtime_timestamp() -> String {
@@ -1358,7 +1351,7 @@ fn cmd_dispatch(
         std::process::exit(1);
     });
 
-    let receipt_store = DispatchReceiptStore::new(&repo_root);
+    let receipt_store = DispatchReceiptStore::new(&repo_name);
     let dispatch_event_id = event_id_arg.map(ToString::to_string).or_else(|| {
         std::env::var("GITHUBCLAW_EVENT_ID")
             .ok()
@@ -1434,25 +1427,17 @@ fn cmd_dispatch(
     }
     extra_env.insert("GITHUBCLAW_REPO".into(), repo_name.clone());
 
-    // Load agent definition: write to temp file, then parse
-    let agent_def_content = load_agent_definition(agent_type, &repo_root);
-    let tmp_dir = std::env::temp_dir().join("githubclaw-dispatch");
-    fs::create_dir_all(&tmp_dir).unwrap_or_default();
-    let agent_file = tmp_dir.join(format!("{}.md", agent_type));
-    fs::write(&agent_file, &agent_def_content).unwrap_or_else(|e| {
-        eprintln!("Error writing temp agent file: {}", e);
-        std::process::exit(1);
-    });
-    let agent_def = match crate::agents::parser::parse_agent_file(&agent_file) {
+    let agent_def = match crate::agents::parser::load_agent_definition(&repo_name, agent_type, None)
+    {
         Ok(def) => def,
         Err(e) => {
-            eprintln!("Error parsing agent definition for '{}': {}", agent_type, e);
+            eprintln!("Error loading agent definition for '{}': {}", agent_type, e);
             std::process::exit(1);
         }
     };
 
     // Assemble prompt
-    let mut prompt_assembler = crate::agents::prompt_assembler::PromptAssembler::new(&repo_root);
+    let mut prompt_assembler = crate::agents::prompt_assembler::PromptAssembler::new(&repo_name);
     let prompt_file = match prompt_assembler.assemble(&agent_def, prompt) {
         Ok(path) => path,
         Err(e) => {
@@ -1542,35 +1527,6 @@ fn cmd_dispatch(
             );
             let _ = session_store.save_runtime_snapshot(&repo_name, &runtime_snapshot);
             eprintln!("Error spawning agent '{}': {}", agent_type, e);
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Load an agent definition, preferring repo-local over embedded defaults.
-fn load_agent_definition(agent_type: &str, repo_root: &Path) -> String {
-    // Check repo-local agents directory first
-    let local_path = repo_root
-        .join(".githubclaw")
-        .join("agents")
-        .join(format!("{}.md", agent_type));
-    if local_path.exists() {
-        return fs::read_to_string(&local_path).unwrap_or_default();
-    }
-
-    // Fall back to embedded defaults
-    match agent_type {
-        "orchestrator" => DEFAULT_AGENT_ORCHESTRATOR.to_string(),
-        "implementer" => DEFAULT_AGENT_IMPLEMENTER.to_string(),
-        "verifier" => DEFAULT_AGENT_VERIFIER.to_string(),
-        "reviewer" => DEFAULT_AGENT_REVIEWER.to_string(),
-        "vision-gap-analyst" => DEFAULT_AGENT_VISION_GAP_ANALYST.to_string(),
-        "bug-reproducer" => DEFAULT_AGENT_BUG_REPRODUCER.to_string(),
-        _ => {
-            eprintln!(
-                "Error: no embedded definition for agent type '{}'",
-                agent_type
-            );
             std::process::exit(1);
         }
     }
