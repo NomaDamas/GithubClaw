@@ -27,25 +27,6 @@ impl AgentSpawner {
         }
     }
 
-    /// Locate an optional spawn script for the given backend.
-    ///
-    /// Looks for `.githubclaw/spawn_claude.sh` or `.githubclaw/spawn_codex.sh`
-    /// under the repo root, matching the spec and the Python implementation.
-    /// Returns `None` if the script does not exist.
-    fn get_spawn_script(&self, backend: &str) -> Option<PathBuf> {
-        let script_name = match backend {
-            "claude-code" => "spawn_claude.sh",
-            "codex" => "spawn_codex.sh",
-            _ => return None,
-        };
-        let script = self.repo_root.join(".githubclaw").join(script_name);
-        if script.exists() {
-            Some(script)
-        } else {
-            None
-        }
-    }
-
     /// Build the full set of environment variables for an agent subprocess.
     ///
     /// Sets git identity, tool permissions, prompt/task info, GithubClaw
@@ -174,50 +155,48 @@ impl AgentSpawner {
     pub fn build_command(
         &self,
         agent_def: &AgentDefinition,
-        prompt_file: &Path,
-        task_prompt: &str,
+        _prompt_file: &Path,
+        _task_prompt: &str,
     ) -> Result<Vec<String>, String> {
-        // If a spawn script override exists, use it. All config is passed via
-        // environment variables (build_env), so no extra CLI args are needed.
-        if let Some(script_path) = self.get_spawn_script(&agent_def.backend) {
-            return Ok(vec![
-                "bash".to_string(),
-                script_path.to_string_lossy().into_owned(),
-            ]);
-        }
+        self.build_inline_command(&agent_def.backend, false)
+    }
 
-        let prompt_path = prompt_file.to_string_lossy().into_owned();
+    /// Build the command for a resumed Claude orchestrator session.
+    pub fn build_resume_command(&self, agent_def: &AgentDefinition) -> Result<Vec<String>, String> {
+        self.build_inline_command(&agent_def.backend, true)
+    }
 
-        match agent_def.backend.as_str() {
+    fn build_inline_command(
+        &self,
+        backend: &str,
+        include_resume: bool,
+    ) -> Result<Vec<String>, String> {
+        let shell = match backend {
             "claude-code" => {
-                let mut cmd = vec![
-                    "claude".to_string(),
-                    "-p".to_string(),
-                    "--prompt-file".to_string(),
-                    prompt_path,
-                    "--max-turns".to_string(),
-                    self.max_turns.to_string(),
-                ];
-                if !task_prompt.is_empty() {
-                    cmd.push("--task".to_string());
-                    cmd.push(task_prompt.to_string());
+                let mut command = concat!(
+                    "cat \"$PROMPT_FILE\" | ",
+                    "claude -p ",
+                    "--dangerously-skip-permissions ",
+                    "--allowedTools \"$ALLOWED_TOOLS\" ",
+                    "--disallowedTools \"$DISALLOWED_TOOLS\" ",
+                    "--max-turns \"$MAX_TURNS\""
+                )
+                .to_string();
+                if include_resume {
+                    command.push_str(" --resume \"$GITHUBCLAW_SESSION_NAME\"");
                 }
-                Ok(cmd)
+                command
             }
-            "codex" => {
-                let mut cmd = vec![
-                    "codex".to_string(),
-                    "--prompt-file".to_string(),
-                    prompt_path,
-                ];
-                if !task_prompt.is_empty() {
-                    cmd.push("--task".to_string());
-                    cmd.push(task_prompt.to_string());
-                }
-                Ok(cmd)
-            }
-            other => Err(format!("unknown backend: {}", other)),
-        }
+            "codex" => concat!(
+                "cat \"$PROMPT_FILE\" | ",
+                "codex exec - ",
+                "--dangerously-bypass-approvals-and-sandbox"
+            )
+            .to_string(),
+            other => return Err(format!("unknown backend: {}", other)),
+        };
+
+        Ok(vec!["bash".to_string(), "-lc".to_string(), shell])
     }
 
     // spawn() will be async in the real implementation.
@@ -340,13 +319,12 @@ mod tests {
 
         let cmd = spawner.build_command(&def, &prompt, "fix the bug").unwrap();
 
-        assert_eq!(cmd[0], "claude");
-        assert!(cmd.contains(&"-p".to_string()));
-        assert!(cmd.contains(&"--prompt-file".to_string()));
-        assert!(cmd.contains(&"--max-turns".to_string()));
-        assert!(cmd.contains(&"200".to_string()));
-        assert!(cmd.contains(&"--task".to_string()));
-        assert!(cmd.contains(&"fix the bug".to_string()));
+        assert_eq!(cmd[0], "bash");
+        assert_eq!(cmd[1], "-lc");
+        assert!(cmd[2].contains("cat \"$PROMPT_FILE\" | claude -p"));
+        assert!(cmd[2].contains("--max-turns \"$MAX_TURNS\""));
+        assert!(!cmd[2].contains("--prompt-file"));
+        assert!(!cmd[2].contains("--task"));
     }
 
     // 6. build_command for codex backend
@@ -361,13 +339,12 @@ mod tests {
             .build_command(&def, &prompt, "implement feature")
             .unwrap();
 
-        assert_eq!(cmd[0], "codex");
-        assert!(cmd.contains(&"--prompt-file".to_string()));
-        assert!(cmd.contains(&"--task".to_string()));
-        assert!(cmd.contains(&"implement feature".to_string()));
-        // codex should NOT have -p or --max-turns
-        assert!(!cmd.contains(&"-p".to_string()));
-        assert!(!cmd.contains(&"--max-turns".to_string()));
+        assert_eq!(cmd[0], "bash");
+        assert_eq!(cmd[1], "-lc");
+        assert!(cmd[2].contains("cat \"$PROMPT_FILE\" | codex exec -"));
+        assert!(cmd[2].contains("--dangerously-bypass-approvals-and-sandbox"));
+        assert!(!cmd[2].contains("--prompt-file"));
+        assert!(!cmd[2].contains("--task"));
     }
 
     // 7. build_command for unknown backend returns error
@@ -383,41 +360,14 @@ mod tests {
         assert!(result.unwrap_err().contains("unknown backend"));
     }
 
-    // 8. get_spawn_script returns None when no script exists
     #[test]
-    fn get_spawn_script_returns_none_when_missing() {
-        let tmp = TempDir::new().unwrap();
-        let spawner = AgentSpawner::new(tmp.path(), 100);
-
-        assert!(spawner.get_spawn_script("claude-code").is_none());
-        assert!(spawner.get_spawn_script("codex").is_none());
-    }
-
-    // 9. get_spawn_script returns path when script exists
-    #[test]
-    fn get_spawn_script_returns_path_when_exists() {
+    fn build_command_ignores_repo_local_spawn_scripts() {
         let tmp = TempDir::new().unwrap();
         let claw_dir = tmp.path().join(".githubclaw");
         std::fs::create_dir_all(&claw_dir).unwrap();
 
         let script_path = claw_dir.join("spawn_claude.sh");
-        std::fs::write(&script_path, "#!/bin/bash\necho hello").unwrap();
-
-        let spawner = AgentSpawner::new(tmp.path(), 100);
-        let result = spawner.get_spawn_script("claude-code");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), script_path);
-    }
-
-    // 10. build_command uses spawn script override when present
-    #[test]
-    fn build_command_uses_spawn_script_override() {
-        let tmp = TempDir::new().unwrap();
-        let claw_dir = tmp.path().join(".githubclaw");
-        std::fs::create_dir_all(&claw_dir).unwrap();
-
-        let script_path = claw_dir.join("spawn_claude.sh");
-        std::fs::write(&script_path, "#!/bin/bash\nexec claude").unwrap();
+        std::fs::write(&script_path, "#!/bin/bash\nexit 99").unwrap();
 
         let spawner = AgentSpawner::new(tmp.path(), 200);
         let def = make_agent_def("claude-code");
@@ -425,7 +375,21 @@ mod tests {
 
         let cmd = spawner.build_command(&def, &prompt, "fix the bug").unwrap();
         assert_eq!(cmd[0], "bash");
-        assert_eq!(cmd[1], script_path.to_string_lossy().as_ref());
-        assert_eq!(cmd.len(), 2);
+        assert_eq!(cmd[1], "-lc");
+        assert!(cmd[2].contains("cat \"$PROMPT_FILE\" | claude -p"));
+    }
+
+    #[test]
+    fn build_resume_command_claude_adds_resume_flag() {
+        let tmp = TempDir::new().unwrap();
+        let spawner = AgentSpawner::new(tmp.path(), 42);
+        let def = make_agent_def("claude-code");
+
+        let cmd = spawner.build_resume_command(&def).unwrap();
+
+        assert_eq!(cmd[0], "bash");
+        assert_eq!(cmd[1], "-lc");
+        assert!(cmd[2].contains("--resume \"$GITHUBCLAW_SESSION_NAME\""));
+        assert!(!cmd[2].contains("--prompt-file"));
     }
 }

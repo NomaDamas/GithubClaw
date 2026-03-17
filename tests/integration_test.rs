@@ -165,7 +165,9 @@ You are the Coder agent.
     let cmd = spawner
         .build_command(&agent, &prompt_file, "Fix the null check")
         .unwrap();
-    assert!(cmd.iter().any(|a| a == "claude"));
+    assert_eq!(cmd[0], "bash");
+    assert_eq!(cmd[1], "-lc");
+    assert!(cmd[2].contains("cat \"$PROMPT_FILE\" | claude -p"));
 
     // Build env
     let env = spawner.build_env(&agent, &prompt_file, "Fix the null check", None);

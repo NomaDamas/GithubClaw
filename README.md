@@ -182,6 +182,7 @@ Global config lives at `~/.githubclaw/` (webhook server settings, repo registry,
 - **VALUE.md** -- Your project's mission statement. Every agent reads this to align decisions with your goals.
 - **Agent prompts** -- Fully customizable in `.githubclaw/agents/`. Each file has YAML frontmatter (backend, git author, allowed tools) and a markdown instruction body. Your edits are never overwritten by upgrades.
 - **config.yaml** -- Per-repo overrides (allowed read paths, timeouts, etc.) in `.githubclaw/config.yaml`. Global settings in `~/.githubclaw/config.yaml`.
+- **Agent spawning** -- `claude-code` and `codex` use built-in Rust launch paths in the MVP. Repo-local spawn script overrides are not part of the runtime contract.
 
 ## Architecture
 

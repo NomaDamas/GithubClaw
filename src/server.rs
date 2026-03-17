@@ -1131,21 +1131,9 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             }
         };
 
-        // Build orchestrator command
-        // Use a deterministic session name so --resume works across invocations
-        let session_name = format!("githubclaw-{}-{}", repo_name.replace('/', "-"), issue_id);
-        let mut cmd_args = vec![
-            "claude".to_string(),
-            "-p".to_string(),
-            "--max-turns".to_string(),
-            "30".to_string(),
-            "--resume".to_string(),
-            session_name.clone(),
-        ];
-        cmd_args.push("--prompt-file".to_string());
-        cmd_args.push(prompt_file.to_string_lossy().to_string());
-
         // Build environment
+        // Use a deterministic session name so --resume works across invocations.
+        let session_name = format!("githubclaw-{}-{}", repo_name.replace('/', "-"), issue_id);
         let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         if issue_id > 0 {
             env.insert("GITHUBCLAW_ROOT_ISSUE".to_string(), issue_id.to_string());
@@ -1170,14 +1158,34 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         let _ = std::fs::create_dir_all(&tmp_agent_dir);
         let tmp_agent_file = tmp_agent_dir.join("orchestrator.md");
         let _ = std::fs::write(&tmp_agent_file, &orch_def_content);
-        if let Ok(orch_def) = crate::agents::parser::parse_agent_file(&tmp_agent_file) {
-            // Write orchestrator prompt to temp file
-            let prompt_path = tmp_agent_dir.join("orch_prompt.md");
-            let _ = std::fs::write(&prompt_path, &orchestrator_prompt);
-            let full_env =
-                spawner.build_env(&orch_def, &prompt_path, &orchestrator_prompt, Some(&env));
-            env = full_env;
-        }
+        let orch_def = match crate::agents::parser::parse_agent_file(&tmp_agent_file) {
+            Ok(def) => def,
+            Err(err) => {
+                error!(
+                    repo = %repo_name,
+                    "Failed to parse orchestrator agent definition: {}",
+                    err
+                );
+                let _ = std::fs::remove_file(&prompt_file);
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        env.insert("GITHUBCLAW_SESSION_NAME".to_string(), session_name.clone());
+        // Write orchestrator prompt to temp file
+        let prompt_path = tmp_agent_dir.join("orch_prompt.md");
+        let _ = std::fs::write(&prompt_path, &orchestrator_prompt);
+        let full_env = spawner.build_env(&orch_def, &prompt_path, &orchestrator_prompt, Some(&env));
+        env = full_env;
+        let cmd_args = match spawner.build_resume_command(&orch_def) {
+            Ok(cmd) => cmd,
+            Err(err) => {
+                error!(repo = %repo_name, "Failed to build orchestrator command: {}", err);
+                let _ = std::fs::remove_file(&prompt_file);
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
 
         info!(
             repo = %repo_name,

@@ -20,23 +20,6 @@ const DEFAULT_ORCHESTRATOR_MD: &str = include_str!("../defaults/orchestrator.md"
 const DEFAULT_GLOBAL_PROMPT_MD: &str = include_str!("../defaults/global_prompt.md");
 const DEFAULT_VALUE_MD: &str = include_str!("../defaults/value.md");
 const DEFAULT_MEMORY_MD: &str = include_str!("../defaults/memory.md");
-const DEFAULT_SPAWN_CLAUDE_SH: &str = r#"#!/usr/bin/env bash
-# GithubClaw spawn template for Claude Code.
-set -euo pipefail
-exec claude -p \
-  --dangerously-skip-permissions \
-  --allowedTools "${ALLOWED_TOOLS}" \
-  --disallowedTools "${DISALLOWED_TOOLS}" \
-  --max-turns "${MAX_TURNS:-200}" \
-  --append-system-prompt-file "${PROMPT_FILE}" \
-  "$TASK_PROMPT"
-"#;
-const DEFAULT_SPAWN_CODEX_SH: &str = r#"#!/usr/bin/env bash
-# GithubClaw spawn template for Codex CLI.
-set -euo pipefail
-cat "${PROMPT_FILE}" | codex exec - \
-  --dangerously-bypass-approvals-and-sandbox
-"#;
 const DEFAULT_GITIGNORE: &str = "secrets/\nqueue/\nlogs/\nmemory.md\n";
 const DEFAULT_REPO_CONFIG_YAML: &str = "# GithubClaw per-repo configuration.\n# See https://github.com/GithubClaw/githubclaw for options.\n";
 
@@ -198,15 +181,12 @@ fn cmd_init() {
     }
 
     // Files to write (path -> content). Prompt/config files are user-owned and
-    // are never overwritten. Runtime spawn scripts are refreshed so existing
-    // repos pick up compatible launcher behavior after upgrades.
+    // are never overwritten.
     let files: Vec<(PathBuf, &str)> = vec![
         (claw_dir.join("orchestrator.md"), DEFAULT_ORCHESTRATOR_MD),
         (claw_dir.join("global-prompt.md"), DEFAULT_GLOBAL_PROMPT_MD),
         (claw_dir.join("VALUE.md"), DEFAULT_VALUE_MD),
         (claw_dir.join("memory.md"), DEFAULT_MEMORY_MD),
-        (claw_dir.join("spawn_claude.sh"), DEFAULT_SPAWN_CLAUDE_SH),
-        (claw_dir.join("spawn_codex.sh"), DEFAULT_SPAWN_CODEX_SH),
         (claw_dir.join(".gitignore"), DEFAULT_GITIGNORE),
         (claw_dir.join("config.yaml"), DEFAULT_REPO_CONFIG_YAML),
         // Agent definition files (6 V2 agents)
@@ -229,17 +209,9 @@ fn cmd_init() {
 
     let mut created: usize = 0;
     let mut skipped: usize = 0;
-    let mut refreshed: usize = 0;
 
     for (filepath, content) in &files {
-        let existed = filepath.exists();
-        let is_spawn_script = filepath
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n == "spawn_claude.sh" || n == "spawn_codex.sh")
-            .unwrap_or(false);
-
-        if existed && !is_spawn_script {
+        if filepath.exists() {
             skipped += 1;
             continue;
         }
@@ -249,26 +221,12 @@ fn cmd_init() {
         if let Err(e) = fs::write(filepath, content) {
             eprintln!("Error writing {}: {e}", filepath.display());
         } else {
-            if existed && is_spawn_script {
-                refreshed += 1;
-            } else {
-                created += 1;
-            }
-        }
-    }
-
-    // Make spawn scripts executable (chmod 755)
-    for script_name in &["spawn_claude.sh", "spawn_codex.sh"] {
-        let script = claw_dir.join(script_name);
-        if script.exists() {
-            let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o755));
+            created += 1;
         }
     }
 
     println!("Initialized .githubclaw/ in {}", repo_root.display());
-    println!(
-        "  Created {created} files, refreshed {refreshed} runtime scripts, skipped {skipped} existing files."
-    );
+    println!("  Created {created} files, skipped {skipped} existing files.");
     println!();
 
     // (a) Auto-register the repo
