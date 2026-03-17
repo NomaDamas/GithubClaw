@@ -37,6 +37,7 @@ const DEFAULT_AGENT_BUG_REPRODUCER: &str = include_str!("../defaults/agents/bug_
 
 const LAUNCHD_LABEL: &str = "com.githubclaw.webhook-server";
 const SYSTEMD_UNIT: &str = "githubclaw-webhook-server";
+const TMUX_SESSION_NAME: &str = "githubclaw";
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -59,7 +60,7 @@ enum Commands {
     Init,
     /// Re-scan the current repository's open issues and PRs into the bootstrap queue
     Bootstrap,
-    /// Start the webhook server as a background daemon
+    /// Start the webhook server using the recommended runtime for this OS
     Start,
     /// Stop the webhook server
     Stop {
@@ -67,15 +68,15 @@ enum Commands {
         #[arg(long, short)]
         force: bool,
     },
-    /// Show the status of the webhook server and registered repos
+    /// Show server status and registered repos
     Status,
-    /// Show webhook server logs
+    /// Show server log output
     Logs {
         /// Follow log output (like tail -f)
         #[arg(long, short)]
         follow: bool,
     },
-    /// Run the webhook server inline (used by launchd/systemd)
+    /// Run the webhook server inline in the current shell
     Serve {
         /// Host to bind to
         #[arg(long, default_value = "0.0.0.0")]
@@ -269,7 +270,10 @@ fn cmd_init() {
     );
     println!("  2. Create a GitHub App and set webhook URL + secret");
     println!("  3. Set up a tunnel (cloudflare tunnel, ngrok, etc.)");
-    println!("  4. githubclaw start");
+    println!(
+        "  4. On macOS: grant Full Disk Access to Terminal/iTerm, then run `githubclaw start`"
+    );
+    println!("     On Linux: `githubclaw start`");
 }
 
 fn cmd_bootstrap() {
@@ -358,11 +362,6 @@ fn cmd_bootstrap() {
 // ===========================================================================
 
 fn cmd_start() {
-    if let Some(pid) = read_pid() {
-        eprintln!("Webhook server already running (PID {pid}).");
-        std::process::exit(1);
-    }
-
     // Ensure global directories exist
     let global_dir = global_config_dir();
     let _ = fs::create_dir_all(global_dir.join("logs"));
@@ -387,67 +386,36 @@ fn cmd_start() {
 
     match system {
         "macos" => {
-            let plist_path = write_launchd_plist(LAUNCHD_LABEL, config.port, &log_path);
-            let uid = unsafe { libc::getuid() };
-
-            // Unload stale definition first
-            let _ = Command::new("launchctl")
-                .args([
-                    "bootout",
-                    &format!("gui/{uid}"),
-                    &plist_path.to_string_lossy(),
-                ])
-                .output();
-
-            let result = Command::new("launchctl")
-                .args([
-                    "bootstrap",
-                    &format!("gui/{uid}"),
-                    &plist_path.to_string_lossy(),
-                ])
-                .output();
-
-            match result {
-                Ok(output) if !output.status.success() => {
-                    eprintln!(
-                        "Failed to start via launchd: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Failed to run launchctl: {e}");
-                    std::process::exit(1);
-                }
-                _ => {}
+            if let Some(session) = find_tmux_session() {
+                eprintln!(
+                    "Webhook server already running in tmux session `{}`.",
+                    session.name
+                );
+                std::process::exit(1);
             }
 
-            // Find PID from launchctl print
-            if let Ok(info) = Command::new("launchctl")
-                .args(["print", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
-                .output()
-            {
-                let stdout = String::from_utf8_lossy(&info.stdout);
-                for line in stdout.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.starts_with("pid =") {
-                        if let Some(val) = trimmed.split('=').nth(1) {
-                            if let Ok(pid) = val.trim().parse::<u32>() {
-                                let _ = fs::write(get_pid_file(), pid.to_string());
-                            }
-                        }
-                    }
-                }
+            if let Some(pid) = read_pid() {
+                eprintln!("Webhook server already running (PID {pid}).");
+                std::process::exit(1);
             }
+
+            start_tmux_session(config.port).unwrap_or_else(|err| {
+                eprintln!("Failed to start via tmux: {err}");
+                std::process::exit(1);
+            });
 
             println!(
-                "Webhook server started via launchd on port {}.",
-                config.port
+                "Webhook server started in tmux session `{}` on port {}.",
+                TMUX_SESSION_NAME, config.port
             );
-            println!("  Logs: {}", log_path.display());
-            println!("  Plist: {}", plist_path.display());
+            println!("  Attach: tmux attach -t {TMUX_SESSION_NAME}");
         }
         "linux" => {
+            if let Some(pid) = read_pid() {
+                eprintln!("Webhook server already running (PID {pid}).");
+                std::process::exit(1);
+            }
+
             let unit_path = write_systemd_unit(SYSTEMD_UNIT, config.port, &log_path);
 
             let _ = Command::new("systemctl")
@@ -607,6 +575,10 @@ fn stop_graceful(system: &str) {
             println!("Webhook server stopped (graceful drain).");
         }
         None => {
+            if stop_tmux_session() {
+                println!("Webhook server stopped (tmux session `{TMUX_SESSION_NAME}`).");
+                return;
+            }
             eprintln!("Webhook server is not running.");
             std::process::exit(1);
         }
@@ -677,6 +649,10 @@ fn stop_force(system: &str) {
                     println!("Webhook server killed (force).");
                 }
                 None => {
+                    if stop_tmux_session() {
+                        println!("Webhook server killed (tmux session `{TMUX_SESSION_NAME}`).");
+                        return;
+                    }
                     eprintln!("Webhook server is not running.");
                     std::process::exit(1);
                 }
@@ -699,7 +675,18 @@ fn cmd_status() {
             }
         }
         None => {
-            println!("Webhook server is not running.");
+            if let Some(session) = find_tmux_session() {
+                println!(
+                    "Webhook server is running via tmux session `{}`{}.",
+                    session.name,
+                    if session.attached { " (attached)" } else { "" }
+                );
+                if let Ok(config) = GlobalConfig::load(None) {
+                    println!("  Port: {}", config.port);
+                }
+            } else {
+                println!("Webhook server is not running.");
+            }
         }
     }
 
@@ -774,6 +761,26 @@ fn cmd_status() {
 fn cmd_logs(follow: bool) {
     let log_path = get_log_file();
     if !log_path.exists() {
+        if let Some(session) = find_tmux_session() {
+            if follow {
+                // Replace process with tmux attach for inline mode.
+                use std::os::unix::process::CommandExt;
+                let err = Command::new("tmux")
+                    .args(["attach", "-t", &session.name])
+                    .exec();
+                eprintln!("Failed to exec tmux attach: {err}");
+                std::process::exit(1);
+            } else if let Some(output) = capture_tmux_session_output(&session.name) {
+                print!("{output}");
+                return;
+            } else {
+                println!(
+                    "tmux session `{}` is running, but output capture failed. Try `tmux attach -t {}`.",
+                    session.name, session.name
+                );
+                return;
+            }
+        }
         println!("No logs found.");
         return;
     }
@@ -806,6 +813,96 @@ fn cmd_logs(follow: bool) {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmuxSessionInfo {
+    name: String,
+    attached: bool,
+}
+
+fn parse_tmux_sessions(output: &str) -> Vec<TmuxSessionInfo> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let name = parts.next()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let attached = parts.next().unwrap_or("0").trim() == "1";
+            Some(TmuxSessionInfo {
+                name: name.to_string(),
+                attached,
+            })
+        })
+        .collect()
+}
+
+fn find_tmux_session() -> Option<TmuxSessionInfo> {
+    let output = Command::new("tmux")
+        .args([
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_attached}",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_tmux_sessions(&stdout)
+        .into_iter()
+        .find(|session| session.name == TMUX_SESSION_NAME)
+}
+
+fn stop_tmux_session() -> bool {
+    Command::new("tmux")
+        .args(["kill-session", "-t", TMUX_SESSION_NAME])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn capture_tmux_session_output(session_name: &str) -> Option<String> {
+    let output = Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", session_name, "-S", "-50"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn start_tmux_session(port: u16) -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("could not resolve current executable: {e}"))?;
+    let shell_command = format!(
+        "{} serve --host 0.0.0.0 --port {}",
+        shell_single_quote(&exe.to_string_lossy()),
+        port
+    );
+
+    let output = Command::new("tmux")
+        .args(["new-session", "-d", "-s", TMUX_SESSION_NAME, &shell_command])
+        .output()
+        .map_err(|e| format!("could not run tmux: {e}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 // ===========================================================================
@@ -1169,57 +1266,6 @@ fn read_pid() -> Option<u32> {
         let _ = fs::remove_file(&pid_file);
         None
     }
-}
-
-/// Write a macOS launchd plist and return its path.
-fn write_launchd_plist(label: &str, port: u16, log_path: &Path) -> PathBuf {
-    let plist_dir = home_dir().join("Library").join("LaunchAgents");
-    let _ = fs::create_dir_all(&plist_dir);
-    let plist_path = plist_dir.join(format!("{label}.plist"));
-
-    let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("githubclaw"));
-    let path_env = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
-
-    let plist_content = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{exe}</string>
-        <string>serve</string>
-        <string>--host</string>
-        <string>0.0.0.0</string>
-        <string>--port</string>
-        <string>{port}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{log}</string>
-    <key>StandardErrorPath</key>
-    <string>{log}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>{path}</string>
-    </dict>
-</dict>
-</plist>
-"#,
-        exe = exe_path.display(),
-        log = log_path.display(),
-        path = path_env,
-    );
-
-    let _ = fs::write(&plist_path, plist_content);
-    plist_path
 }
 
 /// Write a Linux systemd user unit file and return its path.
@@ -1721,5 +1767,46 @@ mod tests {
             }
             _ => panic!("expected dispatch command"),
         }
+    }
+
+    #[test]
+    fn test_parse_tmux_sessions_reads_name_and_attachment_state() {
+        let sessions = parse_tmux_sessions("githubclaw\t1\nother\t0\n");
+
+        assert_eq!(
+            sessions,
+            vec![
+                TmuxSessionInfo {
+                    name: "githubclaw".to_string(),
+                    attached: true,
+                },
+                TmuxSessionInfo {
+                    name: "other".to_string(),
+                    attached: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_tmux_sessions_ignores_empty_lines() {
+        let sessions = parse_tmux_sessions("\n  \ngithubclaw\t0\n");
+
+        assert_eq!(
+            sessions,
+            vec![TmuxSessionInfo {
+                name: "githubclaw".to_string(),
+                attached: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_shell_single_quote_escapes_single_quotes() {
+        assert_eq!(shell_single_quote("/tmp/githubclaw"), "'/tmp/githubclaw'");
+        assert_eq!(
+            shell_single_quote("/tmp/it's/githubclaw"),
+            "'/tmp/it'\"'\"'s/githubclaw'"
+        );
     }
 }
