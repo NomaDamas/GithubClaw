@@ -28,7 +28,7 @@ Write test code that verifies the problem defined in the issue is solved.
 
 Perform direct-use verification — test the application as a real user would.
 
-- Read the project's e2e configuration from `.githubclaw/config.yaml`
+- Read the project's e2e configuration from `~/.githubclaw/repos/<owner_repo>/config.yaml`
 - Based on project type:
   - **Web**: Launch the app, use Playwright/browser to click through, take screenshots
   - **API**: Send real HTTP requests with curl, verify responses

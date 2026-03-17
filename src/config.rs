@@ -29,8 +29,15 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
+fn githubclaw_home_override() -> Option<PathBuf> {
+    std::env::var("GITHUBCLAW_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
 pub fn global_config_dir() -> PathBuf {
-    home_dir().join(".githubclaw")
+    githubclaw_home_override().unwrap_or_else(|| home_dir().join(".githubclaw"))
 }
 
 pub fn global_config_path() -> PathBuf {
@@ -867,6 +874,22 @@ mod tests {
         let pid = get_pid_file();
         assert!(pid.ends_with("server.pid"));
         assert!(pid.to_string_lossy().contains(".githubclaw"));
+    }
+
+    #[test]
+    fn test_global_config_dir_uses_githubclaw_home_override() {
+        let tmp = TempDir::new().unwrap();
+        let original = std::env::var_os("GITHUBCLAW_HOME");
+        std::env::set_var("GITHUBCLAW_HOME", tmp.path());
+
+        let path = global_config_dir();
+
+        match original {
+            Some(value) => std::env::set_var("GITHUBCLAW_HOME", value),
+            None => std::env::remove_var("GITHUBCLAW_HOME"),
+        }
+
+        assert_eq!(path, tmp.path());
     }
 
     #[test]

@@ -255,3 +255,22 @@ For detailed specs, see:
 ## License
 
 MIT
+
+
+## Maintainer Product E2E
+
+GithubClaw now includes a **maintainer-only** product E2E harness for the sandbox repo `git@github.com:vkehfdl1/GithubClaw-Sandbox.git`.
+
+This is **not** a user-facing `githubclaw` CLI feature. Run it through `make` only:
+
+```bash
+make e2e-product-smoke
+make e2e-product-live BACKEND=claude-code
+make e2e-product-live BACKEND=codex
+make e2e-product-release
+```
+
+Notes:
+- The harness creates sandbox issues from fixed fixtures with unique run IDs.
+- Heavy live validation is intended for **release-stage verification**, not every PR.
+- Artifacts are written under `~/.githubclaw/runtime/<owner_repo>/product-e2e/`.

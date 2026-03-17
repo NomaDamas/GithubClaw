@@ -1,4 +1,4 @@
-.PHONY: build release test test-verbose lint format format-check check ci install reinstall restart clean size init start stop status serve serve-tmux logs help
+.PHONY: build release test test-verbose lint format format-check check ci install reinstall restart clean size init start stop status serve serve-tmux logs help e2e-product-smoke e2e-product-live e2e-product-release e2e-product-unit
 
 UNAME_S := $(shell uname -s)
 
@@ -82,6 +82,20 @@ serve-tmux:       ## Start webhook server in tmux explicitly (low-level macOS he
 logs:             ## Tail daemon logs or attach to tmux-backed inline output
 	cargo run -- logs --follow
 
+
+# ─── Maintainer Product E2E ──────────────────────────────────────────
+e2e-product-unit:  ## Run helper-level tests for the product E2E harness
+	python3 -m unittest tests/product_e2e/test_product_e2e.py
+
+e2e-product-smoke: install  ## Maintainer-only sandbox smoke run (default backend)
+	python3 scripts/product_e2e.py smoke
+
+e2e-product-live: install  ## Maintainer-only live sandbox run (set BACKEND=claude-code|codex)
+	python3 scripts/product_e2e.py live --backend $${BACKEND:?set BACKEND=claude-code or BACKEND=codex}
+
+e2e-product-release: install  ## Maintainer-only release gate: smoke + live Claude/Codex matrix
+	python3 scripts/product_e2e.py release
+
 # ─── Help ─────────────────────────────────────────────────────────────
 help:             ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'

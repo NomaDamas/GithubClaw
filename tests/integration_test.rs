@@ -239,6 +239,24 @@ fn test_bug_reproducer_prompt_prefers_isolation_without_requiring_it() {
     assert!(!prompt.contains(".githubclaw/environments/"));
 }
 
+#[test]
+fn test_default_agent_prompts_reference_global_control_plane() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let verifier = std::fs::read_to_string(root.join("defaults/agents/verifier.md")).unwrap();
+    let reviewer = std::fs::read_to_string(root.join("defaults/agents/reviewer.md")).unwrap();
+    let vision_gap =
+        std::fs::read_to_string(root.join("defaults/agents/vision_gap_analyst.md")).unwrap();
+
+    assert!(verifier.contains("~/.githubclaw/repos/<owner_repo>/config.yaml"));
+    assert!(!verifier.contains("`.githubclaw/config.yaml`"));
+
+    assert!(reviewer.contains("~/.githubclaw/repos/<owner_repo>/config.yaml"));
+    assert!(!reviewer.contains("`.githubclaw/config.yaml`"));
+
+    assert!(vision_gap.contains("~/.githubclaw/repos/<owner_repo>/VALUE.md"));
+    assert!(!vision_gap.contains("`.githubclaw/VALUE.md`"));
+}
+
 /// Test: Fork PR gate end-to-end
 #[test]
 fn test_fork_pr_gate_full_scenario() {
