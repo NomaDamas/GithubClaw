@@ -178,21 +178,35 @@ impl AgentSpawner {
                     "claude -p ",
                     "--dangerously-skip-permissions ",
                     "--allowedTools \"$ALLOWED_TOOLS\" ",
-                    "--disallowedTools \"$DISALLOWED_TOOLS\" ",
-                    "--max-turns \"$MAX_TURNS\""
+                    "--disallowedTools \"$DISALLOWED_TOOLS\""
                 )
                 .to_string();
                 if include_resume {
-                    command.push_str(" --resume \"$GITHUBCLAW_SESSION_NAME\"");
+                    command.push_str(
+                        " --resume \"${GITHUBCLAW_SESSION_ID:-$GITHUBCLAW_SESSION_NAME}\"",
+                    );
                 }
                 command
             }
-            "codex" => concat!(
-                "cat \"$PROMPT_FILE\" | ",
-                "codex exec - ",
-                "--dangerously-bypass-approvals-and-sandbox"
-            )
-            .to_string(),
+            "codex" => {
+                if include_resume {
+                    concat!(
+                        "if [ -n \"${GITHUBCLAW_SESSION_ID:-}\" ]; then ",
+                        "cat \"$PROMPT_FILE\" | codex exec resume \"$GITHUBCLAW_SESSION_ID\" - --json --dangerously-bypass-approvals-and-sandbox; ",
+                        "else ",
+                        "cat \"$PROMPT_FILE\" | codex exec - --json --dangerously-bypass-approvals-and-sandbox; ",
+                        "fi"
+                    )
+                    .to_string()
+                } else {
+                    concat!(
+                        "cat \"$PROMPT_FILE\" | ",
+                        "codex exec - ",
+                        "--dangerously-bypass-approvals-and-sandbox"
+                    )
+                    .to_string()
+                }
+            }
             other => return Err(format!("unknown backend: {}", other)),
         };
 
@@ -322,8 +336,8 @@ mod tests {
         assert_eq!(cmd[0], "bash");
         assert_eq!(cmd[1], "-lc");
         assert!(cmd[2].contains("cat \"$PROMPT_FILE\" | claude -p"));
-        assert!(cmd[2].contains("--max-turns \"$MAX_TURNS\""));
         assert!(!cmd[2].contains("--prompt-file"));
+        assert!(!cmd[2].contains("--max-turns"));
         assert!(!cmd[2].contains("--task"));
     }
 
@@ -389,7 +403,21 @@ mod tests {
 
         assert_eq!(cmd[0], "bash");
         assert_eq!(cmd[1], "-lc");
-        assert!(cmd[2].contains("--resume \"$GITHUBCLAW_SESSION_NAME\""));
+        assert!(cmd[2].contains("--resume \"${GITHUBCLAW_SESSION_ID:-$GITHUBCLAW_SESSION_NAME}\""));
         assert!(!cmd[2].contains("--prompt-file"));
+    }
+
+    #[test]
+    fn build_resume_command_codex_uses_json_and_resume_when_session_id_exists() {
+        let tmp = TempDir::new().unwrap();
+        let spawner = AgentSpawner::new(tmp.path(), 42);
+        let def = make_agent_def("codex");
+
+        let cmd = spawner.build_resume_command(&def).unwrap();
+
+        assert_eq!(cmd[0], "bash");
+        assert_eq!(cmd[1], "-lc");
+        assert!(cmd[2].contains("codex exec resume \"$GITHUBCLAW_SESSION_ID\" - --json"));
+        assert!(cmd[2].contains("codex exec - --json"));
     }
 }

@@ -835,6 +835,93 @@ fn is_actionable_event(event: &serde_json::Value) -> bool {
             == Some("githubclaw-approved"))
 }
 
+fn normalized_event_type(event: &serde_json::Value) -> &'static str {
+    if let Some(event_type) = event
+        .get("_githubclaw_event_type")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return match event_type {
+            "issues" => "issues",
+            "issue_comment" => "issue_comment",
+            "pull_request" => "pull_request",
+            "pull_request_review" => "pull_request_review",
+            "discussion" => "discussion",
+            "discussion_comment" => "discussion_comment",
+            "check_run" => "check_run",
+            _ => "unknown",
+        };
+    }
+
+    if event.get("type").and_then(|v| v.as_str()) == Some("virtual_bootstrap") {
+        return match event.get("item_type").and_then(|v| v.as_str()) {
+            Some("issue") => "issues",
+            Some("pull_request") => "pull_request",
+            _ => "unknown",
+        };
+    }
+
+    "unknown"
+}
+
+fn event_summary(event: &serde_json::Value) -> Option<String> {
+    event
+        .pointer("/issue/title")
+        .or_else(|| event.pointer("/pull_request/title"))
+        .or_else(|| event.pointer("/data/title"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn assemble_orchestrator_prompt_file(
+    githubclaw_home: &Path,
+    repo_name: &str,
+    orch_def: &crate::agents::parser::AgentDefinition,
+    orchestrator_prompt: &str,
+) -> Result<(PromptAssembler, PathBuf), String> {
+    let mut assembler = PromptAssembler::with_home(repo_name, githubclaw_home);
+    let prompt_path = assembler
+        .assemble(orch_def, orchestrator_prompt)
+        .map_err(|e| format!("Failed to assemble orchestrator prompt: {}", e))?;
+    Ok((assembler, prompt_path))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CodexExecMetadata {
+    thread_id: Option<String>,
+    last_agent_message: Option<String>,
+}
+
+fn parse_codex_exec_output(stdout: &[u8]) -> CodexExecMetadata {
+    let mut metadata = CodexExecMetadata::default();
+
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        if metadata.thread_id.is_none()
+            && value.get("type").and_then(|v| v.as_str()) == Some("thread.started")
+        {
+            metadata.thread_id = value
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+        }
+
+        if value.get("type").and_then(|v| v.as_str()) == Some("item.completed")
+            && value.pointer("/item/type").and_then(|v| v.as_str()) == Some("agent_message")
+        {
+            metadata.last_agent_message = value
+                .pointer("/item/text")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+        }
+    }
+
+    metadata
+}
+
 /// Per-repo drain loop: peek the queue, send to orchestrator, execute actions.
 async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &RegistryEntry) {
     let _repo_slug = repo_name.replace('/', "-");
@@ -962,11 +1049,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                 resume_msg.to_prompt()
             } else {
                 // Comment without markers — might be human direction or external
-                let event_type = event
-                    .payload
-                    .get("_githubclaw_event_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+                let event_type = normalized_event_type(&event.payload);
                 if let Some(root) = root_issue {
                     let resume_msg = crate::resume_message::ResumeMessage::from_human_comment(
                         root,
@@ -988,18 +1071,9 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             }
         } else {
             // Non-comment event (issues.opened, pull_request.*, check_run.*, etc.)
-            let event_type = event
-                .payload
-                .get("_githubclaw_event_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
+            let event_type = normalized_event_type(&event.payload);
             if let Some(root) = root_issue {
-                let summary = event
-                    .payload
-                    .pointer("/issue/title")
-                    .or_else(|| event.payload.pointer("/pull_request/title"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                let summary = event_summary(&event.payload);
                 let resume_msg = crate::resume_message::ResumeMessage::from_issue_event(
                     root, event_type, summary,
                 );
@@ -1048,24 +1122,12 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         };
         drop(registry);
 
-        // Write prompt to temp file to avoid CLI arg length limits
-        let prompt_tmp_dir = std::env::temp_dir().join("githubclaw-orch-prompts");
-        let _ = std::fs::create_dir_all(&prompt_tmp_dir);
-        let prompt_file =
-            prompt_tmp_dir.join(format!("{}-{}.txt", repo_name.replace('/', "_"), issue_id));
-        if let Err(e) = std::fs::write(&prompt_file, &orchestrator_prompt) {
-            error!(repo = %repo_name, "Failed to write orchestrator prompt file: {}", e);
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            continue;
-        }
-
         let mut reserved_event = {
             let mut queues = state.queues.lock().await;
             let queue = match get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name) {
                 Ok(q) => q,
                 Err(e) => {
                     error!(repo = %repo_name, "Failed to get queue for reserve: {}", e);
-                    let _ = std::fs::remove_file(&prompt_file);
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     continue;
                 }
@@ -1074,13 +1136,11 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             match queue.reserve_next() {
                 Ok(Some(event)) => event,
                 Ok(None) => {
-                    let _ = std::fs::remove_file(&prompt_file);
                     tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                     continue;
                 }
                 Err(e) => {
                     error!(repo = %repo_name, "Failed to reserve queue head: {}", e);
-                    let _ = std::fs::remove_file(&prompt_file);
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     continue;
                 }
@@ -1106,8 +1166,6 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             crate::constants::DEFAULT_AGENT_MAX_TURNS,
         );
         // Load orchestrator agent def to get full env
-        let tmp_agent_dir = std::env::temp_dir().join("githubclaw-orch");
-        let _ = std::fs::create_dir_all(&tmp_agent_dir);
         let orch_def = match crate::agents::parser::load_agent_definition(
             repo_name,
             "orchestrator",
@@ -1120,22 +1178,39 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                     "Failed to load orchestrator agent definition: {}",
                     err
                 );
-                let _ = std::fs::remove_file(&prompt_file);
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 continue;
             }
         };
         env.insert("GITHUBCLAW_SESSION_NAME".to_string(), session_name.clone());
-        // Write orchestrator prompt to temp file
-        let prompt_path = tmp_agent_dir.join("orch_prompt.md");
-        let _ = std::fs::write(&prompt_path, &orchestrator_prompt);
+        let stored_session_id = if issue_id > 0 {
+            state.session_store.load(repo_name, issue_id).ok().flatten()
+        } else {
+            None
+        };
+        if let Some(session_id) = stored_session_id.as_ref() {
+            env.insert("GITHUBCLAW_SESSION_ID".to_string(), session_id.clone());
+        }
+
+        let (prompt_assembler, prompt_path) = match assemble_orchestrator_prompt_file(
+            &state.githubclaw_home,
+            repo_name,
+            &orch_def,
+            &orchestrator_prompt,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                error!(repo = %repo_name, "{}", err);
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
         let full_env = spawner.build_env(&orch_def, &prompt_path, &orchestrator_prompt, Some(&env));
         env = full_env;
         let cmd_args = match spawner.build_resume_command(&orch_def) {
             Ok(cmd) => cmd,
             Err(err) => {
                 error!(repo = %repo_name, "Failed to build orchestrator command: {}", err);
-                let _ = std::fs::remove_file(&prompt_file);
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 continue;
             }
@@ -1209,7 +1284,28 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                         let exit_code = output.status.code().unwrap_or(-1);
                         state.process_manager.report_exit(pid, exit_code).await;
 
-                        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        let stdout = if orch_def.backend == "codex" {
+                            let metadata = parse_codex_exec_output(&output.stdout);
+                            if issue_id > 0 {
+                                if let Some(thread_id) = metadata.thread_id.as_ref() {
+                                    if let Err(err) =
+                                        state.session_store.save(repo_name, issue_id, thread_id)
+                                    {
+                                        warn!(
+                                            repo = %repo_name,
+                                            issue = issue_id,
+                                            error = %err,
+                                            "Failed to persist Codex session id",
+                                        );
+                                    }
+                                }
+                            }
+                            metadata.last_agent_message.unwrap_or_else(|| {
+                                String::from_utf8_lossy(&output.stdout).trim().to_string()
+                            })
+                        } else {
+                            String::from_utf8_lossy(&output.stdout).trim().to_string()
+                        };
                         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
                         if exit_code == 0 {
@@ -1348,12 +1444,11 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
                         );
                     }
                 }
-                let _ = std::fs::remove_file(&prompt_file);
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 continue;
             }
         }
-        let _ = std::fs::remove_file(&prompt_file);
+        drop(prompt_assembler);
     }
 }
 
@@ -1364,11 +1459,13 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::parser::AgentDefinition;
     use axum::body::Body;
     use axum::http::Request;
     use hmac::{Hmac, Mac};
     use http_body_util::BodyExt;
     use sha2::Sha256;
+    use std::collections::HashMap;
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -1426,6 +1523,17 @@ mod tests {
     async fn body_string(response: axum::http::Response<Body>) -> String {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn write_test_orchestrator_prompt_layers(tmp: &TempDir, repo_name: &str) {
+        let profile_dir = crate::config::profile_dir_from_home(tmp.path(), "default");
+        let repo_dir = crate::config::repo_dir_from_home(tmp.path(), repo_name);
+
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(profile_dir.join("global-prompt.md"), "GLOBAL LAYER").unwrap();
+        std::fs::write(repo_dir.join("VALUE.md"), "VALUE LAYER").unwrap();
+        std::fs::write(repo_dir.join("config.yaml"), "profile: default\n").unwrap();
     }
 
     // ---------------------------------------------------------------
@@ -1966,5 +2074,102 @@ mod tests {
             "_githubclaw_event_type": "label",
             "action": "created"
         })));
+    }
+
+    #[test]
+    fn test_normalized_event_type_maps_virtual_bootstrap_issue() {
+        let event = serde_json::json!({
+            "type": "virtual_bootstrap",
+            "item_type": "issue",
+            "data": { "number": 56, "title": "Bootstrapped issue" }
+        });
+
+        assert_eq!(normalized_event_type(&event), "issues");
+    }
+
+    #[test]
+    fn test_normalized_event_type_maps_virtual_bootstrap_pr() {
+        let event = serde_json::json!({
+            "type": "virtual_bootstrap",
+            "item_type": "pull_request",
+            "data": { "number": 57, "title": "Refactoring .githubclaw" }
+        });
+
+        assert_eq!(normalized_event_type(&event), "pull_request");
+    }
+
+    #[test]
+    fn test_event_summary_reads_virtual_bootstrap_title() {
+        let event = serde_json::json!({
+            "type": "virtual_bootstrap",
+            "item_type": "issue",
+            "data": { "number": 56, "title": "[BUG] orchestrator exited with non-zero code" }
+        });
+
+        assert_eq!(
+            event_summary(&event),
+            Some("[BUG] orchestrator exited with non-zero code".to_string())
+        );
+    }
+
+    #[test]
+    fn test_event_summary_reads_virtual_bootstrap_pr_title() {
+        let event = serde_json::json!({
+            "type": "virtual_bootstrap",
+            "item_type": "pull_request",
+            "data": { "number": 57, "title": "Refactoring .githubclaw" }
+        });
+
+        assert_eq!(
+            event_summary(&event),
+            Some("Refactoring .githubclaw".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_codex_exec_output_extracts_thread_id_and_last_agent_message() {
+        let stdout = br#"{"type":"thread.started","thread_id":"thread-123"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"warning"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"FIRST"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"SECOND"}}"#;
+
+        let metadata = parse_codex_exec_output(stdout);
+        assert_eq!(
+            metadata,
+            CodexExecMetadata {
+                thread_id: Some("thread-123".into()),
+                last_agent_message: Some("SECOND".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_assemble_orchestrator_prompt_file_includes_full_layers() {
+        let tmp = TempDir::new().unwrap();
+        let repo_name = "owner/repo";
+        write_test_orchestrator_prompt_layers(&tmp, repo_name);
+
+        let orch_def = AgentDefinition {
+            name: "orchestrator".into(),
+            backend: "codex".into(),
+            git_author_name: "GithubClaw Orchestrator".into(),
+            git_author_email: "orchestrator@githubclaw.local".into(),
+            timeout: None,
+            tools: HashMap::new(),
+            instruction_body: "AGENT INSTRUCTION LAYER".into(),
+        };
+
+        let (assembler, prompt_path) =
+            assemble_orchestrator_prompt_file(tmp.path(), repo_name, &orch_def, "EVENT TASK LAYER")
+                .unwrap();
+
+        let prompt = std::fs::read_to_string(&prompt_path).unwrap();
+        assert!(prompt.contains("GLOBAL LAYER"));
+        assert!(prompt.contains("VALUE LAYER"));
+        assert!(prompt.contains("AGENT INSTRUCTION LAYER"));
+        assert!(prompt.contains("EVENT TASK LAYER"));
+
+        drop(assembler);
+        assert!(!prompt_path.exists());
     }
 }
