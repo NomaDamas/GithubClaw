@@ -1,10 +1,12 @@
 pub mod agents;
 pub mod cli;
+pub mod clone_manager;
 pub mod config;
 pub mod constants;
 pub mod dispatch_receipts;
 pub mod errors;
 pub mod event_triage;
+pub mod issue_manager;
 pub mod issue_router;
 pub mod markers;
 pub mod pipeline;
@@ -17,4 +19,5 @@ pub mod scheduler;
 pub mod server;
 pub mod session_store;
 pub mod signature;
+pub mod tmux_manager;
 pub mod tui;

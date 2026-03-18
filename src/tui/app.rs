@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::event::{is_quit, AppEvent};
 use super::tabs::*;
 use crate::constants::MONITOR_HISTORY_MINUTES;
+use crate::issue_manager::IssueManagerController;
 use crate::runtime_state::{sessions_dir_from_home, IssueRuntimeState, RuntimeStateStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,24 +448,25 @@ impl App {
         repo_root: &Path,
         review: PendingIssueReview,
     ) -> Result<(), String> {
-        self.apply_issue_review_with(repo_root, review, |repo_root, args| {
-            run_gh_command(repo_root, args)
-        })
+        self.apply_issue_review_with(repo_root, review, run_gh_command, finalize_issue_review)
     }
 
-    fn apply_issue_review_with<F>(
+    fn apply_issue_review_with<F, L>(
         &mut self,
         repo_root: &Path,
         review: PendingIssueReview,
         runner: F,
+        lifecycle: L,
     ) -> Result<(), String>
     where
         F: FnOnce(&Path, &[String]) -> Result<(), String>,
+        L: FnOnce(&Path, PendingIssueReview) -> Result<(), String>,
     {
         let result = (|| {
             let repo_slug = detect_repo_slug(repo_root)?;
             let args = issue_review_command_args(&repo_slug, review);
-            runner(repo_root, &args)
+            runner(repo_root, &args)?;
+            lifecycle(repo_root, review)
         })();
 
         match result {
@@ -671,6 +673,20 @@ fn run_gh_command(repo_root: &Path, args: &[String]) -> Result<(), String> {
 fn detect_repo_slug(repo_root: &Path) -> Result<String, String> {
     crate::config::detect_repo_name(repo_root)
         .ok_or_else(|| "could not detect GitHub owner/repo from repo remote".to_string())
+}
+
+fn finalize_issue_review(repo_root: &Path, review: PendingIssueReview) -> Result<(), String> {
+    let repo_slug = detect_repo_slug(repo_root)?;
+    let controller = IssueManagerController::new();
+    match review.decision {
+        IssueReviewDecision::Approve => controller
+            .approve_issue(repo_root, &repo_slug, review.issue_number)
+            .map(|_| ())
+            .map_err(|err| err.to_string()),
+        IssueReviewDecision::Reject => controller
+            .reject_issue(repo_root, &repo_slug, review.issue_number)
+            .map_err(|err| err.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -886,6 +902,7 @@ mod tests {
         app.pty_session = Some(PtySession::test_stub());
 
         let mut captured_args = Vec::new();
+        let mut lifecycle_called = false;
         app.apply_issue_review_with(
             temp.path(),
             PendingIssueReview {
@@ -894,6 +911,10 @@ mod tests {
             },
             |_, args| {
                 captured_args = args.to_vec();
+                Ok(())
+            },
+            |_, _| {
+                lifecycle_called = true;
                 Ok(())
             },
         )
@@ -914,6 +935,7 @@ mod tests {
         );
         assert!(!app.interactive_session_active);
         assert!(app.pty_session.is_none());
+        assert!(lifecycle_called);
     }
 
     #[test]
@@ -922,6 +944,7 @@ mod tests {
         let mut app = App::new();
 
         let mut captured_args = Vec::new();
+        let mut lifecycle_called = false;
         app.apply_issue_review_with(
             temp.path(),
             PendingIssueReview {
@@ -930,6 +953,10 @@ mod tests {
             },
             |_, args| {
                 captured_args = args.to_vec();
+                Ok(())
+            },
+            |_, _| {
+                lifecycle_called = true;
                 Ok(())
             },
         )
@@ -949,6 +976,49 @@ mod tests {
                 "Rejected via GithubClaw TUI interactive session.".to_string(),
             ]
         );
+        assert!(lifecycle_called);
+    }
+
+    #[test]
+    fn issue_review_does_not_run_lifecycle_when_gh_command_fails() {
+        let temp = init_git_repo();
+        let mut app = App::new();
+        let mut lifecycle_called = false;
+
+        let result = app.apply_issue_review_with(
+            temp.path(),
+            PendingIssueReview {
+                issue_number: 20,
+                decision: IssueReviewDecision::Approve,
+            },
+            |_, _| Err("gh failed".to_string()),
+            |_, _| {
+                lifecycle_called = true;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!lifecycle_called);
+    }
+
+    #[test]
+    fn issue_review_propagates_lifecycle_failure() {
+        let temp = init_git_repo();
+        let mut app = App::new();
+
+        let result = app.apply_issue_review_with(
+            temp.path(),
+            PendingIssueReview {
+                issue_number: 21,
+                decision: IssueReviewDecision::Approve,
+            },
+            |_, _| Ok(()),
+            |_, _| Err("lifecycle failed".to_string()),
+        );
+
+        assert!(result.is_err());
+        assert!(app.pty_output.contains("lifecycle failed"));
     }
 
     // 11. Monitoring tab j/k navigation
