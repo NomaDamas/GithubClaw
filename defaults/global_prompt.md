@@ -29,6 +29,8 @@
 
 {Agent-specific body content}
 
+<!-- githubclaw:signature v1 -->
+
 ---
 ```
 

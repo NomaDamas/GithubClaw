@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use crate::agents::parser::load_agent_definition;
 use crate::agents::prompt_assembler::PromptAssembler;
 use crate::agents::spawner::AgentSpawner;
+use crate::event_triage::{triage_event, ManagerKind};
 use crate::process_manager::{check_fork_pr_gate, ProcessManager};
 use crate::queue::DiskPersistedQueue;
 use crate::runtime_state::IssueRuntimeSnapshot;
@@ -787,92 +788,6 @@ pub async fn start_event_processing(state: Arc<ServerState>) {
     info!("Event processing started for {} repos", registry.len());
 }
 
-/// Events worth sending to the orchestrator. Everything else is noise.
-fn is_actionable_event(event: &serde_json::Value) -> bool {
-    // Check the webhook event type stored in the payload
-    let event_type = event
-        .get("_githubclaw_event_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let action = event.get("action").and_then(|v| v.as_str()).unwrap_or("");
-
-    matches!(
-        (event_type, action),
-        ("issues", "opened")
-            | ("issues", "closed")
-            | ("issue_comment", "created")
-            | ("pull_request", "opened")
-            | ("pull_request", "closed")
-            | ("pull_request_review", "submitted")
-            | ("discussion", "created")
-            | ("discussion_comment", "created")
-            // check_run only on failure
-            | ("check_run", "completed") // will further filter by conclusion below
-    )
-    // For check_run.completed, only pass through failures
-    && if event_type == "check_run" {
-        event
-            .pointer("/check_run/conclusion")
-            .and_then(|v| v.as_str())
-            == Some("failure")
-    } else {
-        true
-    }
-    // Special case: issues.labeled only for "githubclaw-approved" (fork PR gate)
-    || (event_type == "issues"
-        && action == "labeled"
-        && event
-            .get("label")
-            .and_then(|l| l.get("name"))
-            .and_then(|n| n.as_str())
-            == Some("githubclaw-approved"))
-    || (event_type == "pull_request"
-        && action == "labeled"
-        && event
-            .get("label")
-            .and_then(|l| l.get("name"))
-            .and_then(|n| n.as_str())
-            == Some("githubclaw-approved"))
-}
-
-fn normalized_event_type(event: &serde_json::Value) -> &'static str {
-    if let Some(event_type) = event
-        .get("_githubclaw_event_type")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        return match event_type {
-            "issues" => "issues",
-            "issue_comment" => "issue_comment",
-            "pull_request" => "pull_request",
-            "pull_request_review" => "pull_request_review",
-            "discussion" => "discussion",
-            "discussion_comment" => "discussion_comment",
-            "check_run" => "check_run",
-            _ => "unknown",
-        };
-    }
-
-    if event.get("type").and_then(|v| v.as_str()) == Some("virtual_bootstrap") {
-        return match event.get("item_type").and_then(|v| v.as_str()) {
-            Some("issue") => "issues",
-            Some("pull_request") => "pull_request",
-            _ => "unknown",
-        };
-    }
-
-    "unknown"
-}
-
-fn event_summary(event: &serde_json::Value) -> Option<String> {
-    event
-        .pointer("/issue/title")
-        .or_else(|| event.pointer("/pull_request/title"))
-        .or_else(|| event.pointer("/data/title"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
 fn assemble_orchestrator_prompt_file(
     githubclaw_home: &Path,
     repo_name: &str,
@@ -983,109 +898,36 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
             }
         };
 
-        // 2. Filter: only actionable events reach the orchestrator
-        if !is_actionable_event(&event.payload)
-            && event.payload.get("type").and_then(|v| v.as_str()) != Some("virtual_bootstrap")
-        {
-            // Silently dequeue and skip
-            let mut queues = state.queues.lock().await;
-            if let Ok(q) = get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name) {
-                let _ = q.dequeue();
+        // 2. Simplified triage: new issues, external issue comments, and PRs to main.
+        let triage = match triage_event(&event.payload) {
+            Some(triage) => triage,
+            None => {
+                let mut queues = state.queues.lock().await;
+                if let Ok(q) = get_or_create_queue(&mut queues, &state.githubclaw_home, repo_name) {
+                    let _ = q.dequeue();
+                }
+                continue;
             }
-            continue;
-        }
+        };
 
-        // 2b. Route the event to its root issue for the correct orchestrator session.
-        let root_issue = state
-            .issue_router
-            .route_event(repo_name, &event.payload)
-            .unwrap_or(None);
-        if let Some(root) = root_issue {
+        let session_number = triage.session_number;
+        let manager_kind = triage.manager.clone();
+        if session_number > 0 {
             tracing::debug!(
                 repo = %repo_name,
-                root_issue = root,
-                "Routed event to root issue #{}",
-                root
+                session_number = session_number,
+                manager = manager_kind.as_str(),
+                "Routed event to {} session #{}",
+                manager_kind.as_str(),
+                session_number
             );
 
-            let mut snapshot = load_or_new_runtime_snapshot(state, repo_name, root);
-            snapshot.apply_event(&event.payload, root);
+            let mut snapshot = load_or_new_runtime_snapshot(state, repo_name, session_number);
+            snapshot.apply_event(&event.payload, session_number);
             save_runtime_snapshot(state, repo_name, &snapshot);
         }
 
-        // 2c. Build the prompt for the orchestrator subprocess.
-        // Detect markers and build ResumeMessage, or use raw event for new issues.
-        let orchestrator_prompt = if let Some(comment_body) = event
-            .payload
-            .pointer("/comment/body")
-            .and_then(|v| v.as_str())
-        {
-            let markers = crate::markers::parse_markers(comment_body);
-            let summary = crate::markers::extract_summary(comment_body);
-            if let (Some(marker), Some(root)) = (markers.first(), root_issue) {
-                tracing::info!(
-                    repo = %repo_name,
-                    root_issue = root,
-                    marker = marker.marker_type.as_str(),
-                    "Marker detected, building resume message"
-                );
-                let agent_type = event
-                    .payload
-                    .pointer("/comment/user/login")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let comment_url = event
-                    .payload
-                    .pointer("/comment/html_url")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let resume_msg = crate::resume_message::ResumeMessage::from_marker(
-                    root,
-                    marker,
-                    summary,
-                    agent_type,
-                    comment_url,
-                );
-                resume_msg.to_prompt()
-            } else {
-                // Comment without markers — might be human direction or external
-                let event_type = normalized_event_type(&event.payload);
-                if let Some(root) = root_issue {
-                    let resume_msg = crate::resume_message::ResumeMessage::from_human_comment(
-                        root,
-                        comment_body,
-                        event
-                            .payload
-                            .pointer("/comment/html_url")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                    );
-                    resume_msg.to_prompt()
-                } else {
-                    format!(
-                        "[GithubClaw Event] type={}\n\n{}",
-                        event_type,
-                        serde_json::to_string_pretty(&event.payload).unwrap_or_default()
-                    )
-                }
-            }
-        } else {
-            // Non-comment event (issues.opened, pull_request.*, check_run.*, etc.)
-            let event_type = normalized_event_type(&event.payload);
-            if let Some(root) = root_issue {
-                let summary = event_summary(&event.payload);
-                let resume_msg = crate::resume_message::ResumeMessage::from_issue_event(
-                    root, event_type, summary,
-                );
-                resume_msg.to_prompt()
-            } else {
-                format!(
-                    "[GithubClaw Event] type={}\n\n{}",
-                    event_type,
-                    serde_json::to_string_pretty(&event.payload).unwrap_or_default()
-                )
-            }
-        };
+        let orchestrator_prompt = triage.prompt;
 
         // 3. Check rate limiter before sending to orchestrator.
         if state.rate_limiter.is_orchestrator_paused() {
@@ -1109,7 +951,7 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
         }
 
         // 5. Spawn the orchestrator as a Claude Code subprocess.
-        let issue_id = root_issue.unwrap_or(0);
+        let issue_id = session_number;
 
         let registry = state.registry.read().await;
         let repo_dir = match registry.get(repo_name) {
@@ -1149,12 +991,34 @@ async fn event_drain_loop(state: &Arc<ServerState>, repo_name: &str, _entry: &Re
 
         // Build environment
         // Use a deterministic session name so --resume works across invocations.
-        let session_name = format!("githubclaw-{}-{}", repo_name.replace('/', "-"), issue_id);
+        let session_name = match &manager_kind {
+            ManagerKind::IssueManager => {
+                format!(
+                    "githubclaw-{}-issue-{}",
+                    repo_name.replace('/', "-"),
+                    issue_id
+                )
+            }
+            ManagerKind::MainPrManager => {
+                format!(
+                    "githubclaw-{}-main-pr-{}",
+                    repo_name.replace('/', "-"),
+                    issue_id
+                )
+            }
+        };
         let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         if issue_id > 0 {
             env.insert("GITHUBCLAW_ROOT_ISSUE".to_string(), issue_id.to_string());
         }
         env.insert("GITHUBCLAW_REPO".to_string(), repo_name.to_string());
+        env.insert(
+            "GITHUBCLAW_MANAGER_KIND".to_string(),
+            manager_kind.as_str().to_string(),
+        );
+        if matches!(&manager_kind, ManagerKind::MainPrManager) {
+            env.insert("GITHUBCLAW_PULL_REQUEST".to_string(), issue_id.to_string());
+        }
         env.insert(
             "GITHUBCLAW_EVENT_ID".to_string(),
             reserved_event.event_id.clone(),
@@ -2021,108 +1885,6 @@ mod tests {
             err.contains("Fork PR gate blocked"),
             "Expected 'Fork PR gate blocked' but got: {}",
             err,
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // 15. is_actionable_event filtering
-    // ---------------------------------------------------------------
-    #[test]
-    fn test_is_actionable_event() {
-        // issues.opened → actionable
-        assert!(is_actionable_event(&serde_json::json!({
-            "_githubclaw_event_type": "issues",
-            "action": "opened"
-        })));
-
-        // issues.labeled → NOT actionable (unless githubclaw-approved)
-        assert!(!is_actionable_event(&serde_json::json!({
-            "_githubclaw_event_type": "issues",
-            "action": "labeled",
-            "label": { "name": "bug" }
-        })));
-
-        // issues.labeled with githubclaw-approved → actionable
-        assert!(is_actionable_event(&serde_json::json!({
-            "_githubclaw_event_type": "issues",
-            "action": "labeled",
-            "label": { "name": "githubclaw-approved" }
-        })));
-
-        // check_run.completed failure → actionable
-        assert!(is_actionable_event(&serde_json::json!({
-            "_githubclaw_event_type": "check_run",
-            "action": "completed",
-            "check_run": { "conclusion": "failure" }
-        })));
-
-        // check_run.completed success → NOT actionable
-        assert!(!is_actionable_event(&serde_json::json!({
-            "_githubclaw_event_type": "check_run",
-            "action": "completed",
-            "check_run": { "conclusion": "success" }
-        })));
-
-        // check_run.created → NOT actionable
-        assert!(!is_actionable_event(&serde_json::json!({
-            "_githubclaw_event_type": "check_run",
-            "action": "created"
-        })));
-
-        // label.created → NOT actionable
-        assert!(!is_actionable_event(&serde_json::json!({
-            "_githubclaw_event_type": "label",
-            "action": "created"
-        })));
-    }
-
-    #[test]
-    fn test_normalized_event_type_maps_virtual_bootstrap_issue() {
-        let event = serde_json::json!({
-            "type": "virtual_bootstrap",
-            "item_type": "issue",
-            "data": { "number": 56, "title": "Bootstrapped issue" }
-        });
-
-        assert_eq!(normalized_event_type(&event), "issues");
-    }
-
-    #[test]
-    fn test_normalized_event_type_maps_virtual_bootstrap_pr() {
-        let event = serde_json::json!({
-            "type": "virtual_bootstrap",
-            "item_type": "pull_request",
-            "data": { "number": 57, "title": "Refactoring .githubclaw" }
-        });
-
-        assert_eq!(normalized_event_type(&event), "pull_request");
-    }
-
-    #[test]
-    fn test_event_summary_reads_virtual_bootstrap_title() {
-        let event = serde_json::json!({
-            "type": "virtual_bootstrap",
-            "item_type": "issue",
-            "data": { "number": 56, "title": "[BUG] orchestrator exited with non-zero code" }
-        });
-
-        assert_eq!(
-            event_summary(&event),
-            Some("[BUG] orchestrator exited with non-zero code".to_string())
-        );
-    }
-
-    #[test]
-    fn test_event_summary_reads_virtual_bootstrap_pr_title() {
-        let event = serde_json::json!({
-            "type": "virtual_bootstrap",
-            "item_type": "pull_request",
-            "data": { "number": 57, "title": "Refactoring .githubclaw" }
-        });
-
-        assert_eq!(
-            event_summary(&event),
-            Some("Refactoring .githubclaw".to_string())
         );
     }
 
