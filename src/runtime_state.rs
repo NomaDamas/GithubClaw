@@ -25,9 +25,23 @@ pub struct IssueRuntimeSnapshot {
     pub title: String,
     pub tracker: Option<PipelineTracker>,
     pub vision_report_ready: bool,
+    pub issue_manager_session_name: Option<String>,
+    pub issue_manager_status: Option<String>,
+    pub clone_id: Option<String>,
+    pub clone_path: Option<String>,
+    pub clone_status: Option<String>,
     pub agent_sessions: Vec<AgentSessionItem>,
     pub agent_timeline: Vec<TimelineEntry>,
     pub updated_at_unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IssueManagerRuntimeUpdate<'a> {
+    pub session_name: Option<&'a str>,
+    pub issue_manager_status: Option<&'a str>,
+    pub clone_id: Option<&'a str>,
+    pub clone_path: Option<&'a Path>,
+    pub clone_status: Option<&'a str>,
 }
 
 impl IssueRuntimeSnapshot {
@@ -38,6 +52,11 @@ impl IssueRuntimeSnapshot {
             title: String::new(),
             tracker: None,
             vision_report_ready: false,
+            issue_manager_session_name: None,
+            issue_manager_status: None,
+            clone_id: None,
+            clone_path: None,
+            clone_status: None,
             agent_sessions: Vec::new(),
             agent_timeline: Vec::new(),
             updated_at_unix_seconds: unix_timestamp_now(),
@@ -433,6 +452,21 @@ impl RuntimeStateStore {
         })
     }
 
+    pub fn record_issue_manager_state(
+        &self,
+        repo: &str,
+        issue_number: u64,
+        update: IssueManagerRuntimeUpdate<'_>,
+    ) -> std::io::Result<()> {
+        self.update_issue(repo, issue_number, |state| {
+            state.issue_manager_session_name = update.session_name.map(ToString::to_string);
+            state.issue_manager_status = update.issue_manager_status.map(ToString::to_string);
+            state.clone_id = update.clone_id.map(ToString::to_string);
+            state.clone_path = update.clone_path.map(|path| path.display().to_string());
+            state.clone_status = update.clone_status.map(ToString::to_string);
+        })
+    }
+
     fn update_issue(
         &self,
         repo: &str,
@@ -677,6 +711,38 @@ mod tests {
         ));
         assert_eq!(state.agent_timeline.len(), 2);
         assert_eq!(state.title, "Polish dashboard");
+    }
+
+    #[test]
+    fn issue_manager_state_records_clone_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let store = RuntimeStateStore::with_base_dir(tmp.path().join("sessions"));
+        let clone_path = tmp.path().join("clone-1");
+
+        store
+            .record_issue_manager_state(
+                "owner/repo",
+                55,
+                IssueManagerRuntimeUpdate {
+                    session_name: Some("githubclaw-owner_repo-issue-55"),
+                    issue_manager_status: Some("running"),
+                    clone_id: Some("clone-1"),
+                    clone_path: Some(&clone_path),
+                    clone_status: Some("assigned"),
+                },
+            )
+            .unwrap();
+
+        let state = store.load_issue("owner/repo", 55).unwrap().unwrap();
+        let expected_path = clone_path.display().to_string();
+        assert_eq!(
+            state.issue_manager_session_name.as_deref(),
+            Some("githubclaw-owner_repo-issue-55")
+        );
+        assert_eq!(state.issue_manager_status.as_deref(), Some("running"));
+        assert_eq!(state.clone_id.as_deref(), Some("clone-1"));
+        assert_eq!(state.clone_path.as_deref(), Some(expected_path.as_str()));
+        assert_eq!(state.clone_status.as_deref(), Some("assigned"));
     }
 
     #[test]

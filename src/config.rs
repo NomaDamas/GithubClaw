@@ -185,6 +185,22 @@ pub fn dispatch_receipts_dir_for_repo_from_home(
     repo_runtime_dir_from_home(githubclaw_home, repo_name).join("dispatch_receipts")
 }
 
+pub fn clone_pool_path_for_repo(repo_name: &str) -> PathBuf {
+    clone_pool_path_for_repo_from_home(&global_config_dir(), repo_name)
+}
+
+pub fn clone_pool_path_for_repo_from_home(githubclaw_home: &Path, repo_name: &str) -> PathBuf {
+    repo_runtime_dir_from_home(githubclaw_home, repo_name).join("clone_pool.json")
+}
+
+pub fn issue_managers_dir_for_repo(repo_name: &str) -> PathBuf {
+    issue_managers_dir_for_repo_from_home(&global_config_dir(), repo_name)
+}
+
+pub fn issue_managers_dir_for_repo_from_home(githubclaw_home: &Path, repo_name: &str) -> PathBuf {
+    repo_runtime_dir_from_home(githubclaw_home, repo_name).join("issue_managers")
+}
+
 // ---------------------------------------------------------------------------
 // Default event subscription
 // ---------------------------------------------------------------------------
