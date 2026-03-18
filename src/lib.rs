@@ -4,6 +4,7 @@ pub mod config;
 pub mod constants;
 pub mod dispatch_receipts;
 pub mod errors;
+pub mod event_triage;
 pub mod issue_router;
 pub mod markers;
 pub mod pipeline;

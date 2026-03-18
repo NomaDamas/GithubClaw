@@ -80,6 +80,8 @@ static SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 static REF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"ref\s+#(\d+)").unwrap());
 
+pub const HIDDEN_SIGNATURE: &str = "<!-- githubclaw:signature v1 -->";
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -125,6 +127,20 @@ pub fn extract_ref_issue(comment_body: &str) -> Option<u64> {
     REF_RE
         .captures(comment_body)
         .and_then(|cap| cap[1].parse::<u64>().ok())
+}
+
+/// Return true when a comment body contains the hidden GithubClaw signature.
+pub fn has_hidden_signature(comment_body: &str) -> bool {
+    comment_body.contains(HIDDEN_SIGNATURE)
+}
+
+/// Append the hidden GithubClaw signature unless it already exists.
+pub fn append_hidden_signature(comment_body: &str) -> String {
+    if has_hidden_signature(comment_body) {
+        comment_body.to_string()
+    } else {
+        format!("{comment_body}\n\n{HIDDEN_SIGNATURE}")
+    }
 }
 
 /// Generate a marker HTML comment string.
@@ -232,14 +248,30 @@ mod tests {
         assert!(extract_ref_issue(body).is_none());
     }
 
-    // 10. Format marker
+    // 10. Detect hidden signature
+    #[test]
+    fn detect_hidden_signature() {
+        let body = format!("Status update\n\n{}", HIDDEN_SIGNATURE);
+        assert!(has_hidden_signature(&body));
+    }
+
+    // 11. Append hidden signature only once
+    #[test]
+    fn append_hidden_signature_idempotent() {
+        let once = append_hidden_signature("Hello");
+        let twice = append_hidden_signature(&once);
+        assert_eq!(once, twice);
+        assert!(twice.contains(HIDDEN_SIGNATURE));
+    }
+
+    // 12. Format marker
     #[test]
     fn format_marker_simple() {
         let marker = format_marker(&MarkerType::Approved, &HashMap::new());
         assert_eq!(marker, "<!-- githubclaw:approved -->");
     }
 
-    // 11. Format marker with attributes
+    // 13. Format marker with attributes
     #[test]
     fn format_marker_with_attrs() {
         let mut attrs = HashMap::new();
@@ -249,7 +281,7 @@ mod tests {
         assert!(marker.contains("reproduced=true"));
     }
 
-    // 12. Format summary
+    // 14. Format summary
     #[test]
     fn format_summary_block() {
         let summary = format_summary("Test passed on all platforms.");

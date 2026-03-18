@@ -19,6 +19,7 @@ set -euo pipefail
 REAL_GH="${GITHUBCLAW_REAL_GH:-$(which -a gh | grep -v "$(dirname "$0")" | head -1)}"
 ROOT_ISSUE="${GITHUBCLAW_ROOT_ISSUE:-}"
 DENIED_PATHS="${GITHUBCLAW_DENIED_PATHS:-}"
+HIDDEN_SIGNATURE="<!-- githubclaw:signature v1 -->"
 
 if [ -z "$REAL_GH" ] || [ ! -x "$REAL_GH" ]; then
     echo "githubclaw gh-wrapper: cannot find real gh binary" >&2
@@ -48,18 +49,23 @@ is_write_command() {
     return 1
 }
 
-# Append ref #N to a body string
-append_ref() {
+# Append ref #N and the hidden GithubClaw signature to a body string
+append_metadata() {
     local body="$1"
     local issue="$2"
     local ref_tag="ref #${issue}"
+    local result="$body"
 
     # Don't append if already present
-    if echo "$body" | grep -qF "$ref_tag"; then
-        echo "$body"
-    else
-        echo "${body}"$'\n\n'"_${ref_tag}_"
+    if ! echo "$result" | grep -qF "$ref_tag"; then
+        result="${result}"$'\n\n'"_${ref_tag}_"
     fi
+
+    if ! echo "$result" | grep -qF "$HIDDEN_SIGNATURE"; then
+        result="${result}"$'\n\n'"$HIDDEN_SIGNATURE"
+    fi
+
+    echo "$result"
 }
 
 # ---------------------------------------------------------------------------
@@ -85,7 +91,7 @@ if is_write_command "$cmd" "$sub"; then
         if [ "${args[$i]}" = "--body" ] && [ $((i + 1)) -lt ${#args[@]} ]; then
             new_args+=("--body")
             i=$((i + 1))
-            modified_body=$(append_ref "${args[$i]}" "$ROOT_ISSUE")
+            modified_body=$(append_metadata "${args[$i]}" "$ROOT_ISSUE")
             new_args+=("$modified_body")
             body_modified=true
         else
